@@ -1,0 +1,8 @@
+tmp/
+*.log
+*.xcresult
+*.trace
+*.plist
+*.mobileprovision
+.env
+
