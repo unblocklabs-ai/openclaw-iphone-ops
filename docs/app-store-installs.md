@@ -20,6 +20,10 @@
 8. Verify the App Store state reaches `Open` or equivalent.
 9. Verify the app appears in `devicectl` installed-app output.
 
+The reusable example is `snippets/wda-app-store-install-example.py`. It assumes
+WebDriverAgent is already running and accepts `APP_NAME`, `EXPECTED_PUBLISHER`,
+`EXPECTED_BUNDLE_ID`, `DEVICE_ID`, and `WDA_URL` through environment variables.
+
 ## Default Prompt Choices
 
 - If App Store asks to save the password for free items, choose `Not Now` unless the task explicitly says to save it.
@@ -37,4 +41,3 @@ Minimum evidence for repeat installs:
 - Fresh installed-app proof
 
 Capture more only when a new prompt, ambiguity, or blocker appears.
-

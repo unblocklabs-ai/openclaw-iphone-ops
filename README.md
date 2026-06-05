@@ -62,6 +62,17 @@ Check WebDriverAgent if it is already running:
 WDA_URL="http://127.0.0.1:8100" ./snippets/wda-smoke.sh
 ```
 
+Run the App Store install example after WDA is already reachable:
+
+```sh
+WDA_URL="http://127.0.0.1:8100" \
+APP_NAME="Example App" \
+EXPECTED_PUBLISHER="Example Publisher" \
+EXPECTED_BUNDLE_ID="com.example.app" \
+DEVICE_ID="<udid-or-device-name>" \
+python3 ./snippets/wda-app-store-install-example.py
+```
+
 ## Human Intervention Boundaries
 
 Escalate only for concrete boundaries:
@@ -92,4 +103,3 @@ Do not share screenshots or local evidence paths into user-facing chat unless ex
 - `docs/app-store-installs.md`: App Store-specific flow and proof rules
 - `docs/troubleshooting.md`: common failures and exact escalation language
 - `snippets/`: small reusable shell snippets
-
