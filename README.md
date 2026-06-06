@@ -38,6 +38,74 @@ If the phone is locked, foreground app launches and UI tests are blocked until a
 
 ## Quick Start
 
+Run the reusable Python CLI directly from a checkout:
+
+```sh
+PYTHONPATH=src python3 -m openclaw_iphone devices list
+```
+
+Launch an app by display name or bundle id:
+
+```sh
+PYTHONPATH=src python3 -m openclaw_iphone apps launch Instagram
+PYTHONPATH=src python3 -m openclaw_iphone apps launch com.burbn.instagram
+```
+
+Run the first optional app recipe:
+
+```sh
+PYTHONPATH=src python3 -m openclaw_iphone instagram smoke
+```
+
+Check WebDriverAgent and capture the current UI when WDA is already running:
+
+```sh
+PYTHONPATH=src python3 -m openclaw_iphone wda status
+PYTHONPATH=src python3 -m openclaw_iphone ui screenshot
+PYTHONPATH=src python3 -m openclaw_iphone ui source
+```
+
+The WDA URL defaults to `OPENCLAW_IPHONE_WDA_URL`, then
+`http://127.0.0.1:8100`. Pass `--url` to target a different endpoint.
+
+Run WebDriverAgentRunner from a local WDA checkout:
+
+```sh
+OPENCLAW_IPHONE_WDA_PATH="/path/to/WebDriverAgent" \
+PYTHONPATH=src python3 -m openclaw_iphone wda run
+```
+
+This must be an actual WebDriverAgent Xcode project, such as Appium's maintained
+fork, with signing/provisioning configured for the physical iPhone. Cache marker
+files are not enough.
+
+When signing is not already configured in the project, pass Xcode build settings
+through the CLI:
+
+```sh
+OPENCLAW_IPHONE_WDA_PATH="/path/to/WebDriverAgent" \
+PYTHONPATH=src python3 -m openclaw_iphone wda run \
+  --development-team "<team-id>" \
+  --runner-bundle-id "com.example.WebDriverAgentRunner" \
+  --allow-provisioning-updates
+```
+
+In a second process, forward the device WDA port when `iproxy` is installed:
+
+```sh
+brew install libimobiledevice
+PYTHONPATH=src python3 -m openclaw_iphone wda tunnel
+```
+
+Both commands stay in the foreground while their underlying process is alive. If
+either exits, UI control breaks and needs to be restarted or supervised.
+After the runner and tunnel are up, `wda status`, `ui screenshot`, and
+`ui source` should talk to `http://127.0.0.1:8100`.
+
+The CLI resolves full Xcode through `DEVELOPER_DIR`, the current
+`xcode-select` path, or common Xcode install locations. It does not change the
+host's global Xcode selection.
+
 Run a basic device check:
 
 ```sh
@@ -102,4 +170,6 @@ Do not share screenshots or local evidence paths into user-facing chat unless ex
 - `docs/mechanics.md`: detailed operating notes
 - `docs/app-store-installs.md`: App Store-specific flow and proof rules
 - `docs/troubleshooting.md`: common failures and exact escalation language
+- `docs/agent-automation-guide.md`: guidance for writing reusable app recipes
+- `src/openclaw_iphone/`: reusable Python primitives and CLI
 - `snippets/`: small reusable shell snippets
