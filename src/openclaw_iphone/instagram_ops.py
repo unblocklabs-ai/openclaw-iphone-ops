@@ -47,10 +47,32 @@ class InstagramBenchmarkResult:
     payload: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class InstagramTriageShortlistResult:
+    manifest: Path
+    report: Path
+    payload: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class InstagramRankingQualityBenchmarkResult:
+    manifest: Path
+    report: Path
+    payload: dict[str, Any]
+
+
 DISCOVERY_SCENARIOS = (
     "pregnancy journey",
     "first trimester pregnancy nausea",
     "pregnancy after loss",
+)
+
+RANKING_QUALITY_THEMES = (
+    "pregnancy journey",
+    "first trimester pregnancy nausea",
+    "pregnancy after loss",
+    "postpartum mom life",
+    "ttc fertility journey",
 )
 
 PREGNANCY_MOTHERHOOD_KEYWORDS = (
@@ -247,12 +269,16 @@ def discover_creators(
     max_steps: int = 120,
     max_steps_per_candidate: int = 10,
     per_candidate_deadline_seconds: float = 45,
+    verification_mode: str = "profile",
+    source_open_wait_seconds: float = 1.5,
 ) -> InstagramDiscoveryResult:
+    if verification_mode not in {"profile", "source-only"}:
+        raise ValueError("verification_mode must be 'profile' or 'source-only'.")
     base = output_base(output_dir)
     started = time.monotonic()
     controller = UIController(client, evidence_base=str(base))
     steps = StepBudget(max_steps, deadline_seconds=deadline_seconds)
-    source_pool_size = max(max_candidates, min(max_candidates * 3, max_candidates + 20))
+    source_pool_size = max_candidates if verification_mode == "source-only" else max(max_candidates, min(max_candidates * 3, max_candidates + 20))
     source_candidates: dict[str, dict[str, Any]] = {}
     verified_pool: list[dict[str, Any]] = []
     source_screens: list[dict[str, Any]] = []
@@ -268,6 +294,8 @@ def discover_creators(
         "max_steps": max_steps,
         "max_steps_per_candidate": max_steps_per_candidate,
         "per_candidate_deadline_seconds": per_candidate_deadline_seconds,
+        "verification_mode": verification_mode,
+        "source_open_wait_seconds": source_open_wait_seconds,
         "source_pool_size": source_pool_size,
         "prohibited_actions": list(IRREVERSIBLE_INSTAGRAM_ACTIONS_PROHIBITED),
         "actions_taken": [],
@@ -293,7 +321,7 @@ def discover_creators(
             url = f"instagram://tag?name={tag}"
             payload["actions_taken"].append({"action": "open_url", "url": url})
             client.open_url(url)
-            time.sleep(1.5)
+            time.sleep(source_open_wait_seconds)
             for scroll_index in range(max_source_scrolls + 1):
                 if len(source_candidates) >= source_pool_size:
                     break
@@ -363,26 +391,30 @@ def discover_creators(
                     }
                 )
 
-    for handle, source_candidate in list(source_candidates.items())[:source_pool_size]:
-        if time.monotonic() - started >= deadline_seconds:
-            errors.append({"stage": "verify", "handle": handle, "error": "global deadline reached"})
-            verified_pool.append(candidate_with_status(source_candidate, "rejected_or_ambiguous", "global deadline reached before verification"))
-            continue
-        try:
-            steps.take(payload, f"verify-handle:{handle}")
-            verification = verify_discovery_handle(
-                client,
-                handle,
-                output_dir=str(base),
-                prefix=f"{prefix}-verify-{handle}",
-                deadline_seconds=per_candidate_deadline_seconds,
-                max_steps=max_steps_per_candidate,
-            )
-            candidate = build_discovery_candidate(query, source_candidate, verification)
-        except Exception as exc:
-            errors.append({"stage": "verify", "handle": handle, "error": str(exc)})
-            candidate = candidate_with_status(source_candidate, "rejected_or_ambiguous", f"verification failed: {exc}")
-        verified_pool.append(candidate)
+    if verification_mode == "source-only":
+        for source_candidate in list(source_candidates.values())[:source_pool_size]:
+            verified_pool.append(build_source_only_candidate(query, source_candidate))
+    else:
+        for handle, source_candidate in list(source_candidates.items())[:source_pool_size]:
+            if time.monotonic() - started >= deadline_seconds:
+                errors.append({"stage": "verify", "handle": handle, "error": "global deadline reached"})
+                verified_pool.append(candidate_with_status(source_candidate, "rejected_or_ambiguous", "global deadline reached before verification"))
+                continue
+            try:
+                steps.take(payload, f"verify-handle:{handle}")
+                verification = verify_discovery_handle(
+                    client,
+                    handle,
+                    output_dir=str(base),
+                    prefix=f"{prefix}-verify-{handle}",
+                    deadline_seconds=per_candidate_deadline_seconds,
+                    max_steps=max_steps_per_candidate,
+                )
+                candidate = build_discovery_candidate(query, source_candidate, verification)
+            except Exception as exc:
+                errors.append({"stage": "verify", "handle": handle, "error": str(exc)})
+                candidate = candidate_with_status(source_candidate, "rejected_or_ambiguous", f"verification failed: {exc}")
+            verified_pool.append(candidate)
 
     for candidate in select_report_candidates(verified_pool, max_candidates):
         payload[classify_candidate(candidate)].append(candidate)
@@ -406,6 +438,8 @@ def benchmark_discovery(
     max_candidates_per_scenario: int = 10,
     scenario_deadline_seconds: float = 360,
     max_source_scrolls: int = 6,
+    verification_mode: str = "profile",
+    source_open_wait_seconds: float = 1.5,
 ) -> InstagramBenchmarkResult:
     base = output_base(output_dir)
     started = time.monotonic()
@@ -421,6 +455,8 @@ def benchmark_discovery(
             "irreversible_actions": 0,
         },
         "prohibited_actions": list(IRREVERSIBLE_INSTAGRAM_ACTIONS_PROHIBITED),
+        "verification_mode": verification_mode,
+        "source_open_wait_seconds": source_open_wait_seconds,
     }
     for index, scenario in enumerate(scenarios, start=1):
         result = discover_creators(
@@ -431,6 +467,8 @@ def benchmark_discovery(
             max_candidates=max_candidates_per_scenario,
             deadline_seconds=scenario_deadline_seconds,
             max_source_scrolls=max_source_scrolls,
+            verification_mode=verification_mode,
+            source_open_wait_seconds=source_open_wait_seconds,
         )
         summary = result.payload.get("summary", {})
         payload["scenarios"].append(
@@ -453,6 +491,219 @@ def benchmark_discovery(
     manifest.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     report.write_text(render_benchmark_markdown(payload), encoding="utf-8")
     return InstagramBenchmarkResult(manifest=manifest, report=report, payload=payload)
+
+
+def triage_shortlist(
+    client: WDAClient,
+    *,
+    output_dir: str | None = None,
+    prefix: str = "instagram-triage-shortlist",
+    scenarios: tuple[str, ...] = DISCOVERY_SCENARIOS,
+    max_candidates_per_scenario: int = 10,
+    source_deadline_seconds: float = 45,
+    max_source_scrolls: int = 1,
+    verify_top: int = 10,
+    verification_deadline_seconds: float = 180,
+    per_candidate_deadline_seconds: float = 30,
+    shortlist_size: int = 5,
+    source_open_wait_seconds: float = 1.5,
+) -> InstagramTriageShortlistResult:
+    base = output_base(output_dir)
+    started = time.monotonic()
+    scenario_payloads: list[dict[str, Any]] = []
+    source_candidates: list[dict[str, Any]] = []
+    payload: dict[str, Any] = {
+        "kind": "instagram_creator_triage_shortlist",
+        "scenarios": [],
+        "prohibited_actions": list(IRREVERSIBLE_INSTAGRAM_ACTIONS_PROHIBITED),
+        "source_stage": {
+            "mode": "source-only",
+            "max_candidates_per_scenario": max_candidates_per_scenario,
+            "deadline_seconds_per_scenario": source_deadline_seconds,
+            "max_source_scrolls": max_source_scrolls,
+            "source_open_wait_seconds": source_open_wait_seconds,
+        },
+        "verification_stage": {
+            "verify_top": verify_top,
+            "deadline_seconds": verification_deadline_seconds,
+            "per_candidate_deadline_seconds": per_candidate_deadline_seconds,
+            "verified": [],
+            "errors": [],
+        },
+        "ranked_triage_candidates": [],
+        "shortlisted_verified_creators": [],
+        "rejected_low_confidence_candidates": [],
+        "unresolved_candidates_needing_manual_review": [],
+    }
+
+    source_started = time.monotonic()
+    source_target = max_candidates_per_scenario * len(scenarios)
+    source_result = collect_source_triage_pool(
+        client,
+        scenarios,
+        output_dir=str(base),
+        prefix=f"{prefix}-source",
+        target_candidates=source_target,
+        deadline_seconds=source_deadline_seconds * len(scenarios),
+        max_source_scrolls=max_source_scrolls,
+        source_open_wait_seconds=source_open_wait_seconds,
+    )
+    payload["scenarios"] = source_result["scenarios"]
+    scenario_payloads = source_result["scenario_payloads"]
+    source_candidates = source_result["candidates"]
+
+    source_elapsed = round(time.monotonic() - source_started, 2)
+    ranked = rank_triage_candidates(source_candidates)
+    payload["ranked_triage_candidates"] = ranked
+    payload["source_stage"]["elapsed_seconds"] = source_elapsed
+    payload["source_stage"]["candidates_found"] = len(source_candidates)
+    payload["source_stage"]["unique_handles"] = len({candidate.get("handle") for candidate in ranked if candidate.get("handle")})
+
+    verification_started = time.monotonic()
+    verified_candidates: list[dict[str, Any]] = []
+    for candidate in ranked[:verify_top]:
+        handle = candidate.get("handle")
+        if not handle:
+            continue
+        elapsed = time.monotonic() - verification_started
+        if elapsed >= verification_deadline_seconds:
+            payload["verification_stage"]["errors"].append(
+                {"handle": handle, "error": "verification deadline reached before candidate"}
+            )
+            break
+        try:
+            verification = verify_discovery_handle(
+                client,
+                handle,
+                output_dir=str(base),
+                prefix=f"{prefix}-verify-{handle}",
+                deadline_seconds=min(per_candidate_deadline_seconds, max(1.0, verification_deadline_seconds - elapsed)),
+                max_steps=4,
+            )
+            verified = build_discovery_candidate(
+                candidate.get("source_query") or "",
+                source_candidate_from_triage_candidate(candidate),
+                verification,
+            )
+            verified["triage_score"] = candidate.get("triage_score")
+            verified["triage_reasons"] = candidate.get("triage_reasons", [])
+            verified_candidates.append(verified)
+            payload["verification_stage"]["verified"].append(verified)
+        except Exception as exc:
+            payload["verification_stage"]["errors"].append({"handle": handle, "error": str(exc)})
+
+    verification_elapsed = round(time.monotonic() - verification_started, 2)
+    payload["verification_stage"]["elapsed_seconds"] = verification_elapsed
+    payload["verification_stage"]["verified_count"] = len(verified_candidates)
+
+    shortlisted = select_shortlist(verified_candidates, shortlist_size)
+    shortlisted_handles = {candidate.get("handle") for candidate in shortlisted}
+    verified_handles = {candidate.get("handle") for candidate in verified_candidates}
+    payload["shortlisted_verified_creators"] = shortlisted
+    payload["rejected_low_confidence_candidates"] = [
+        candidate for candidate in verified_candidates if candidate.get("handle") not in shortlisted_handles
+    ]
+    payload["unresolved_candidates_needing_manual_review"] = [
+        candidate for candidate in ranked if candidate.get("handle") not in verified_handles
+    ]
+    payload["summary"] = triage_shortlist_metrics(payload, started)
+    payload["elapsed_seconds"] = round(time.monotonic() - started, 2)
+
+    manifest = base / f"{prefix}.json"
+    report = base / f"{prefix}.md"
+    manifest.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    report.write_text(render_triage_shortlist_markdown(payload), encoding="utf-8")
+    return InstagramTriageShortlistResult(manifest=manifest, report=report, payload=payload)
+
+
+def benchmark_ranking_quality(
+    client: WDAClient,
+    *,
+    output_dir: str | None = None,
+    prefix: str = "instagram-ranking-quality",
+    themes: tuple[str, ...] | None = RANKING_QUALITY_THEMES,
+    candidates_per_theme: int = 30,
+    verify_top: int = 10,
+    comparison_size: int = 5,
+    comparison_start_rank: int = 10,
+    source_deadline_seconds: float = 60,
+    verification_deadline_seconds: float = 180,
+    per_candidate_deadline_seconds: float = 30,
+    max_source_scrolls: int = 1,
+    source_open_wait_seconds: float = 1.5,
+) -> InstagramRankingQualityBenchmarkResult:
+    base = output_base(output_dir)
+    themes = themes or RANKING_QUALITY_THEMES
+    started = time.monotonic()
+    runs: list[dict[str, Any]] = []
+    payload: dict[str, Any] = {
+        "kind": "instagram_ranking_quality_benchmark",
+        "themes": list(themes),
+        "candidates_per_theme": candidates_per_theme,
+        "verify_top": verify_top,
+        "comparison_size": comparison_size,
+        "comparison_start_rank": comparison_start_rank,
+        "prohibited_actions": list(IRREVERSIBLE_INSTAGRAM_ACTIONS_PROHIBITED),
+        "runs": runs,
+    }
+    for index, theme in enumerate(themes, start=1):
+        run_started = time.monotonic()
+        triage = triage_shortlist(
+            client,
+            output_dir=str(base),
+            prefix=f"{prefix}-{index}-{slugify(theme)}",
+            scenarios=(theme,),
+            max_candidates_per_scenario=candidates_per_theme,
+            source_deadline_seconds=source_deadline_seconds,
+            max_source_scrolls=max_source_scrolls,
+            verify_top=verify_top,
+            verification_deadline_seconds=verification_deadline_seconds,
+            per_candidate_deadline_seconds=per_candidate_deadline_seconds,
+            shortlist_size=verify_top,
+            source_open_wait_seconds=source_open_wait_seconds,
+        )
+        ranked = triage.payload.get("ranked_triage_candidates") or []
+        comparison_source = ranked[comparison_start_rank : comparison_start_rank + comparison_size]
+        comparison_verified = verify_ranked_candidates(
+            client,
+            comparison_source,
+            output_dir=str(base),
+            prefix=f"{prefix}-{index}-{slugify(theme)}-comparison",
+            deadline_seconds=max(30.0, comparison_size * per_candidate_deadline_seconds),
+            per_candidate_deadline_seconds=per_candidate_deadline_seconds,
+        )
+        top_verified = triage.payload.get("verification_stage", {}).get("verified", [])
+        top_credible = select_shortlist(top_verified, verify_top)
+        comparison_credible = select_shortlist(comparison_verified, comparison_size)
+        run = {
+            "theme": theme,
+            "triage_manifest": str(triage.manifest),
+            "triage_report": str(triage.report),
+            "elapsed_seconds": round(time.monotonic() - run_started, 2),
+            "triage_summary": triage.payload.get("summary", {}),
+            "ranked_candidates": len(ranked),
+            "duplicate_rate": duplicate_rate_from_ranked(ranked),
+            "unresolved_count": len(triage.payload.get("unresolved_candidates_needing_manual_review") or []),
+            "top_verified_count": len(top_verified),
+            "top_credible_count": len(top_credible),
+            "top_precision": precision(len(top_credible), len(top_verified)),
+            "comparison_verified_count": len(comparison_verified),
+            "comparison_credible_count": len(comparison_credible),
+            "comparison_precision": precision(len(comparison_credible), len(comparison_verified)),
+            "top_verified": top_verified,
+            "top_credible": top_credible,
+            "comparison_verified": comparison_verified,
+            "comparison_credible": comparison_credible,
+            "passed_yield_target": len(top_credible) >= 5,
+        }
+        runs.append(run)
+
+    payload["summary"] = ranking_quality_summary(runs, started)
+    manifest = base / f"{prefix}.json"
+    report = base / f"{prefix}.md"
+    manifest.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    report.write_text(render_ranking_quality_markdown(payload), encoding="utf-8")
+    return InstagramRankingQualityBenchmarkResult(manifest=manifest, report=report, payload=payload)
 
 
 class StepBudget:
@@ -482,18 +733,25 @@ def output_base(output_dir: str | None) -> Path:
 def query_to_hashtags(query: str) -> list[str]:
     words = re.findall(r"[a-z0-9]+", query.casefold())
     joined = "".join(words)
-    tags: list[str] = [joined] if joined else []
+    phrase_key = " ".join(words)
+    tags: list[str] = []
     phrase_aliases = {
-        "pregnancy journey": ["pregnancyjourney", "pregnantlife", "pregnantmom"],
+        "pregnancy journey": ["pregnancyjourney", "pregnantmom", "pregnantlife"],
         "first trimester pregnancy nausea": [
+            "trimesterpregnancy",
+            "pregnancy",
+            "first",
             "firsttrimester",
-            "pregnancynausea",
-            "morningsickness",
             "firsttrimesterpregnancy",
+            "pregnancynausea",
         ],
-        "pregnancy after loss": ["pregnancyafterloss", "pregnancyafterlosssupport", "rainbowbaby"],
+        "pregnancy after loss": ["pregnancyafter", "afterloss", "pregnancyafterloss", "pregnancyafterlosssupport", "rainbowbaby"],
+        "postpartum mom life": ["postpartummom", "postpartumjourney", "newmomlife", "postpartum", "momlife"],
+        "ttc fertility journey": ["ttcjourney", "fertilityjourney", "ttccommunity", "ttcsisters", "fertility"],
     }
-    tags.extend(phrase_aliases.get(" ".join(words), []))
+    tags.extend(phrase_aliases.get(phrase_key, []))
+    if joined:
+        tags.append(joined)
     if len(words) > 1:
         for size in range(min(3, len(words)), 1, -1):
             for index in range(len(words) - size + 1):
@@ -546,6 +804,148 @@ def harvest_handles_from_capture(capture: Any, *, query: str, tag: str) -> dict[
             "artifact_paths": artifacts[:],
         }
     return handles
+
+
+def collect_source_triage_pool(
+    client: WDAClient,
+    scenarios: tuple[str, ...],
+    *,
+    output_dir: str,
+    prefix: str,
+    target_candidates: int,
+    deadline_seconds: float,
+    max_source_scrolls: int,
+    source_open_wait_seconds: float,
+) -> dict[str, Any]:
+    base = output_base(output_dir)
+    controller = UIController(client, evidence_base=str(base))
+    started = time.monotonic()
+    steps = StepBudget(max(20, target_candidates * 4), deadline_seconds=deadline_seconds)
+    source_candidates: dict[str, dict[str, Any]] = {}
+    scenario_states: list[dict[str, Any]] = []
+    for scenario_index, scenario in enumerate(scenarios, start=1):
+        scenario_states.append(
+            {
+                "index": scenario_index,
+                "query": scenario,
+                "tags": query_to_hashtags(scenario),
+                "started": time.monotonic(),
+                "steps_before": steps.used,
+                "source_screens": [],
+                "ambiguous_screens": [],
+                "actions_taken": [],
+                "errors": [],
+                "steps": [],
+            }
+        )
+
+    max_tags = max((len(state["tags"]) for state in scenario_states), default=0)
+    for tag_index in range(max_tags):
+        for state in scenario_states:
+            if len(source_candidates) >= target_candidates:
+                break
+            if tag_index >= len(state["tags"]):
+                continue
+            if time.monotonic() - started >= deadline_seconds:
+                state["errors"].append({"stage": "source", "error": "source triage deadline reached"})
+                break
+            scenario = state["query"]
+            tag = state["tags"][tag_index]
+            try:
+                steps.take(state, f"open-source-tag:{tag}")
+                url = f"instagram://tag?name={tag}"
+                state["actions_taken"].append({"action": "open_url", "url": url})
+                client.open_url(url)
+                time.sleep(source_open_wait_seconds)
+                for scroll_index in range(max_source_scrolls + 1):
+                    if len(source_candidates) >= target_candidates:
+                        break
+                    capture_prefix = f"{prefix}-{state['index']}-{slugify(scenario)}-{tag}-{scroll_index}"
+                    steps.take(state, f"capture-source:{tag}:{scroll_index}")
+                    capture = capture_instagram_context(client, output_dir=str(base), prefix=capture_prefix)
+                    handles = harvest_handles_from_capture(capture, query=scenario, tag=tag)
+                    source_screen = {
+                        "query": scenario,
+                        "tag": tag,
+                        "scroll_index": scroll_index,
+                        "handle_count": len(handles),
+                        "manifest": str(capture.manifest),
+                        "screenshot": str(capture.screenshot),
+                        "source": str(capture.source),
+                        "warning": capture.payload.get("warning"),
+                    }
+                    state["source_screens"].append(source_screen)
+                    if not handles:
+                        state["ambiguous_screens"].append(
+                            {
+                                "stage": "source",
+                                "reason": "no visible creator media handles parsed",
+                                **source_screen,
+                            }
+                        )
+                    for handle, evidence in handles.items():
+                        if handle not in source_candidates:
+                            source_candidates[handle] = evidence
+                        else:
+                            source_candidates[handle]["source_evidence"].extend(evidence["source_evidence"])
+                            source_candidates[handle]["artifact_paths"].extend(evidence["artifact_paths"])
+                        if len(source_candidates) >= target_candidates:
+                            break
+                    if len(source_candidates) >= target_candidates or scroll_index == max_source_scrolls:
+                        break
+                    steps.take(state, f"scroll-source:{tag}:{scroll_index}")
+                    state["actions_taken"].append({"action": "drag", "purpose": "scroll_source_results"})
+                    controller.drag(200, 735, 200, 260, duration=0.2)
+                    time.sleep(0.8)
+            except Exception as exc:
+                state["errors"].append({"stage": "source", "tag": tag, "error": str(exc)})
+        if len(source_candidates) >= target_candidates:
+            break
+
+    scenarios_payload: list[dict[str, Any]] = []
+    scenario_payloads: list[dict[str, Any]] = []
+    for state in scenario_states:
+        scenario = state["query"]
+        scenario_payload: dict[str, Any] = {
+            "kind": "instagram_creator_source_triage",
+            "query": scenario,
+            "source_screens": state["source_screens"],
+            "ambiguous_screens": state["ambiguous_screens"],
+            "actions_taken": state["actions_taken"],
+            "errors": state["errors"],
+            "steps": state.get("steps", []),
+        }
+        candidates = [
+            build_source_only_candidate(scenario, candidate)
+            for candidate in source_candidates.values()
+            if candidate.get("source_query") == scenario
+        ]
+        scenario_payload["partial"] = candidates
+        scenario_payload["qualified"] = []
+        scenario_payload["rejected_or_ambiguous"] = []
+        scenario_payload["elapsed_seconds"] = round(time.monotonic() - state["started"], 2)
+        scenario_payload["ui_steps"] = len(state.get("steps", []))
+        scenario_payload["summary"] = discovery_metrics(candidates, state["started"])
+        scenario_payloads.append(scenario_payload)
+        scenarios_payload.append(
+            {
+                "query": scenario,
+                "summary": scenario_payload["summary"],
+                "elapsed_seconds": scenario_payload["elapsed_seconds"],
+                "ui_steps": scenario_payload["ui_steps"],
+                "failed_ambiguous_screens": len(state["ambiguous_screens"]),
+                "source_screens": state["source_screens"],
+            }
+        )
+
+    return {
+        "candidates": [
+            build_source_only_candidate(str(candidate.get("source_query") or ""), candidate)
+            for candidate in source_candidates.values()
+        ],
+        "scenarios": scenarios_payload,
+        "scenario_payloads": scenario_payloads,
+    }
 
 
 def verify_discovery_handle(
@@ -650,6 +1050,38 @@ def build_discovery_candidate(query: str, source_candidate: dict[str, Any], veri
     return candidate
 
 
+def build_source_only_candidate(query: str, source_candidate: dict[str, Any]) -> dict[str, Any]:
+    evidence = pregnancy_evidence(query, source_candidate, {}, {})
+    recency_signal = {
+        "type": "visible_source_media_result",
+        "evidence": source_candidate.get("source_evidence", [])[:2],
+        "caveat": "The source screen exposed visible Instagram media results, but no profile or post date was opened in source-only mode.",
+    }
+    candidate = {
+        "handle": source_candidate.get("handle"),
+        "display_name": None,
+        "follower_count": None,
+        "follower_count_number": None,
+        "likely_under_10k_followers": False,
+        "bio": None,
+        "visible_pregnancy_motherhood_evidence": evidence,
+        "recency_signal": recency_signal,
+        "source_query": source_candidate.get("source_query"),
+        "source_screen": source_candidate.get("source_screen"),
+        "confidence": score_candidate(False, None, evidence, recency_signal, []),
+        "caveats": [
+            "Source-only mode did not open the profile, so follower count, bio, and display name were not verified.",
+            "Deep-link verification was skipped to meet the fast benchmark budget.",
+        ],
+        "artifact_paths": source_candidate.get("artifact_paths", []),
+        "deep_link_verified": False,
+        "verification_status": "source_only",
+        "verification": None,
+    }
+    candidate["result_bucket"] = classify_candidate(candidate)
+    return candidate
+
+
 def pregnancy_evidence(query: str, source_candidate: dict[str, Any], profile: dict[str, Any], current_reel: dict[str, Any]) -> list[dict[str, Any]]:
     evidence: list[dict[str, Any]] = []
     source_terms = " ".join([query, str(source_candidate.get("source_tag") or "")])
@@ -701,7 +1133,7 @@ def classify_candidate(candidate: dict[str, Any]) -> str:
         and candidate.get("confidence", 0) >= 0.55
     ):
         return "qualified"
-    if candidate.get("verification_status") in {"captured_deep_link", "captured_current_context_match", "captured"}:
+    if candidate.get("verification_status") in {"captured_deep_link", "captured_current_context_match", "captured", "source_only"}:
         return "partial"
     return "rejected_or_ambiguous"
 
@@ -722,6 +1154,179 @@ def select_report_candidates(candidates: list[dict[str, Any]], max_candidates: i
         )
 
     return sorted(candidates, key=sort_key)[:max_candidates]
+
+
+def candidates_from_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    for key in ("qualified", "partial", "rejected_or_ambiguous"):
+        for candidate in payload.get(key, []) or []:
+            if isinstance(candidate, dict):
+                candidates.append(candidate)
+    return candidates
+
+
+def rank_triage_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_handle: dict[str, dict[str, Any]] = {}
+    for candidate in candidates:
+        handle = normalize_handle(str(candidate.get("handle") or ""))
+        if not handle:
+            continue
+        if handle not in by_handle:
+            merged = dict(candidate)
+            merged["handle"] = handle
+            merged["triage_occurrences"] = 0
+            merged["triage_source_queries"] = []
+            merged["visible_pregnancy_motherhood_evidence"] = []
+            merged["artifact_paths"] = []
+            by_handle[handle] = merged
+        merged = by_handle[handle]
+        merged["triage_occurrences"] += 1
+        query = candidate.get("source_query")
+        if query and query not in merged["triage_source_queries"]:
+            merged["triage_source_queries"].append(query)
+        merged["visible_pregnancy_motherhood_evidence"].extend(candidate.get("visible_pregnancy_motherhood_evidence") or [])
+        merged["artifact_paths"].extend(candidate.get("artifact_paths") or [])
+        if not merged.get("recency_signal") and candidate.get("recency_signal"):
+            merged["recency_signal"] = candidate.get("recency_signal")
+
+    ranked: list[dict[str, Any]] = []
+    for candidate in by_handle.values():
+        candidate["artifact_paths"] = list(dict.fromkeys(candidate.get("artifact_paths") or []))
+        candidate["visible_pregnancy_motherhood_evidence"] = dedupe_evidence(
+            candidate.get("visible_pregnancy_motherhood_evidence") or []
+        )
+        score, reasons = triage_score(candidate)
+        candidate["triage_score"] = score
+        candidate["triage_reasons"] = reasons
+        ranked.append(candidate)
+
+    return sorted(
+        ranked,
+        key=lambda candidate: (
+            -(candidate.get("triage_score") or 0),
+            -(candidate.get("triage_occurrences") or 0),
+            candidate.get("handle") or "",
+        ),
+    )
+
+
+def triage_score(candidate: dict[str, Any]) -> tuple[float, list[str]]:
+    score = 0.2
+    reasons: list[str] = []
+    evidence = candidate.get("visible_pregnancy_motherhood_evidence") or []
+    if evidence:
+        score += 0.25
+        reasons.append("visible pregnancy/motherhood source evidence")
+    if candidate.get("recency_signal"):
+        score += 0.15
+        reasons.append("visible source media recency signal")
+    occurrences = int(candidate.get("triage_occurrences") or 0)
+    if occurrences > 1:
+        bump = min(0.2, 0.06 * (occurrences - 1))
+        score += bump
+        reasons.append(f"appeared in {occurrences} source screens")
+    quality = source_evidence_quality(evidence)
+    if quality:
+        score += quality
+        reasons.append("specific source label evidence")
+    if len(candidate.get("triage_source_queries") or []) > 1:
+        score += 0.08
+        reasons.append("appeared across multiple discovery scenarios")
+    return round(min(score, 1.0), 2), reasons
+
+
+def source_evidence_quality(evidence: list[dict[str, Any]]) -> float:
+    labels = " ".join(str(item.get("label") or item.get("statement") or "") for item in evidence).casefold()
+    score = 0.0
+    if "video by" in labels:
+        score += 0.06
+    if has_pregnancy_motherhood_signal(labels):
+        score += 0.06
+    return min(score, 0.12)
+
+
+def dedupe_evidence(evidence: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for item in evidence:
+        key = (str(item.get("type")), str(item.get("tag")), str(item.get("label") or item.get("text") or item.get("statement")))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped
+
+
+def source_candidate_from_triage_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
+    evidence = candidate.get("visible_pregnancy_motherhood_evidence") or []
+    source_tag = None
+    if evidence and isinstance(evidence[0], dict):
+        source_tag = evidence[0].get("tag")
+    return {
+        "handle": candidate.get("handle"),
+        "source_query": candidate.get("source_query"),
+        "source_screen": candidate.get("source_screen"),
+        "source_tag": source_tag,
+        "source_evidence": evidence,
+        "artifact_paths": candidate.get("artifact_paths") or [],
+    }
+
+
+def select_shortlist(candidates: list[dict[str, Any]], shortlist_size: int) -> list[dict[str, Any]]:
+    credible = [
+        candidate
+        for candidate in candidates
+        if candidate.get("deep_link_verified")
+        and candidate.get("visible_pregnancy_motherhood_evidence")
+        and candidate.get("confidence", 0) >= 0.55
+    ]
+    return sorted(
+        credible,
+        key=lambda candidate: (
+            0 if candidate.get("likely_under_10k_followers") else 1,
+            -(candidate.get("confidence") or 0),
+            -(candidate.get("triage_score") or 0),
+            candidate.get("follower_count_number") if candidate.get("follower_count_number") is not None else 10**12,
+            candidate.get("handle") or "",
+        ),
+    )[:shortlist_size]
+
+
+def verify_ranked_candidates(
+    client: WDAClient,
+    candidates: list[dict[str, Any]],
+    *,
+    output_dir: str,
+    prefix: str,
+    deadline_seconds: float,
+    per_candidate_deadline_seconds: float,
+) -> list[dict[str, Any]]:
+    started = time.monotonic()
+    verified: list[dict[str, Any]] = []
+    for candidate in candidates:
+        handle = candidate.get("handle")
+        if not handle:
+            continue
+        elapsed = time.monotonic() - started
+        if elapsed >= deadline_seconds:
+            break
+        verification = verify_discovery_handle(
+            client,
+            str(handle),
+            output_dir=output_dir,
+            prefix=f"{prefix}-{handle}",
+            deadline_seconds=min(per_candidate_deadline_seconds, max(1.0, deadline_seconds - elapsed)),
+            max_steps=4,
+        )
+        verified_candidate = build_discovery_candidate(
+            candidate.get("source_query") or "",
+            source_candidate_from_triage_candidate(candidate),
+            verification,
+        )
+        verified_candidate["triage_score"] = candidate.get("triage_score")
+        verified_candidate["triage_reasons"] = candidate.get("triage_reasons", [])
+        verified.append(verified_candidate)
+    return verified
 
 
 def candidate_with_status(source_candidate: dict[str, Any], bucket: str, caveat: str) -> dict[str, Any]:
@@ -774,6 +1379,71 @@ def benchmark_metrics(scenario_payloads: list[dict[str, Any]], started: float) -
     metrics["ui_steps"] = ui_steps
     metrics["irreversible_actions"] = 0
     return metrics
+
+
+def triage_shortlist_metrics(payload: dict[str, Any], started: float) -> dict[str, Any]:
+    source_stage = payload.get("source_stage") or {}
+    verification_stage = payload.get("verification_stage") or {}
+    shortlisted = payload.get("shortlisted_verified_creators") or []
+    verified = verification_stage.get("verified") or []
+    ranked = payload.get("ranked_triage_candidates") or []
+    return {
+        "elapsed_seconds": round(time.monotonic() - started, 2),
+        "triage_elapsed_seconds": source_stage.get("elapsed_seconds"),
+        "triage_candidates_found": source_stage.get("candidates_found", 0),
+        "triage_unique_handles": source_stage.get("unique_handles", 0),
+        "verification_elapsed_seconds": verification_stage.get("elapsed_seconds"),
+        "verified_count": len(verified),
+        "shortlist_count": len(shortlisted),
+        "ranked_candidates": len(ranked),
+        "follower_counts_found": sum(1 for candidate in verified if candidate.get("follower_count") is not None),
+        "likely_under_10k_followers": sum(1 for candidate in shortlisted if candidate.get("likely_under_10k_followers")),
+        "pregnancy_motherhood_evidence": sum(1 for candidate in shortlisted if candidate.get("visible_pregnancy_motherhood_evidence")),
+        "irreversible_actions": 0,
+    }
+
+
+def ranking_quality_summary(runs: list[dict[str, Any]], started: float) -> dict[str, Any]:
+    run_count = len(runs)
+    passing = sum(1 for run in runs if run.get("passed_yield_target"))
+    top_verified = sum(int(run.get("top_verified_count") or 0) for run in runs)
+    top_credible = sum(int(run.get("top_credible_count") or 0) for run in runs)
+    comparison_verified = sum(int(run.get("comparison_verified_count") or 0) for run in runs)
+    comparison_credible = sum(int(run.get("comparison_credible_count") or 0) for run in runs)
+    return {
+        "elapsed_seconds": round(time.monotonic() - started, 2),
+        "runs": run_count,
+        "runs_with_at_least_5_credible_top_leads": passing,
+        "pass_rate": precision(passing, run_count),
+        "target_passed": run_count > 0 and passing / run_count >= 0.8,
+        "top_verified_count": top_verified,
+        "top_credible_count": top_credible,
+        "top_precision": precision(top_credible, top_verified),
+        "comparison_verified_count": comparison_verified,
+        "comparison_credible_count": comparison_credible,
+        "comparison_precision": precision(comparison_credible, comparison_verified),
+        "ranking_lift_vs_comparison": round(precision(top_credible, top_verified) - precision(comparison_credible, comparison_verified), 3),
+        "average_duplicate_rate": round(
+            sum(float(run.get("duplicate_rate") or 0.0) for run in runs) / run_count,
+            3,
+        )
+        if run_count
+        else 0.0,
+    }
+
+
+def precision(numerator: int, denominator: int) -> float:
+    if denominator <= 0:
+        return 0.0
+    return round(numerator / denominator, 3)
+
+
+def duplicate_rate_from_ranked(ranked: list[dict[str, Any]]) -> float:
+    if not ranked:
+        return 0.0
+    duplicate_hits = sum(max(0, int(candidate.get("triage_occurrences") or 0) - 1) for candidate in ranked)
+    total_hits = sum(max(1, int(candidate.get("triage_occurrences") or 0)) for candidate in ranked)
+    return precision(duplicate_hits, total_hits)
 
 
 def evaluate_benchmark_targets(summary: dict[str, Any], targets: dict[str, Any]) -> dict[str, bool]:
@@ -919,6 +1589,165 @@ def render_benchmark_markdown(payload: dict[str, Any]) -> str:
             ]
         )
     return "\n".join(lines)
+
+
+def render_triage_shortlist_markdown(payload: dict[str, Any]) -> str:
+    summary = payload.get("summary") or {}
+    source_stage = payload.get("source_stage") or {}
+    verification_stage = payload.get("verification_stage") or {}
+    lines = [
+        "# Instagram Creator Triage Shortlist",
+        "",
+        f"- Total elapsed seconds: {summary.get('elapsed_seconds')}",
+        f"- Triage elapsed seconds: {summary.get('triage_elapsed_seconds')}",
+        f"- Verification elapsed seconds: {summary.get('verification_elapsed_seconds')}",
+        f"- Triage candidates found: {summary.get('triage_candidates_found', 0)}",
+        f"- Triage unique handles: {summary.get('triage_unique_handles', 0)}",
+        f"- Verified candidates: {summary.get('verified_count', 0)}",
+        f"- Shortlist count: {summary.get('shortlist_count', 0)}",
+        f"- Irreversible actions: {summary.get('irreversible_actions', 0)}",
+        "",
+        "## Timing Benchmarks",
+        "",
+        f"- Source stage mode: {source_stage.get('mode')}",
+        f"- Source stage max candidates per scenario: {source_stage.get('max_candidates_per_scenario')}",
+        f"- Source stage max source scrolls: {source_stage.get('max_source_scrolls')}",
+        f"- Verification top N: {verification_stage.get('verify_top')}",
+        f"- Verification deadline seconds: {verification_stage.get('deadline_seconds')}",
+        "",
+        "## Shortlisted Verified Creators",
+        "",
+    ]
+    lines.extend(render_candidate_lines(payload.get("shortlisted_verified_creators") or []))
+    lines.extend(["", "## Rejected/Low-Confidence Candidates", ""])
+    lines.extend(render_candidate_lines(payload.get("rejected_low_confidence_candidates") or []))
+    lines.extend(["", "## Unresolved Candidates Needing Manual Review", ""])
+    lines.extend(render_candidate_lines((payload.get("unresolved_candidates_needing_manual_review") or [])[:25]))
+    lines.extend(["", "## Scenario Artifacts", ""])
+    for scenario in payload.get("scenarios") or []:
+        lines.extend(
+            [
+                f"### {scenario.get('query')}",
+                "",
+                f"- Elapsed seconds: {scenario.get('elapsed_seconds')}",
+                f"- UI steps: {scenario.get('ui_steps')}",
+                f"- Failed/ambiguous screens: {scenario.get('failed_ambiguous_screens')}",
+                f"- Manifest: {scenario.get('manifest')}",
+                f"- Report: {scenario.get('report')}",
+                "",
+            ]
+        )
+    if verification_stage.get("errors"):
+        lines.extend(["## Verification Errors", ""])
+        for error in verification_stage["errors"]:
+            lines.append(f"- @{error.get('handle')}: {error.get('error')}")
+    return "\n".join(lines)
+
+
+def render_ranking_quality_markdown(payload: dict[str, Any]) -> str:
+    summary = payload.get("summary") or {}
+    lines = [
+        "# Instagram Ranking Quality Benchmark",
+        "",
+        f"- Runs: {summary.get('runs', 0)}",
+        f"- Runs with >=5 credible top leads: {summary.get('runs_with_at_least_5_credible_top_leads', 0)}",
+        f"- Pass rate: {summary.get('pass_rate')}",
+        f"- Target passed: {summary.get('target_passed')}",
+        f"- Top precision: {summary.get('top_precision')}",
+        f"- Comparison precision: {summary.get('comparison_precision')}",
+        f"- Ranking lift vs comparison: {summary.get('ranking_lift_vs_comparison')}",
+        f"- Elapsed seconds: {summary.get('elapsed_seconds')}",
+        "",
+        "## Runs",
+        "",
+    ]
+    for run in payload.get("runs") or []:
+        lines.extend(
+            [
+                f"### {run.get('theme')}",
+                "",
+                f"- Passed yield target: {run.get('passed_yield_target')}",
+                f"- Elapsed seconds: {run.get('elapsed_seconds')}",
+                f"- Ranked candidates: {run.get('ranked_candidates')}",
+                f"- Duplicate rate: {run.get('duplicate_rate')}",
+                f"- Unresolved count: {run.get('unresolved_count')}",
+                f"- Top verified: {run.get('top_verified_count')}",
+                f"- Top credible: {run.get('top_credible_count')}",
+                f"- Top precision: {run.get('top_precision')}",
+                f"- Comparison verified: {run.get('comparison_verified_count')}",
+                f"- Comparison credible: {run.get('comparison_credible_count')}",
+                f"- Comparison precision: {run.get('comparison_precision')}",
+                f"- Triage manifest: {run.get('triage_manifest')}",
+                f"- Triage report: {run.get('triage_report')}",
+                "",
+                "Top credible handles:",
+            ]
+        )
+        credible = run.get("top_credible") or []
+        if credible:
+            for candidate in credible:
+                lines.append(
+                    f"- @{candidate.get('handle')} | followers: {candidate.get('follower_count') or 'unknown'} | "
+                    f"confidence: {candidate.get('confidence')} | verified: {candidate.get('deep_link_verified')}"
+                )
+        else:
+            lines.append("- None.")
+        lines.append("")
+    lines.extend(
+        [
+            "## Recommendation",
+            "",
+            ranking_quality_recommendation(summary),
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def ranking_quality_recommendation(summary: dict[str, Any]) -> str:
+    if summary.get("target_passed") and (summary.get("ranking_lift_vs_comparison") or 0) >= 0:
+        return (
+            "Current ranking is meeting the 80% yield target. Next best experiment: add an optional "
+            "second-pass verification for high-scoring unresolved candidates to increase shortlist breadth."
+        )
+    if (summary.get("top_precision") or 0) <= (summary.get("comparison_precision") or 0):
+        return (
+            "Top-ranked precision is not beating the lower-ranked comparison. Next best experiment: add richer "
+            "source evidence quality signals from screenshot/source text before increasing verification volume."
+        )
+    return (
+        "Ranking improves over the lower-ranked comparison but does not yet meet the 80% yield target. Next best "
+        "experiment: broaden source collection for low-yield themes before top-10 verification."
+    )
+
+
+def render_candidate_lines(candidates: list[dict[str, Any]]) -> list[str]:
+    if not candidates:
+        return ["None."]
+    lines: list[str] = []
+    for candidate in candidates:
+        artifacts = candidate.get("artifact_paths") or []
+        caveats = candidate.get("caveats") or []
+        evidence = candidate.get("visible_pregnancy_motherhood_evidence") or []
+        lines.extend(
+            [
+                f"### @{candidate.get('handle')}",
+                "",
+                f"- Display name: {candidate.get('display_name') or 'unknown'}",
+                f"- Followers: {candidate.get('follower_count') or 'unknown'}",
+                f"- Likely under 10k: {candidate.get('likely_under_10k_followers')}",
+                f"- Verified: {candidate.get('deep_link_verified')}",
+                f"- Verification status: {candidate.get('verification_status')}",
+                f"- Confidence: {candidate.get('confidence')}",
+                f"- Triage score: {candidate.get('triage_score')}",
+                f"- Evidence items: {len(evidence)}",
+                f"- Recency signal: {'yes' if candidate.get('recency_signal') else 'unknown'}",
+                f"- Caveats: {'; '.join(caveats) if caveats else 'none'}",
+                f"- Artifact paths: {', '.join(artifacts[:5])}",
+                "",
+            ]
+        )
+    return lines
 
 
 def context_matches_handle(payload: dict[str, Any], handle: str) -> bool:

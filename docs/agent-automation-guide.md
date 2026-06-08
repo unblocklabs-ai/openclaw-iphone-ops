@@ -170,6 +170,32 @@ and `pregnancy after loss`, then reports candidates found, handles found,
 follower counts found, likely-under-10k counts, evidence counts, recency counts,
 elapsed time, UI steps, ambiguous screens, and artifact paths.
 
+For a fast source-only pass around the 30-second budget:
+
+```sh
+openclaw-iphone instagram benchmark-discovery \
+  --verification-mode source-only \
+  --max-source-scrolls 0 \
+  --output-dir /tmp/iphone
+```
+
+Source-only mode returns partial candidates from visible result screens and does
+not open profiles. Treat missing follower count, likely-under-10k status, bio,
+display name, and deep-link verification as caveats, not negative evidence. Use
+the default profile mode when those fields are required.
+
+For the triage-to-shortlist workflow, prefer:
+
+```sh
+openclaw-iphone instagram triage-shortlist --output-dir /tmp/iphone
+```
+
+This runs source-only triage first, ranks and deduplicates the broad pool, then
+profile-verifies only the top candidates. The report separates shortlisted
+verified creators, rejected/low-confidence verified candidates, and unresolved
+source-only candidates needing manual review. Treat `deep_link_verified:
+false` and missing profile fields as unverified, not disqualified.
+
 For known-handle verification, prefer:
 
 ```sh

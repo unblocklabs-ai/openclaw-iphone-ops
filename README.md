@@ -167,6 +167,36 @@ counts, handles found, follower counts found, likely-under-10k counts, evidence
 counts, recency counts, elapsed time, UI steps, ambiguous screen counts, and
 artifact paths.
 
+For a fast source-only pass that skips profile deep-links and completes the
+three-scenario benchmark in about 30 seconds on the physical phone:
+
+```sh
+PYTHONPATH=src python3 -m openclaw_iphone instagram benchmark-discovery \
+  --verification-mode source-only \
+  --max-source-scrolls 0 \
+  --output-dir /Users/pearlperelel/.openclaw/tmp/openclaw-iphone-ops
+```
+
+Source-only mode returns partial candidates from visible result screens. It does
+not claim follower counts, likely-under-10k status, bio, display name, or
+deep-link verification; use the default profile mode when those fields are
+required.
+
+For the fastest usable Perelel sourcing workflow, run source triage followed by
+top-candidate verification in one command:
+
+```sh
+PYTHONPATH=src python3 -m openclaw_iphone instagram triage-shortlist \
+  --output-dir /Users/pearlperelel/.openclaw/tmp/openclaw-iphone-ops
+```
+
+`triage-shortlist` gathers a source-only pool across the Perelel benchmark
+scenarios, ranks and deduplicates candidates by visible pregnancy/motherhood
+evidence, source recency, duplicate appearances, and evidence quality, then
+deep-link verifies only the top candidates. The final JSON and Markdown reports
+separate shortlisted verified creators, rejected/low-confidence verified
+candidates, and unresolved source-only candidates needing manual review.
+
 To pair current Instagram context with a direct video URL or local video file:
 
 ```sh

@@ -9,7 +9,7 @@ from .devicectl import DeviceCtl
 from .evidence import artifact_path
 from .errors import DeviceLocked, OpenClawIPhoneError
 from .instagram_context import capture_instagram_context
-from .instagram_ops import DEFAULT_ANALYSIS_PROMPT, analyze_video, benchmark_discovery, discover_creators, verify_handles
+from .instagram_ops import DEFAULT_ANALYSIS_PROMPT, analyze_video, benchmark_discovery, benchmark_ranking_quality, discover_creators, triage_shortlist, verify_handles
 from .recipes.instagram import smoke as instagram_smoke
 from .ui import UIController
 from .wda import WDAClient, WDARunConfig, find_iproxy, resolve_wda_path, run_iproxy, run_wda
@@ -134,6 +134,8 @@ def build_parser() -> argparse.ArgumentParser:
     instagram_discover.add_argument("--max-steps", type=int, default=120)
     instagram_discover.add_argument("--max-steps-per-candidate", type=int, default=10)
     instagram_discover.add_argument("--per-candidate-deadline-seconds", type=float, default=45)
+    instagram_discover.add_argument("--verification-mode", choices=("profile", "source-only"), default="profile")
+    instagram_discover.add_argument("--source-open-wait-seconds", type=float, default=1.5)
     instagram_discover.add_argument("--no-launch", action="store_true", help="Do not launch Instagram before discovery.")
     instagram_discover.set_defaults(handler=handle_instagram_discover_creators)
 
@@ -148,8 +150,50 @@ def build_parser() -> argparse.ArgumentParser:
     instagram_benchmark.add_argument("--max-candidates-per-scenario", type=int, default=10)
     instagram_benchmark.add_argument("--scenario-deadline-seconds", type=float, default=360)
     instagram_benchmark.add_argument("--max-source-scrolls", type=int, default=6)
+    instagram_benchmark.add_argument("--verification-mode", choices=("profile", "source-only"), default="profile")
+    instagram_benchmark.add_argument("--source-open-wait-seconds", type=float, default=1.5)
     instagram_benchmark.add_argument("--no-launch", action="store_true", help="Do not launch Instagram before benchmarking.")
     instagram_benchmark.set_defaults(handler=handle_instagram_benchmark_discovery)
+
+    instagram_triage = instagram_subcommands.add_parser(
+        "triage-shortlist",
+        help="Run fast source-only triage, verify top candidates, and write a shortlist report.",
+    )
+    add_device_arg(instagram_triage)
+    add_wda_url_arg(instagram_triage)
+    instagram_triage.add_argument("--output-dir", help="Directory for triage artifacts.")
+    instagram_triage.add_argument("--prefix", default="instagram-triage-shortlist")
+    instagram_triage.add_argument("--max-candidates-per-scenario", type=int, default=10)
+    instagram_triage.add_argument("--source-deadline-seconds", type=float, default=45)
+    instagram_triage.add_argument("--max-source-scrolls", type=int, default=1)
+    instagram_triage.add_argument("--verify-top", type=int, default=10)
+    instagram_triage.add_argument("--verification-deadline-seconds", type=float, default=180)
+    instagram_triage.add_argument("--per-candidate-deadline-seconds", type=float, default=30)
+    instagram_triage.add_argument("--shortlist-size", type=int, default=5)
+    instagram_triage.add_argument("--source-open-wait-seconds", type=float, default=1.5)
+    instagram_triage.add_argument("--no-launch", action="store_true", help="Do not launch Instagram before triage.")
+    instagram_triage.set_defaults(handler=handle_instagram_triage_shortlist)
+
+    instagram_ranking = instagram_subcommands.add_parser(
+        "benchmark-ranking-quality",
+        help="Benchmark triage ranking quality across varied themes against a lower-ranked comparison sample.",
+    )
+    add_device_arg(instagram_ranking)
+    add_wda_url_arg(instagram_ranking)
+    instagram_ranking.add_argument("--output-dir", help="Directory for ranking benchmark artifacts.")
+    instagram_ranking.add_argument("--prefix", default="instagram-ranking-quality")
+    instagram_ranking.add_argument("--theme", action="append", help="Theme/query to benchmark. Repeat for multiple themes.")
+    instagram_ranking.add_argument("--candidates-per-theme", type=int, default=30)
+    instagram_ranking.add_argument("--verify-top", type=int, default=10)
+    instagram_ranking.add_argument("--comparison-size", type=int, default=5)
+    instagram_ranking.add_argument("--comparison-start-rank", type=int, default=10)
+    instagram_ranking.add_argument("--source-deadline-seconds", type=float, default=60)
+    instagram_ranking.add_argument("--verification-deadline-seconds", type=float, default=180)
+    instagram_ranking.add_argument("--per-candidate-deadline-seconds", type=float, default=30)
+    instagram_ranking.add_argument("--max-source-scrolls", type=int, default=1)
+    instagram_ranking.add_argument("--source-open-wait-seconds", type=float, default=1.5)
+    instagram_ranking.add_argument("--no-launch", action="store_true", help="Do not launch Instagram before benchmarking.")
+    instagram_ranking.set_defaults(handler=handle_instagram_benchmark_ranking_quality)
 
     wda = subcommands.add_parser("wda", help="WebDriverAgent commands.")
     wda_subcommands = wda.add_subparsers(dest="wda_command")
@@ -450,6 +494,8 @@ def handle_instagram_discover_creators(args: argparse.Namespace) -> int:
         max_steps=args.max_steps,
         max_steps_per_candidate=args.max_steps_per_candidate,
         per_candidate_deadline_seconds=args.per_candidate_deadline_seconds,
+        verification_mode=args.verification_mode,
+        source_open_wait_seconds=args.source_open_wait_seconds,
     )
     print(f"manifest: {result.manifest}")
     print(f"report: {result.report}")
@@ -474,6 +520,8 @@ def handle_instagram_benchmark_discovery(args: argparse.Namespace) -> int:
         max_candidates_per_scenario=args.max_candidates_per_scenario,
         scenario_deadline_seconds=args.scenario_deadline_seconds,
         max_source_scrolls=args.max_source_scrolls,
+        verification_mode=args.verification_mode,
+        source_open_wait_seconds=args.source_open_wait_seconds,
     )
     print(f"manifest: {result.manifest}")
     print(f"report: {result.report}")
@@ -487,6 +535,66 @@ def handle_instagram_benchmark_discovery(args: argparse.Namespace) -> int:
     print(f"failed/ambiguous screens: {summary.get('failed_ambiguous_screens', 0)}")
     for target, passed in (result.payload.get("target_results") or {}).items():
         print(f"{target}: {'PASS' if passed else 'FAIL'}")
+    return 0
+
+
+def handle_instagram_triage_shortlist(args: argparse.Namespace) -> int:
+    if not args.no_launch:
+        launch_instagram_for_foreground_work(args)
+    result = triage_shortlist(
+        wda_client_from_args(args),
+        output_dir=args.output_dir or args.evidence_dir,
+        prefix=args.prefix,
+        max_candidates_per_scenario=args.max_candidates_per_scenario,
+        source_deadline_seconds=args.source_deadline_seconds,
+        max_source_scrolls=args.max_source_scrolls,
+        verify_top=args.verify_top,
+        verification_deadline_seconds=args.verification_deadline_seconds,
+        per_candidate_deadline_seconds=args.per_candidate_deadline_seconds,
+        shortlist_size=args.shortlist_size,
+        source_open_wait_seconds=args.source_open_wait_seconds,
+    )
+    print(f"manifest: {result.manifest}")
+    print(f"report: {result.report}")
+    summary = result.payload.get("summary", {})
+    print(f"triage candidates found: {summary.get('triage_candidates_found', 0)}")
+    print(f"triage unique handles: {summary.get('triage_unique_handles', 0)}")
+    print(f"triage elapsed seconds: {summary.get('triage_elapsed_seconds')}")
+    print(f"verified count: {summary.get('verified_count', 0)}")
+    print(f"verification elapsed seconds: {summary.get('verification_elapsed_seconds')}")
+    print(f"shortlist count: {summary.get('shortlist_count', 0)}")
+    print(f"total elapsed seconds: {summary.get('elapsed_seconds')}")
+    return 0
+
+
+def handle_instagram_benchmark_ranking_quality(args: argparse.Namespace) -> int:
+    if not args.no_launch:
+        launch_instagram_for_foreground_work(args)
+    result = benchmark_ranking_quality(
+        wda_client_from_args(args),
+        output_dir=args.output_dir or args.evidence_dir,
+        prefix=args.prefix,
+        themes=tuple(args.theme) if args.theme else None,  # type: ignore[arg-type]
+        candidates_per_theme=args.candidates_per_theme,
+        verify_top=args.verify_top,
+        comparison_size=args.comparison_size,
+        comparison_start_rank=args.comparison_start_rank,
+        source_deadline_seconds=args.source_deadline_seconds,
+        verification_deadline_seconds=args.verification_deadline_seconds,
+        per_candidate_deadline_seconds=args.per_candidate_deadline_seconds,
+        max_source_scrolls=args.max_source_scrolls,
+        source_open_wait_seconds=args.source_open_wait_seconds,
+    )
+    print(f"manifest: {result.manifest}")
+    print(f"report: {result.report}")
+    summary = result.payload.get("summary", {})
+    print(f"runs: {summary.get('runs', 0)}")
+    print(f"runs with >=5 credible top leads: {summary.get('runs_with_at_least_5_credible_top_leads', 0)}")
+    print(f"pass rate: {summary.get('pass_rate')}")
+    print(f"target passed: {summary.get('target_passed')}")
+    print(f"top precision: {summary.get('top_precision')}")
+    print(f"comparison precision: {summary.get('comparison_precision')}")
+    print(f"ranking lift vs comparison: {summary.get('ranking_lift_vs_comparison')}")
     return 0
 
 
