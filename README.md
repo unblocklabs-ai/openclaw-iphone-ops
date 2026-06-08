@@ -136,6 +136,37 @@ PYTHONPATH=src python3 -m openclaw_iphone instagram verify-handles prenatal.crea
   --deadline-seconds 45
 ```
 
+For bounded broad Instagram creator discovery on the physical phone:
+
+```sh
+PYTHONPATH=src python3 -m openclaw_iphone instagram discover-creators \
+  --query "pregnancy journey" \
+  --max-candidates 10 \
+  --deadline-seconds 600 \
+  --output-dir /Users/pearlperelel/.openclaw/tmp/openclaw-iphone-ops
+```
+
+Discovery opens bounded Instagram hashtag result screens, harvests visible media
+handles, deep-links each sourced handle to capture profile evidence, and writes
+both JSON and Markdown reports. Reports include handle, display name, follower
+count when visible, likely-under-10k status, bio, visible pregnancy/motherhood
+evidence, recency signal when visible, confidence, caveats, artifact paths, and
+whether the profile was deep-link verified. The workflow records only URL opens,
+captures, and scroll drags; it must not like, follow, comment, message, post,
+enable notifications, or change account settings.
+
+Run the benchmark suite for the three Perelel discovery scenarios:
+
+```sh
+PYTHONPATH=src python3 -m openclaw_iphone instagram benchmark-discovery \
+  --output-dir /Users/pearlperelel/.openclaw/tmp/openclaw-iphone-ops
+```
+
+The benchmark writes aggregate JSON/Markdown reports with per-scenario candidate
+counts, handles found, follower counts found, likely-under-10k counts, evidence
+counts, recency counts, elapsed time, UI steps, ambiguous screen counts, and
+artifact paths.
+
 To pair current Instagram context with a direct video URL or local video file:
 
 ```sh

@@ -9,7 +9,7 @@ from .devicectl import DeviceCtl
 from .evidence import artifact_path
 from .errors import DeviceLocked, OpenClawIPhoneError
 from .instagram_context import capture_instagram_context
-from .instagram_ops import DEFAULT_ANALYSIS_PROMPT, analyze_video, verify_handles
+from .instagram_ops import DEFAULT_ANALYSIS_PROMPT, analyze_video, benchmark_discovery, discover_creators, verify_handles
 from .recipes.instagram import smoke as instagram_smoke
 from .ui import UIController
 from .wda import WDAClient, WDARunConfig, find_iproxy, resolve_wda_path, run_iproxy, run_wda
@@ -118,6 +118,38 @@ def build_parser() -> argparse.ArgumentParser:
     instagram_video.add_argument("--dry-run", action="store_true", help="Write handoff artifacts without invoking video-understand.")
     instagram_video.add_argument("--timeout", type=int, default=300)
     instagram_video.set_defaults(handler=handle_instagram_analyze_video)
+
+    instagram_discover = instagram_subcommands.add_parser(
+        "discover-creators",
+        help="Discover pregnancy/motherhood creator candidates from bounded Instagram source screens.",
+    )
+    add_device_arg(instagram_discover)
+    add_wda_url_arg(instagram_discover)
+    instagram_discover.add_argument("--query", required=True, help="Creator discovery query, for example 'pregnancy journey'.")
+    instagram_discover.add_argument("--max-candidates", type=int, default=10)
+    instagram_discover.add_argument("--deadline-seconds", type=float, default=600)
+    instagram_discover.add_argument("--output-dir", help="Directory for discovery artifacts.")
+    instagram_discover.add_argument("--prefix", default="instagram-discovery")
+    instagram_discover.add_argument("--max-source-scrolls", type=int, default=6)
+    instagram_discover.add_argument("--max-steps", type=int, default=120)
+    instagram_discover.add_argument("--max-steps-per-candidate", type=int, default=10)
+    instagram_discover.add_argument("--per-candidate-deadline-seconds", type=float, default=45)
+    instagram_discover.add_argument("--no-launch", action="store_true", help="Do not launch Instagram before discovery.")
+    instagram_discover.set_defaults(handler=handle_instagram_discover_creators)
+
+    instagram_benchmark = instagram_subcommands.add_parser(
+        "benchmark-discovery",
+        help="Run the creator discovery benchmark scenarios and write JSON/markdown reports.",
+    )
+    add_device_arg(instagram_benchmark)
+    add_wda_url_arg(instagram_benchmark)
+    instagram_benchmark.add_argument("--output-dir", help="Directory for benchmark artifacts.")
+    instagram_benchmark.add_argument("--prefix", default="instagram-discovery-benchmark")
+    instagram_benchmark.add_argument("--max-candidates-per-scenario", type=int, default=10)
+    instagram_benchmark.add_argument("--scenario-deadline-seconds", type=float, default=360)
+    instagram_benchmark.add_argument("--max-source-scrolls", type=int, default=6)
+    instagram_benchmark.add_argument("--no-launch", action="store_true", help="Do not launch Instagram before benchmarking.")
+    instagram_benchmark.set_defaults(handler=handle_instagram_benchmark_discovery)
 
     wda = subcommands.add_parser("wda", help="WebDriverAgent commands.")
     wda_subcommands = wda.add_subparsers(dest="wda_command")
@@ -402,6 +434,68 @@ def handle_instagram_analyze_video(args: argparse.Namespace) -> int:
     if result.payload.get("blocker"):
         print(f"blocker: {result.payload.get('blocker')}")
     return 0 if result.payload.get("status") in {"analyzed", "dry_run"} else 1
+
+
+def handle_instagram_discover_creators(args: argparse.Namespace) -> int:
+    if not args.no_launch:
+        launch_instagram_for_foreground_work(args)
+    result = discover_creators(
+        wda_client_from_args(args),
+        args.query,
+        output_dir=args.output_dir or args.evidence_dir,
+        prefix=args.prefix,
+        max_candidates=args.max_candidates,
+        deadline_seconds=args.deadline_seconds,
+        max_source_scrolls=args.max_source_scrolls,
+        max_steps=args.max_steps,
+        max_steps_per_candidate=args.max_steps_per_candidate,
+        per_candidate_deadline_seconds=args.per_candidate_deadline_seconds,
+    )
+    print(f"manifest: {result.manifest}")
+    print(f"report: {result.report}")
+    summary = result.payload.get("summary", {})
+    print(f"candidates found: {summary.get('candidates_found', 0)}")
+    print(f"handles found: {summary.get('handles_found', 0)}")
+    print(f"follower counts found: {summary.get('follower_counts_found', 0)}")
+    print(f"likely under 10k: {summary.get('likely_under_10k_followers', 0)}")
+    print(f"pregnancy/motherhood evidence: {summary.get('pregnancy_motherhood_evidence', 0)}")
+    print(f"recency evidence: {summary.get('recency_evidence', 0)}")
+    print(f"ui steps: {result.payload.get('ui_steps')}")
+    return 0
+
+
+def handle_instagram_benchmark_discovery(args: argparse.Namespace) -> int:
+    if not args.no_launch:
+        launch_instagram_for_foreground_work(args)
+    result = benchmark_discovery(
+        wda_client_from_args(args),
+        output_dir=args.output_dir or args.evidence_dir,
+        prefix=args.prefix,
+        max_candidates_per_scenario=args.max_candidates_per_scenario,
+        scenario_deadline_seconds=args.scenario_deadline_seconds,
+        max_source_scrolls=args.max_source_scrolls,
+    )
+    print(f"manifest: {result.manifest}")
+    print(f"report: {result.report}")
+    summary = result.payload.get("summary", {})
+    print(f"candidates found: {summary.get('candidates_found', 0)}")
+    print(f"handles found: {summary.get('handles_found', 0)}")
+    print(f"follower counts found: {summary.get('follower_counts_found', 0)}")
+    print(f"likely under 10k: {summary.get('likely_under_10k_followers', 0)}")
+    print(f"pregnancy/motherhood evidence: {summary.get('pregnancy_motherhood_evidence', 0)}")
+    print(f"recency evidence: {summary.get('recency_evidence', 0)}")
+    print(f"failed/ambiguous screens: {summary.get('failed_ambiguous_screens', 0)}")
+    for target, passed in (result.payload.get("target_results") or {}).items():
+        print(f"{target}: {'PASS' if passed else 'FAIL'}")
+    return 0
+
+
+def launch_instagram_for_foreground_work(args: argparse.Namespace) -> None:
+    client = client_from_args(args)
+    device = client.select_device(args.device)
+    ensure_unlocked_or_attempt_wda(args, client, device.identifier)
+    app = client.find_app(device.identifier, "Instagram")
+    client.launch_app(device.identifier, app.bundle_identifier)
 
 
 def handle_wda_status(args: argparse.Namespace) -> int:

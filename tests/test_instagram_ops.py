@@ -4,8 +4,9 @@ from pathlib import Path
 import json
 import tempfile
 import unittest
+from unittest.mock import patch
 
-from openclaw_iphone.instagram_ops import analyze_video, query_field_candidates, verify_handles
+from openclaw_iphone.instagram_ops import analyze_video, discover_creators, parse_follower_count, query_field_candidates, verify_handles
 from openclaw_iphone.ui import parse_elements
 
 
@@ -158,6 +159,49 @@ class InstagramOpsTests(unittest.TestCase):
             self.assertEqual(item["status"], "captured_current_context_match")
             self.assertEqual(item["current_reel"]["creator"], "prenatal.creator")
             self.assertEqual(client.calls, [])
+
+    def test_discover_creators_harvests_source_and_deep_link_verifies_profiles(self) -> None:
+        class DiscoveryWDA(FakeWDA):
+            def open_url(self, url: str) -> None:
+                super().open_url(url)
+                if "tag?name=" in url:
+                    self.source_text = """<XCUIElementTypeApplication bundleId="com.burbn.instagram" name="Instagram" label="Instagram">
+                      <XCUIElementTypeCell name="media-discovery-cell" label="Video by prenatal.creator media-discovery-cell" visible="true" x="0" y="161" width="215" height="286" />
+                    </XCUIElementTypeApplication>"""
+                elif "prenatal.creator" in url:
+                    self.source_text = """<XCUIElementTypeApplication bundleId="com.burbn.instagram" name="Instagram" label="Instagram">
+                      <XCUIElementTypeStaticText name="prenatal.creator" label="prenatal.creator" visible="true" x="52" y="29" width="118" height="104" />
+                      <XCUIElementTypeOther name="Prenatal Creator" label="Prenatal Creator" visible="true" x="123" y="121" width="291" height="20" />
+                      <XCUIElementTypeButton name="user-detail-header-followers" value="9,812 followers" visible="true" x="203" y="141" width="109" height="70" />
+                      <XCUIElementTypeLink name="user-detail-header-info-label" label="Pregnancy journey and first trimester nausea support" visible="true" x="16" y="213" width="398" height="60" />
+                      <XCUIElementTypeButton label="Video by prenatal.creator media-thumbnail-cell" visible="true" x="0" y="721" width="143" height="191" />
+                    </XCUIElementTypeApplication>"""
+
+        with tempfile.TemporaryDirectory() as tmp, patch("openclaw_iphone.instagram_ops.time.sleep", return_value=None):
+            result = discover_creators(
+                DiscoveryWDA(""),  # type: ignore[arg-type]
+                "pregnancy journey",
+                output_dir=tmp,
+                max_candidates=1,
+                max_source_scrolls=0,
+                deadline_seconds=30,
+            )
+
+            payload = json.loads(result.manifest.read_text(encoding="utf-8"))
+            self.assertTrue(result.report.exists())
+            self.assertEqual(payload["summary"]["candidates_found"], 1)
+            self.assertEqual(payload["summary"]["likely_under_10k_followers"], 1)
+            item = payload["qualified"][0]
+            self.assertEqual(item["handle"], "prenatal.creator")
+            self.assertEqual(item["display_name"], "Prenatal Creator")
+            self.assertTrue(item["deep_link_verified"])
+            self.assertTrue(item["visible_pregnancy_motherhood_evidence"])
+            self.assertTrue(item["recency_signal"])
+
+    def test_parse_follower_count_handles_instagram_units(self) -> None:
+        self.assertEqual(parse_follower_count("1.6 thousand  "), 1600)
+        self.assertEqual(parse_follower_count("9,812 followers"), 9812)
+        self.assertEqual(parse_follower_count("2.4K"), 2400)
 
 
 if __name__ == "__main__":

@@ -140,8 +140,37 @@ is not active, treat the manifest warning as a hard stop. To analyze a reel's
 content, pair the manifest with a spoofed/extracted Instagram asset URL or local
 video file and hand that file/URL to the `video-understand` skill.
 
-For creator research, use the phone for logged-in verification rather than broad
-sourcing. Prefer:
+For broad creator research on the physical phone, use bounded discovery:
+
+```sh
+openclaw-iphone instagram discover-creators \
+  --query "pregnancy journey" \
+  --max-candidates 10 \
+  --deadline-seconds 600 \
+  --output-dir /tmp/iphone
+```
+
+Discovery opens bounded Instagram hashtag result screens, harvests visible media
+handles, deep-links sourced handles to capture profile evidence, and writes JSON
+plus Markdown reports. Each candidate includes handle, display name, follower
+count when visible, bio, visible pregnancy/motherhood evidence, recency signal
+when visible, confidence, caveats, artifact paths, and deep-link verification
+status. It records only URL opens, screenshot/source captures, and scroll drags.
+It must not like, follow, comment, message, post, enable notifications, or change
+account settings.
+
+Run the repeatable benchmark suite with:
+
+```sh
+openclaw-iphone instagram benchmark-discovery --output-dir /tmp/iphone
+```
+
+The benchmark covers `pregnancy journey`, `first trimester pregnancy nausea`,
+and `pregnancy after loss`, then reports candidates found, handles found,
+follower counts found, likely-under-10k counts, evidence counts, recency counts,
+elapsed time, UI steps, ambiguous screens, and artifact paths.
+
+For known-handle verification, prefer:
 
 ```sh
 openclaw-iphone instagram verify-handles creator1 creator2 \

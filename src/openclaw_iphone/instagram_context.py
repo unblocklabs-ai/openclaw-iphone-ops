@@ -81,7 +81,7 @@ def parse_visible_videos(elements: list[ET.Element]) -> list[dict[str, Any]]:
         label = attr(element, "label") or attr(element, "name")
         if not label:
             continue
-        match = re.fullmatch(r"Video by ([A-Za-z0-9._]+)", label)
+        match = re.fullmatch(r"Video by ([A-Za-z0-9._]+)(?:\b.*)?", label)
         if not match:
             continue
         rect = rect_from_element(element)
@@ -132,6 +132,16 @@ def parse_current_profile(elements: list[ET.Element]) -> dict[str, Any] | None:
             profile["posts"] = value
         elif name == "user-detail-header-info-label" and label:
             profile["bio"] = label
+        elif (
+            "display_name" not in profile
+            and element.tag in {"XCUIElementTypeOther", "XCUIElementTypeStaticText"}
+            and label
+            and name == label
+            and not is_probable_instagram_handle(label)
+            and not label.casefold().startswith(("posts", "followers", "following"))
+            and 90 <= (parse_int(attr(element, "y")) or 0) <= 220
+        ):
+            profile["display_name"] = label
         elif (
             element.tag == "XCUIElementTypeStaticText"
             and name
