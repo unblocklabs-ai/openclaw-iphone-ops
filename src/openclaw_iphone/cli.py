@@ -7,7 +7,9 @@ import sys
 
 from .devicectl import DeviceCtl
 from .evidence import artifact_path
-from .errors import OpenClawIPhoneError
+from .errors import DeviceLocked, OpenClawIPhoneError
+from .instagram_context import capture_instagram_context
+from .instagram_ops import DEFAULT_ANALYSIS_PROMPT, analyze_video, verify_handles
 from .recipes.instagram import smoke as instagram_smoke
 from .ui import UIController
 from .wda import WDAClient, WDARunConfig, find_iproxy, resolve_wda_path, run_iproxy, run_wda
@@ -81,12 +83,66 @@ def build_parser() -> argparse.ArgumentParser:
     add_device_arg(instagram_smoke_parser)
     instagram_smoke_parser.set_defaults(handler=handle_instagram_smoke)
 
+    instagram_context = instagram_subcommands.add_parser(
+        "capture-context",
+        help="Capture current Instagram screen/source and parse visible creator/content metadata.",
+    )
+    add_wda_url_arg(instagram_context)
+    instagram_context.add_argument("--output-dir", help="Directory for screenshot/source/manifest artifacts.")
+    instagram_context.add_argument("--prefix", default="instagram-context", help="Artifact filename prefix.")
+    instagram_context.set_defaults(handler=handle_instagram_capture_context)
+
+    instagram_verify = instagram_subcommands.add_parser(
+        "verify-handles",
+        help="Best-effort bounded flow to open known Instagram handles and capture profile evidence.",
+    )
+    add_device_arg(instagram_verify)
+    add_wda_url_arg(instagram_verify)
+    instagram_verify.add_argument("handles", nargs="+", help="Instagram handles, with or without @.")
+    instagram_verify.add_argument("--output-dir", help="Directory for per-handle evidence artifacts.")
+    instagram_verify.add_argument("--prefix", default="instagram-verify")
+    instagram_verify.add_argument("--max-steps-per-handle", type=int, default=12)
+    instagram_verify.add_argument("--deadline-seconds", type=float, help="Wall-clock deadline per handle.")
+    instagram_verify.add_argument("--no-launch", action="store_true", help="Do not launch Instagram before verifying.")
+    instagram_verify.set_defaults(handler=handle_instagram_verify_handles)
+
+    instagram_video = instagram_subcommands.add_parser(
+        "analyze-video",
+        help="Capture current Instagram context and hand a supplied video URL/file to video-understand.",
+    )
+    add_wda_url_arg(instagram_video)
+    instagram_video.add_argument("--video", required=True, help="Direct video URL or local file for video-understand.")
+    instagram_video.add_argument("--prompt", default=DEFAULT_ANALYSIS_PROMPT)
+    instagram_video.add_argument("--output-dir", help="Directory for context and analysis artifacts.")
+    instagram_video.add_argument("--prefix", default="instagram-video-analysis")
+    instagram_video.add_argument("--dry-run", action="store_true", help="Write handoff artifacts without invoking video-understand.")
+    instagram_video.add_argument("--timeout", type=int, default=300)
+    instagram_video.set_defaults(handler=handle_instagram_analyze_video)
+
     wda = subcommands.add_parser("wda", help="WebDriverAgent commands.")
     wda_subcommands = wda.add_subparsers(dest="wda_command")
     wda_status = wda_subcommands.add_parser("status", help="Check whether WebDriverAgent is reachable.")
     add_wda_url_arg(wda_status)
     wda_status.add_argument("--output", help="Optional path for raw status JSON.")
     wda_status.set_defaults(handler=handle_wda_status)
+
+    wda_locked = wda_subcommands.add_parser("locked", help="Check WDA-reported screen lock state.")
+    add_wda_url_arg(wda_locked)
+    wda_locked.set_defaults(handler=handle_wda_locked)
+
+    wda_unlock = wda_subcommands.add_parser("unlock", help="Best-effort WDA unlock attempt.")
+    add_wda_url_arg(wda_unlock)
+    add_device_arg(wda_unlock)
+    wda_unlock.add_argument(
+        "--verify",
+        action="store_true",
+        help="Verify passcode lock state with devicectl after the WDA unlock attempt.",
+    )
+    wda_unlock.set_defaults(handler=handle_wda_unlock)
+
+    wda_lock = wda_subcommands.add_parser("lock", help="Lock the phone through WDA. Mostly for diagnostics.")
+    add_wda_url_arg(wda_lock)
+    wda_lock.set_defaults(handler=handle_wda_lock)
 
     wda_run = wda_subcommands.add_parser(
         "run",
@@ -133,6 +189,81 @@ def build_parser() -> argparse.ArgumentParser:
     ui_source.add_argument("--output", help="Optional path for the source XML/text.")
     ui_source.set_defaults(handler=handle_ui_source)
 
+    ui_elements = ui_subcommands.add_parser("elements", help="Save visible accessibility elements as JSON.")
+    add_wda_url_arg(ui_elements)
+    ui_elements.add_argument("--output", help="Optional path for elements JSON.")
+    ui_elements.add_argument("--all", action="store_true", help="Include elements marked not visible.")
+    ui_elements.set_defaults(handler=handle_ui_elements)
+
+    ui_annotated = ui_subcommands.add_parser("annotated-screenshot", help="Capture screenshot plus element map/HTML overlay.")
+    add_wda_url_arg(ui_annotated)
+    ui_annotated.add_argument("--output", help="Optional path for the PNG screenshot.")
+    ui_annotated.add_argument("--all", action="store_true", help="Include elements marked not visible.")
+    ui_annotated.set_defaults(handler=handle_ui_annotated_screenshot)
+
+    ui_tap = ui_subcommands.add_parser("tap", help="Tap absolute screen coordinates through WebDriverAgent.")
+    add_wda_url_arg(ui_tap)
+    ui_tap.add_argument("--x", type=float, required=True)
+    ui_tap.add_argument("--y", type=float, required=True)
+    ui_tap.set_defaults(handler=handle_ui_tap)
+
+    ui_tap_text = ui_subcommands.add_parser("tap-text", help="Tap the center of a visible element matching text.")
+    add_wda_url_arg(ui_tap_text)
+    ui_tap_text.add_argument("text")
+    ui_tap_text.add_argument("--exact", action="store_true", help="Require exact text/name/label/value match.")
+    ui_tap_text.set_defaults(handler=handle_ui_tap_text)
+
+    ui_wait_text = ui_subcommands.add_parser("wait-text", help="Wait until visible text appears.")
+    add_wda_url_arg(ui_wait_text)
+    ui_wait_text.add_argument("text")
+    ui_wait_text.add_argument("--timeout", type=float, default=10.0)
+    ui_wait_text.add_argument("--interval", type=float, default=0.5)
+    ui_wait_text.add_argument("--exact", action="store_true")
+    ui_wait_text.set_defaults(handler=handle_ui_wait_text)
+
+    ui_scroll_until_text = ui_subcommands.add_parser("scroll-until-text", help="Scroll up until visible text appears.")
+    add_wda_url_arg(ui_scroll_until_text)
+    ui_scroll_until_text.add_argument("text")
+    ui_scroll_until_text.add_argument("--max-scrolls", type=int, default=8)
+    ui_scroll_until_text.add_argument("--exact", action="store_true")
+    ui_scroll_until_text.add_argument("--from-x", type=float, default=200)
+    ui_scroll_until_text.add_argument("--from-y", type=float, default=720)
+    ui_scroll_until_text.add_argument("--to-x", type=float, default=200)
+    ui_scroll_until_text.add_argument("--to-y", type=float, default=260)
+    ui_scroll_until_text.add_argument("--duration", type=float, default=0.2)
+    ui_scroll_until_text.set_defaults(handler=handle_ui_scroll_until_text)
+
+    ui_type = ui_subcommands.add_parser("type", help="Type text into the currently focused field.")
+    add_wda_url_arg(ui_type)
+    ui_type.add_argument("text")
+    ui_type.add_argument("--frequency", type=int, help="Optional WDA typing frequency override.")
+    ui_type.set_defaults(handler=handle_ui_type)
+
+    ui_clear = ui_subcommands.add_parser("clear-field", help="Clear the focused field or a field matched by text.")
+    add_wda_url_arg(ui_clear)
+    ui_clear.add_argument("text", nargs="?", help="Optional visible text/name/label to tap before clearing.")
+    ui_clear.add_argument("--exact", action="store_true")
+    ui_clear.set_defaults(handler=handle_ui_clear_field)
+
+    ui_drag = ui_subcommands.add_parser("drag", help="Drag between absolute screen coordinates.")
+    add_wda_url_arg(ui_drag)
+    ui_drag.add_argument("--from-x", type=float, required=True)
+    ui_drag.add_argument("--from-y", type=float, required=True)
+    ui_drag.add_argument("--to-x", type=float, required=True)
+    ui_drag.add_argument("--to-y", type=float, required=True)
+    ui_drag.add_argument("--duration", type=float, default=0.1, help="Press duration before dragging, in seconds.")
+    ui_drag.set_defaults(handler=handle_ui_drag)
+
+    ui_press_button = ui_subcommands.add_parser("press-button", help="Press an iPhone hardware button.")
+    add_wda_url_arg(ui_press_button)
+    ui_press_button.add_argument("name", help="Button name, for example home, volumeUp, volumeDown, or siri.")
+    ui_press_button.add_argument("--duration", type=float, help="Optional press duration in seconds.")
+    ui_press_button.set_defaults(handler=handle_ui_press_button)
+
+    ui_back = ui_subcommands.add_parser("back", help="Navigate back through WDA.")
+    add_wda_url_arg(ui_back)
+    ui_back.set_defaults(handler=handle_ui_back)
+
     return parser
 
 
@@ -153,7 +284,7 @@ def client_from_args(args: argparse.Namespace) -> DeviceCtl:
 
 
 def wda_client_from_args(args: argparse.Namespace) -> WDAClient:
-    return WDAClient(url=args.url, timeout=args.timeout)
+    return WDAClient(url=getattr(args, "url", None), timeout=args.timeout)
 
 
 def handle_devices_list(args: argparse.Namespace) -> int:
@@ -187,7 +318,7 @@ def handle_apps_launch(args: argparse.Namespace) -> int:
     device = client.select_device(args.device)
     app = client.find_app(device.identifier, args.query)
     if not args.skip_lock_check:
-        client.require_unlocked(device.identifier)
+        ensure_unlocked_or_attempt_wda(args, client, device.identifier)
     client.launch_app(device.identifier, app.bundle_identifier)
     print(f"launched: {app.name} ({app.bundle_identifier}) on {device.name}")
     return 0
@@ -212,6 +343,67 @@ def handle_instagram_smoke(args: argparse.Namespace) -> int:
     return 0
 
 
+def handle_instagram_capture_context(args: argparse.Namespace) -> int:
+    capture = capture_instagram_context(
+        wda_client_from_args(args),
+        output_dir=args.output_dir or args.evidence_dir,
+        prefix=args.prefix,
+    )
+    print(f"screenshot: {capture.screenshot}")
+    print(f"source: {capture.source}")
+    print(f"manifest: {capture.manifest}")
+    current_reel = capture.payload.get("current_reel")
+    current_profile = capture.payload.get("current_profile")
+    visible_videos = capture.payload.get("visible_videos") or []
+    if current_reel:
+        print(f"current reel: {current_reel}")
+    if current_profile:
+        print(f"current profile: {current_profile}")
+    if visible_videos:
+        print(f"visible videos: {len(visible_videos)}")
+        for video in visible_videos[:8]:
+            print(f"- {video.get('creator')}\t{video.get('plays')}\t{video.get('rect')}")
+    return 0
+
+
+def handle_instagram_verify_handles(args: argparse.Namespace) -> int:
+    if not args.no_launch:
+        client = client_from_args(args)
+        device = client.select_device(args.device)
+        ensure_unlocked_or_attempt_wda(args, client, device.identifier)
+        app = client.find_app(device.identifier, "Instagram")
+        client.launch_app(device.identifier, app.bundle_identifier)
+    result = verify_handles(
+        wda_client_from_args(args),
+        args.handles,
+        output_dir=args.output_dir or args.evidence_dir,
+        prefix=args.prefix,
+        max_steps_per_handle=args.max_steps_per_handle,
+        deadline_seconds=args.deadline_seconds,
+    )
+    print(f"manifest: {result.manifest}")
+    for item in result.payload.get("handles", []):
+        print(f"{item.get('handle')}: {item.get('status')}")
+    return 0
+
+
+def handle_instagram_analyze_video(args: argparse.Namespace) -> int:
+    result = analyze_video(
+        wda_client_from_args(args),
+        args.video,
+        prompt=args.prompt,
+        output_dir=args.output_dir or args.evidence_dir,
+        prefix=args.prefix,
+        dry_run=args.dry_run,
+        timeout=args.timeout,
+    )
+    print(f"manifest: {result.manifest}")
+    print(f"status: {result.payload.get('status')}")
+    if result.payload.get("blocker"):
+        print(f"blocker: {result.payload.get('blocker')}")
+    return 0 if result.payload.get("status") in {"analyzed", "dry_run"} else 1
+
+
 def handle_wda_status(args: argparse.Namespace) -> int:
     status = wda_client_from_args(args).status()
     artifact = Path(args.output) if args.output else artifact_path("wda-status", base=args.evidence_dir)
@@ -223,6 +415,40 @@ def handle_wda_status(args: argparse.Namespace) -> int:
     print("reachable: true")
     print(f"ready: {ready}")
     print(f"evidence: {artifact}")
+    return 0
+
+
+def handle_wda_locked(args: argparse.Namespace) -> int:
+    locked = wda_client_from_args(args).locked()
+    value = "unknown" if locked is None else str(locked).lower()
+    print(f"locked: {value}")
+    return 0
+
+
+def handle_wda_unlock(args: argparse.Namespace) -> int:
+    wda_client_from_args(args).unlock()
+    print("unlock-attempted: true")
+    locked = wda_client_from_args(args).locked()
+    if locked is not None:
+        print(f"wda-locked: {str(locked).lower()}")
+    if args.verify:
+        device = client_from_args(args).select_device(args.device)
+        data, artifact = client_from_args(args).lock_state(device.identifier)
+        result = data.get("result", {})
+        passcode_required = result.get("passcodeRequired") if isinstance(result, dict) else None
+        value = "unknown" if not isinstance(passcode_required, bool) else str(passcode_required).lower()
+        print(f"passcode-required: {value}")
+        print(f"evidence: {artifact}")
+        if passcode_required is True:
+            print("result: human-unlock-required")
+            return 1
+    print("result: ok")
+    return 0
+
+
+def handle_wda_lock(args: argparse.Namespace) -> int:
+    wda_client_from_args(args).lock()
+    print("locked: true")
     return 0
 
 
@@ -248,6 +474,17 @@ def handle_wda_run(args: argparse.Namespace) -> int:
             allow_provisioning_updates=args.allow_provisioning_updates,
         )
     )
+
+
+def ensure_unlocked_or_attempt_wda(args: argparse.Namespace, client: DeviceCtl, device_id: str) -> None:
+    try:
+        client.require_unlocked(device_id)
+        return
+    except DeviceLocked:
+        pass
+
+    wda_client_from_args(args).unlock()
+    client.require_unlocked(device_id)
 
 
 def handle_wda_tunnel(args: argparse.Namespace) -> int:
@@ -279,4 +516,113 @@ def handle_ui_source(args: argparse.Namespace) -> int:
         evidence_base=args.evidence_dir,
     ).capture_source(args.output)
     print(f"source: {path}")
+    return 0
+
+
+def handle_ui_elements(args: argparse.Namespace) -> int:
+    path = UIController(
+        wda_client_from_args(args),
+        evidence_base=args.evidence_dir,
+    ).save_elements(args.output, visible_only=not args.all)
+    print(f"elements: {path}")
+    return 0
+
+
+def handle_ui_annotated_screenshot(args: argparse.Namespace) -> int:
+    screenshot, elements, html = UIController(
+        wda_client_from_args(args),
+        evidence_base=args.evidence_dir,
+    ).annotated_screenshot(args.output, visible_only=not args.all)
+    print(f"screenshot: {screenshot}")
+    print(f"elements: {elements}")
+    print(f"annotation: {html}")
+    return 0
+
+
+def handle_ui_tap(args: argparse.Namespace) -> int:
+    UIController(wda_client_from_args(args), evidence_base=args.evidence_dir).tap(args.x, args.y)
+    print(f"tapped: {args.x:g},{args.y:g}")
+    return 0
+
+
+def handle_ui_tap_text(args: argparse.Namespace) -> int:
+    element = UIController(wda_client_from_args(args), evidence_base=args.evidence_dir).tap_text(
+        args.text,
+        exact=args.exact,
+    )
+    print(f"tapped: {element.index}\t{element.type}\t{element.text}")
+    return 0
+
+
+def handle_ui_wait_text(args: argparse.Namespace) -> int:
+    element = UIController(wda_client_from_args(args), evidence_base=args.evidence_dir).wait_text(
+        args.text,
+        timeout=args.timeout,
+        interval=args.interval,
+        exact=args.exact,
+    )
+    print(f"found: {element.index}\t{element.type}\t{element.text}")
+    return 0
+
+
+def handle_ui_scroll_until_text(args: argparse.Namespace) -> int:
+    element = UIController(wda_client_from_args(args), evidence_base=args.evidence_dir).scroll_until_text(
+        args.text,
+        max_scrolls=args.max_scrolls,
+        exact=args.exact,
+        start_x=args.from_x,
+        start_y=args.from_y,
+        end_x=args.to_x,
+        end_y=args.to_y,
+        duration=args.duration,
+    )
+    print(f"found: {element.index}\t{element.type}\t{element.text}")
+    return 0
+
+
+def handle_ui_type(args: argparse.Namespace) -> int:
+    UIController(wda_client_from_args(args), evidence_base=args.evidence_dir).type_text(
+        args.text,
+        frequency=args.frequency,
+    )
+    print(f"typed: {len(args.text)} chars")
+    return 0
+
+
+def handle_ui_clear_field(args: argparse.Namespace) -> int:
+    element = UIController(wda_client_from_args(args), evidence_base=args.evidence_dir).clear_field(
+        args.text,
+        exact=args.exact,
+    )
+    if element is None:
+        print("cleared: focused-field")
+    else:
+        print(f"cleared: {element.index}\t{element.type}\t{element.text}")
+    return 0
+
+
+def handle_ui_drag(args: argparse.Namespace) -> int:
+    UIController(wda_client_from_args(args), evidence_base=args.evidence_dir).drag(
+        args.from_x,
+        args.from_y,
+        args.to_x,
+        args.to_y,
+        duration=args.duration,
+    )
+    print(f"dragged: {args.from_x:g},{args.from_y:g} -> {args.to_x:g},{args.to_y:g}")
+    return 0
+
+
+def handle_ui_press_button(args: argparse.Namespace) -> int:
+    UIController(wda_client_from_args(args), evidence_base=args.evidence_dir).press_button(
+        args.name,
+        duration=args.duration,
+    )
+    print(f"pressed: {args.name}")
+    return 0
+
+
+def handle_ui_back(args: argparse.Namespace) -> int:
+    UIController(wda_client_from_args(args), evidence_base=args.evidence_dir).back()
+    print("back: true")
     return 0

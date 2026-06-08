@@ -56,7 +56,10 @@ Example:
 xcrun devicectl device info lockState --device "$DEVICE_ID" --json-output "$TMPDIR/lock-state.json"
 ```
 
-If the phone is locked, do not keep pushing UI commands. Ask for an unlock and report the exact boundary.
+If the phone is locked, try `openclaw-iphone wda unlock --verify` once. This
+agent phone is expected to have no passcode, so WDA unlock should normally
+recover without human input. If verification still reports passcode required,
+do not keep pushing UI commands. Ask for an unlock and report the exact boundary.
 
 ## App Control Pattern
 
@@ -86,4 +89,3 @@ When blocked, report the exact failed step and what is needed:
 - "The App Store prompt rejected the stored credential; a human needs to verify the Apple ID credential or complete the prompt."
 
 Avoid generic statements like "the iPhone cannot be used" unless device discovery itself fails after focused checks.
-

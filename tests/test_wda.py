@@ -18,8 +18,39 @@ class FakeWDAClient(WDAClient):
         super().__init__(url="http://wda.test", timeout=1)
         self.responses = responses
 
-    def _request(self, path: str) -> bytes:
+    def _request(self, path: str, *, method: str = "GET", payload: dict | None = None) -> bytes:
         return self.responses[path]
+
+
+class RecordingWDAClient(WDAClient):
+    def __init__(self) -> None:
+        super().__init__(url="http://wda.test", timeout=1)
+        self.posts: list[tuple[str, dict]] = []
+        self.requests: list[tuple[str, str, dict | None]] = []
+
+    def _json_post(self, path: str, payload: dict) -> dict:
+        self.posts.append((path, payload))
+        if path == "/session":
+            return {"sessionId": "session-123", "value": {}}
+        return {"value": None}
+
+    def _request(self, path: str, *, method: str = "GET", payload: dict | None = None) -> bytes:
+        self.requests.append((method, path, payload))
+        return b'{"value": null}'
+
+
+class SelectiveFailingBackWDAClient(RecordingWDAClient):
+    def __init__(self, *, fail_wda_back: bool, fail_session_back: bool) -> None:
+        super().__init__()
+        self.fail_wda_back = fail_wda_back
+        self.fail_session_back = fail_session_back
+
+    def _json_post(self, path: str, payload: dict) -> dict:
+        if path == "/wda/back" and self.fail_wda_back:
+            raise WDAUnavailable("WDA POST /wda/back failed with HTTP 404")
+        if path == "/session/session-123/back" and self.fail_session_back:
+            raise WDAUnavailable("WDA POST /session/session-123/back failed with HTTP 404")
+        return super()._json_post(path, payload)
 
 
 class WDATests(unittest.TestCase):
@@ -75,6 +106,189 @@ class WDATests(unittest.TestCase):
 
         with self.assertRaises(WDAUnavailable):
             client.screenshot()
+
+    def test_locked_reads_boolean_value(self) -> None:
+        client = FakeWDAClient({"/wda/locked": b'{"value":true}'})
+
+        self.assertTrue(client.locked())
+
+    def test_locked_returns_none_for_unknown_shape(self) -> None:
+        client = FakeWDAClient({"/wda/locked": b'{"value":"unknown"}'})
+
+        self.assertIsNone(client.locked())
+
+    def test_unlock_posts_wda_unlock(self) -> None:
+        client = RecordingWDAClient()
+
+        client.unlock()
+
+        self.assertEqual(client.posts, [("/wda/unlock", {})])
+
+    def test_lock_posts_wda_lock(self) -> None:
+        client = RecordingWDAClient()
+
+        client.lock()
+
+        self.assertEqual(client.posts, [("/wda/lock", {})])
+
+    def test_tap_posts_w3c_touch_action_and_deletes_session(self) -> None:
+        client = RecordingWDAClient()
+
+        client.tap(12.5, 44)
+
+        self.assertEqual(client.posts[0], ("/session", {"capabilities": {"alwaysMatch": {}, "firstMatch": [{}]}}))
+        self.assertEqual(
+            client.posts[1],
+            (
+                "/session/session-123/actions",
+                {
+                    "actions": [
+                        {
+                            "type": "pointer",
+                            "id": "finger1",
+                            "parameters": {"pointerType": "touch"},
+                            "actions": [
+                                {"type": "pointerMove", "duration": 0, "x": 12.5, "y": 44},
+                                {"type": "pointerDown", "button": 0},
+                                {"type": "pause", "duration": 100},
+                                {"type": "pointerUp", "button": 0},
+                            ],
+                        }
+                    ]
+                },
+            ),
+        )
+        self.assertEqual(client.requests, [("DELETE", "/session/session-123", None)])
+
+    def test_type_text_posts_w3c_key_actions_and_deletes_session(self) -> None:
+        client = RecordingWDAClient()
+
+        client.type_text("hi")
+
+        self.assertEqual(client.posts[0], ("/session", {"capabilities": {"alwaysMatch": {}, "firstMatch": [{}]}}))
+        self.assertEqual(
+            client.posts[1],
+            (
+                "/session/session-123/actions",
+                {
+                    "actions": [
+                        {
+                            "type": "key",
+                            "id": "keyboard1",
+                            "actions": [
+                                {"type": "keyDown", "value": "h"},
+                                {"type": "keyUp", "value": "h"},
+                            ],
+                        }
+                    ]
+                },
+            ),
+        )
+        self.assertEqual(
+            client.posts[3],
+            (
+                "/session/session-123/actions",
+                {
+                    "actions": [
+                        {
+                            "type": "key",
+                            "id": "keyboard1",
+                            "actions": [
+                                {"type": "keyDown", "value": "i"},
+                                {"type": "keyUp", "value": "i"},
+                            ],
+                        }
+                    ]
+                },
+            ),
+        )
+        self.assertEqual(client.requests, [("DELETE", "/session/session-123", None), ("DELETE", "/session/session-123", None)])
+
+    def test_clear_text_posts_repeated_backspace_actions(self) -> None:
+        client = RecordingWDAClient()
+
+        client.clear_text(max_chars=2)
+
+        self.assertEqual(client.posts[0], ("/session", {"capabilities": {"alwaysMatch": {}, "firstMatch": [{}]}}))
+        self.assertEqual(
+            client.posts[1],
+            (
+                "/session/session-123/actions",
+                {
+                    "actions": [
+                        {
+                            "type": "key",
+                            "id": "keyboard1",
+                            "actions": [
+                                {"type": "keyDown", "value": "\ue003"},
+                                {"type": "keyUp", "value": "\ue003"},
+                            ],
+                        }
+                    ]
+                },
+            ),
+        )
+        self.assertEqual(len(client.requests), 2)
+
+    def test_press_button_posts_name_and_duration(self) -> None:
+        client = RecordingWDAClient()
+
+        client.press_button("home", duration=0.2)
+
+        self.assertEqual(client.posts, [("/wda/pressButton", {"name": "home", "duration": 0.2})])
+
+    def test_back_posts_wda_back(self) -> None:
+        client = RecordingWDAClient()
+
+        client.back()
+
+        self.assertEqual(client.posts, [("/wda/back", {})])
+
+    def test_back_falls_back_to_session_back(self) -> None:
+        client = SelectiveFailingBackWDAClient(fail_wda_back=True, fail_session_back=False)
+
+        client.back()
+
+        self.assertEqual(
+            client.posts,
+            [
+                ("/session", {"capabilities": {"alwaysMatch": {}, "firstMatch": [{}]}}),
+                ("/session/session-123/back", {}),
+            ],
+        )
+        self.assertEqual(client.requests, [("DELETE", "/session/session-123", None)])
+
+    def test_back_raises_clean_error_when_all_wda_routes_fail(self) -> None:
+        client = SelectiveFailingBackWDAClient(fail_wda_back=True, fail_session_back=True)
+
+        with self.assertRaisesRegex(WDAUnavailable, "WDA back is unavailable on this runner"):
+            client.back()
+
+        self.assertEqual(client.requests, [("DELETE", "/session/session-123", None)])
+
+    def test_open_url_posts_webdriver_url_and_deletes_session(self) -> None:
+        client = RecordingWDAClient()
+
+        client.open_url("instagram://user?username=creator")
+
+        self.assertEqual(client.posts[0], ("/session", {"capabilities": {"alwaysMatch": {}, "firstMatch": [{}]}}))
+        self.assertEqual(client.posts[1], ("/session/session-123/url", {"url": "instagram://user?username=creator"}))
+        self.assertEqual(client.requests, [("DELETE", "/session/session-123", None)])
+
+    def test_drag_posts_absolute_coordinates(self) -> None:
+        client = RecordingWDAClient()
+
+        client.drag(10, 20, 30, 40, duration=0.4)
+
+        self.assertEqual(
+            client.posts,
+            [
+                (
+                    "/wda/dragfromtoforduration",
+                    {"fromX": 10, "fromY": 20, "toX": 30, "toY": 40, "duration": 0.4},
+                )
+            ],
+        )
 
     def test_find_xcode_container_prefers_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
