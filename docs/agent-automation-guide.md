@@ -196,6 +196,17 @@ verified creators, rejected/low-confidence verified candidates, and unresolved
 source-only candidates needing manual review. Treat `deep_link_verified:
 false` and missing profile fields as unverified, not disqualified.
 
+To validate ranking quality across broader pregnancy/motherhood themes:
+
+```sh
+openclaw-iphone instagram benchmark-ranking-quality --output-dir /tmp/iphone
+```
+
+The benchmark verifies the top-ranked candidates and a lower-ranked comparison
+sample where available. Use its JSON/Markdown reports to compare credible-lead
+yield, precision, speed, duplicate rate, unresolved count, zero irreversible
+actions, and failure modes before changing ranking weights.
+
 For known-handle verification, prefer:
 
 ```sh

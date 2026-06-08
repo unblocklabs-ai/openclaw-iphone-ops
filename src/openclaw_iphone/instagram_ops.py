@@ -675,6 +675,17 @@ def benchmark_ranking_quality(
         top_verified = triage.payload.get("verification_stage", {}).get("verified", [])
         top_credible = select_shortlist(top_verified, verify_top)
         comparison_credible = select_shortlist(comparison_verified, comparison_size)
+        failure_modes = ranking_quality_failure_modes(
+            ranked_count=len(ranked),
+            candidates_per_theme=candidates_per_theme,
+            verify_top=verify_top,
+            top_verified_count=len(top_verified),
+            top_credible_count=len(top_credible),
+            comparison_size=comparison_size,
+            comparison_verified_count=len(comparison_verified),
+            top_precision_value=precision(len(top_credible), len(top_verified)),
+            comparison_precision_value=precision(len(comparison_credible), len(comparison_verified)),
+        )
         run = {
             "theme": theme,
             "triage_manifest": str(triage.manifest),
@@ -695,6 +706,7 @@ def benchmark_ranking_quality(
             "comparison_verified": comparison_verified,
             "comparison_credible": comparison_credible,
             "passed_yield_target": len(top_credible) >= 5,
+            "failure_modes": failure_modes,
         }
         runs.append(run)
 
@@ -1410,6 +1422,11 @@ def ranking_quality_summary(runs: list[dict[str, Any]], started: float) -> dict[
     top_credible = sum(int(run.get("top_credible_count") or 0) for run in runs)
     comparison_verified = sum(int(run.get("comparison_verified_count") or 0) for run in runs)
     comparison_credible = sum(int(run.get("comparison_credible_count") or 0) for run in runs)
+    failure_modes: dict[str, int] = {}
+    for run in runs:
+        for failure_mode in run.get("failure_modes") or []:
+            key = str(failure_mode)
+            failure_modes[key] = failure_modes.get(key, 0) + 1
     return {
         "elapsed_seconds": round(time.monotonic() - started, 2),
         "runs": run_count,
@@ -1429,7 +1446,34 @@ def ranking_quality_summary(runs: list[dict[str, Any]], started: float) -> dict[
         )
         if run_count
         else 0.0,
+        "failure_modes": failure_modes,
     }
+
+
+def ranking_quality_failure_modes(
+    *,
+    ranked_count: int,
+    candidates_per_theme: int,
+    verify_top: int,
+    top_verified_count: int,
+    top_credible_count: int,
+    comparison_size: int,
+    comparison_verified_count: int,
+    top_precision_value: float,
+    comparison_precision_value: float,
+) -> list[str]:
+    failures: list[str] = []
+    if ranked_count < candidates_per_theme:
+        failures.append("source_candidate_shortfall")
+    if top_verified_count < verify_top:
+        failures.append("top_verification_shortfall")
+    if top_credible_count < 5:
+        failures.append("top_yield_below_target")
+    if comparison_verified_count < comparison_size:
+        failures.append("comparison_sample_shortfall")
+    if comparison_verified_count and top_precision_value <= comparison_precision_value:
+        failures.append("top_precision_not_above_comparison")
+    return failures
 
 
 def precision(numerator: int, denominator: int) -> float:
@@ -1656,6 +1700,7 @@ def render_ranking_quality_markdown(payload: dict[str, Any]) -> str:
         f"- Top precision: {summary.get('top_precision')}",
         f"- Comparison precision: {summary.get('comparison_precision')}",
         f"- Ranking lift vs comparison: {summary.get('ranking_lift_vs_comparison')}",
+        f"- Failure modes: {summary.get('failure_modes') or {}}",
         f"- Elapsed seconds: {summary.get('elapsed_seconds')}",
         "",
         "## Runs",
@@ -1677,6 +1722,7 @@ def render_ranking_quality_markdown(payload: dict[str, Any]) -> str:
                 f"- Comparison verified: {run.get('comparison_verified_count')}",
                 f"- Comparison credible: {run.get('comparison_credible_count')}",
                 f"- Comparison precision: {run.get('comparison_precision')}",
+                f"- Failure modes: {', '.join(run.get('failure_modes') or []) if run.get('failure_modes') else 'none'}",
                 f"- Triage manifest: {run.get('triage_manifest')}",
                 f"- Triage report: {run.get('triage_report')}",
                 "",
@@ -1705,7 +1751,20 @@ def render_ranking_quality_markdown(payload: dict[str, Any]) -> str:
 
 
 def ranking_quality_recommendation(summary: dict[str, Any]) -> str:
-    if summary.get("target_passed") and (summary.get("ranking_lift_vs_comparison") or 0) >= 0:
+    failure_modes = summary.get("failure_modes") or {}
+    if summary.get("target_passed") and (summary.get("top_precision") or 0) <= (summary.get("comparison_precision") or 0):
+        if failure_modes.get("source_candidate_shortfall"):
+            return (
+                "Current ranking is meeting the 80% yield target, but top-ranked precision is not beating the "
+                "lower-ranked comparison and source pools are smaller than requested. Next best experiment: broaden "
+                "source collection before adding new ranking weights."
+            )
+        return (
+            "Current ranking is meeting the 80% yield target, but top-ranked precision is not beating the "
+            "lower-ranked comparison. Next best experiment: add richer source evidence quality signals and rerun "
+            "the top-vs-comparison benchmark before increasing verification volume."
+        )
+    if summary.get("target_passed") and (summary.get("ranking_lift_vs_comparison") or 0) > 0:
         return (
             "Current ranking is meeting the 80% yield target. Next best experiment: add an optional "
             "second-pass verification for high-scoring unresolved candidates to increase shortlist breadth."

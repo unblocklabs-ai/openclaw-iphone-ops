@@ -344,7 +344,9 @@ class InstagramOpsTests(unittest.TestCase):
             self.assertEqual(run["comparison_verified_count"], 1)
             self.assertIn("top_precision", run)
             self.assertIn("comparison_precision", run)
+            self.assertIn("failure_modes", run)
             self.assertEqual(payload["summary"]["runs"], 1)
+            self.assertIn("failure_modes", payload["summary"])
 
 
 if __name__ == "__main__":

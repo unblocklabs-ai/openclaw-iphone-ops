@@ -197,6 +197,19 @@ deep-link verifies only the top candidates. The final JSON and Markdown reports
 separate shortlisted verified creators, rejected/low-confidence verified
 candidates, and unresolved source-only candidates needing manual review.
 
+To validate ranking quality across broader pregnancy/motherhood themes and
+compare top-ranked candidates with a lower-ranked verification sample:
+
+```sh
+PYTHONPATH=src python3 -m openclaw_iphone instagram benchmark-ranking-quality \
+  --output-dir /Users/pearlperelel/.openclaw/tmp/openclaw-iphone-ops
+```
+
+The ranking benchmark writes aggregate JSON/Markdown reports plus per-theme
+triage reports. It tracks top-10 credible-lead yield, top precision, comparison
+precision, speed, duplicate rate, unresolved count, and failure modes such as
+source shortfalls or missing lower-ranked comparison samples.
+
 To pair current Instagram context with a direct video URL or local video file:
 
 ```sh
