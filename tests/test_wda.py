@@ -7,7 +7,7 @@ import tempfile
 import unittest
 
 from openclaw_iphone.errors import WDASetupError, WDAUnavailable
-from openclaw_iphone.wda import WDAClient, WDARunConfig, build_xcodebuild_command, find_xcode_container, iproxy_command, parse_ready
+from openclaw_iphone.wda import WDAClient, WDARunConfig, build_xcodebuild_command, find_xcode_container, parse_ready
 
 
 PNG_BYTES = b"\x89PNG\r\n\x1a\nfake-png"
@@ -275,20 +275,37 @@ class WDATests(unittest.TestCase):
         self.assertEqual(client.posts[1], ("/session/session-123/url", {"url": "instagram://user?username=creator"}))
         self.assertEqual(client.requests, [("DELETE", "/session/session-123", None)])
 
-    def test_drag_posts_absolute_coordinates(self) -> None:
+    def test_drag_posts_w3c_touch_action_and_deletes_session(self) -> None:
         client = RecordingWDAClient()
 
         client.drag(10, 20, 30, 40, duration=0.4)
 
+        self.assertEqual(client.posts[0], ("/session", {"capabilities": {"alwaysMatch": {}, "firstMatch": [{}]}}))
         self.assertEqual(
-            client.posts,
-            [
+            client.posts[1],
+            (
+                "/session/session-123/actions",
                 (
-                    "/wda/dragfromtoforduration",
-                    {"fromX": 10, "fromY": 20, "toX": 30, "toY": 40, "duration": 0.4},
-                )
-            ],
+                    {
+                        "actions": [
+                            {
+                                "type": "pointer",
+                                "id": "finger1",
+                                "parameters": {"pointerType": "touch"},
+                                "actions": [
+                                    {"type": "pointerMove", "duration": 0, "x": 10, "y": 20},
+                                    {"type": "pointerDown", "button": 0},
+                                    {"type": "pause", "duration": 400},
+                                    {"type": "pointerMove", "duration": 400, "x": 30, "y": 40},
+                                    {"type": "pointerUp", "button": 0},
+                                ],
+                            }
+                        ]
+                    }
+                ),
+            ),
         )
+        self.assertEqual(client.requests, [("DELETE", "/session/session-123", None)])
 
     def test_find_xcode_container_prefers_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -342,26 +359,6 @@ class WDATests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(WDASetupError):
                 find_xcode_container(Path(tmp))
-
-    def test_iproxy_command_fails_cleanly_when_missing(self) -> None:
-        # This host currently has no iproxy; if future hosts do, the command shape
-        # remains covered by integration use.
-        import shutil
-
-        if shutil.which("iproxy"):
-            self.skipTest("iproxy is installed on this host")
-
-        with self.assertRaises(WDASetupError):
-            iproxy_command("device-id")
-
-    def test_iproxy_command_shape_when_binary_exists(self) -> None:
-        import unittest.mock
-
-        with unittest.mock.patch("shutil.which", return_value="/usr/bin/iproxy"):
-            self.assertEqual(
-                iproxy_command("device-id", local_port=8101, device_port=8100),
-                ["/usr/bin/iproxy", "--udid", "device-id", "8101:8100"],
-            )
 
 
 if __name__ == "__main__":

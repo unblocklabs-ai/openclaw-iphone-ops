@@ -53,6 +53,43 @@ class DeviceCtl:
         devices = [_device_from_json(item) for item in find_list(data, "devices")]
         return devices, output
 
+    def device_details(self, device_id: str) -> tuple[dict[str, Any], Path]:
+        output = artifact_path("device-details", base=self.evidence_base)
+        self.runner.run(
+            [
+                "xcrun",
+                "devicectl",
+                "device",
+                "info",
+                "details",
+                "--device",
+                device_id,
+                "--json-output",
+                str(output),
+            ]
+        )
+        return read_json(output), output
+
+    def coredevice_wda_url(self, device_id: str, *, port: int = 8100) -> tuple[str, Path]:
+        data, output = self.device_details(device_id)
+        result = data.get("result", {})
+        if not isinstance(result, dict):
+            raise DeviceSelectionError("CoreDevice details response did not include a result object.")
+
+        connection = result.get("connectionProperties", {})
+        if not isinstance(connection, dict):
+            raise DeviceSelectionError("CoreDevice details response did not include connection properties.")
+
+        tunnel_state = connection.get("tunnelState")
+        tunnel_ip = connection.get("tunnelIPAddress")
+        if tunnel_state != "connected" or not tunnel_ip:
+            raise DeviceSelectionError(
+                "CoreDevice tunnel is not connected for the selected iPhone; "
+                "keep the phone plugged in, paired, trusted, and visible to Xcode."
+            )
+
+        return f"http://{url_host(str(tunnel_ip))}:{port}", output
+
     def select_device(self, requested: str | None = None) -> Device:
         requested = requested or None
         devices, _ = self.list_devices()
@@ -63,8 +100,8 @@ class DeviceCtl:
             matches = [
                 device
                 for device in pool
-                if requested in {device.identifier, device.name}
-                or requested.lower() in {device.identifier.lower(), device.name.lower()}
+                if requested in {device.identifier, device.name, device.udid}
+                or requested.lower() in {device.identifier.lower(), device.name.lower(), device.udid.lower()}
             ]
             if not matches:
                 raise DeviceSelectionError(f"No connected iPhone matched {requested!r}.")
@@ -77,7 +114,10 @@ class DeviceCtl:
         if not pool:
             raise DeviceSelectionError("No connected iPhone was found.")
         names = ", ".join(f"{device.name} ({device.identifier})" for device in pool)
-        raise DeviceSelectionError(f"Multiple devices found; pass --device. Candidates: {names}")
+        raise DeviceSelectionError(
+            "Multiple devices found; set OPENCLAW_IPHONE_DEVICE in config.env "
+            f"or pass --device where supported. Candidates: {names}"
+        )
 
     def lock_state(self, device_id: str) -> tuple[dict[str, Any], Path]:
         output = artifact_path("lock-state", base=self.evidence_base)
@@ -98,12 +138,21 @@ class DeviceCtl:
 
     def require_unlocked(self, device_id: str) -> Path:
         data, output = self.lock_state(device_id)
-        result = data.get("result", {})
-        if isinstance(result, dict) and result.get("passcodeRequired") is True:
+        result = data.get("result")
+        if not isinstance(result, dict):
+            raise DeviceLocked(
+                "Blocked at lock state: devicectl returned an unknown lock-state response."
+            )
+        passcode_required = result.get("passcodeRequired")
+        if passcode_required is False:
+            return output
+        if passcode_required is True:
             raise DeviceLocked(
                 "Blocked at lock state: the device is locked and needs human unlock."
             )
-        return output
+        raise DeviceLocked(
+            "Blocked at lock state: devicectl did not report a boolean passcodeRequired value."
+        )
 
     def list_apps(self, device_id: str, *, include_all: bool = True) -> tuple[list[App], Path]:
         output = artifact_path("apps", base=self.evidence_base)
@@ -235,3 +284,9 @@ def value_at(item: dict[str, Any], dotted_key: str) -> Any:
             return None
         current = current[part]
     return current
+
+
+def url_host(host: str) -> str:
+    if ":" in host and not (host.startswith("[") and host.endswith("]")):
+        return f"[{host}]"
+    return host

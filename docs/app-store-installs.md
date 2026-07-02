@@ -21,8 +21,9 @@
 9. Verify the app appears in `devicectl` installed-app output.
 
 The reusable example is `snippets/wda-app-store-install-example.py`. It assumes
-WebDriverAgent is already running and accepts `APP_NAME`, `EXPECTED_PUBLISHER`,
-`EXPECTED_BUNDLE_ID`, `DEVICE_ID`, and `WDA_URL` through environment variables.
+WebDriverAgent is already running, resolves the live WDA URL from the host
+config/CoreDevice path, and accepts `APP_NAME`, `EXPECTED_PUBLISHER`,
+`EXPECTED_BUNDLE_ID`, and optional `DEVICE_ID` through environment variables.
 
 ## Default Prompt Choices
 

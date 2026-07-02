@@ -17,8 +17,7 @@ xcrun devicectl list devices
 cat <<'EOF'
 
 Next:
-  1. Pick the physical iPhone identifier from the device list.
+  1. Set OPENCLAW_IPHONE_DEVICE in ~/.openclaw/iphone/config.env if more than one device is connected.
   2. Run:
-       DEVICE_ID="<udid-or-device-name>" ./snippets/iphone-lock-state.sh
+       ./snippets/iphone-lock-state.sh
 EOF
-

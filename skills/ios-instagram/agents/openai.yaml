@@ -1,0 +1,5 @@
+interface:
+  display_name: "iOS Instagram"
+  short_description: "Automate Instagram on a physical iPhone"
+  brand_color: "#C13584"
+  default_prompt: "Use $ios-instagram to launch Instagram on the physical iPhone, capture evidence, and complete the requested workflow."

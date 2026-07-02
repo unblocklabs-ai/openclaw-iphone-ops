@@ -23,13 +23,10 @@ if value:
 PY
 )"
 REPO_DIR="${CONFIG_REPO_DIR:-$REPO_FROM_SCRIPT}"
-
-set -- \
-  python3 -m openclaw_iphone wda run \
-  --allow-provisioning-updates
+TIMEOUT="${OPENCLAW_IPHONE_WATCHDOG_TIMEOUT:-20}"
 
 export PYTHONPATH="$REPO_DIR/src${PYTHONPATH:+:$PYTHONPATH}"
 
 cd "$REPO_DIR"
 
-exec "$@"
+exec python3 -m openclaw_iphone --timeout "$TIMEOUT" watchdog once

@@ -6,7 +6,6 @@ import binascii
 import json
 import os
 from pathlib import Path
-import shutil
 import socket
 import subprocess
 import time
@@ -18,7 +17,7 @@ from .errors import WDASetupError, WDAUnavailable
 from .xcode import resolve_developer_dir
 
 
-DEFAULT_WDA_URL = "http://127.0.0.1:8100"
+DEFAULT_WDA_PORT = 8100
 DEFAULT_WDA_SCHEME = "WebDriverAgentRunner"
 DEFAULT_WDA_CONFIGURATION = "Debug"
 KEY_BACKSPACE = "\ue003"
@@ -37,7 +36,13 @@ class WDAStatus:
 
 class WDAClient:
     def __init__(self, *, url: str | None = None, timeout: int = 30) -> None:
-        self.url = normalize_url(url or os.environ.get("OPENCLAW_IPHONE_WDA_URL") or DEFAULT_WDA_URL)
+        if url is None and not os.environ.get("OPENCLAW_IPHONE_WDA_URL"):
+            raise WDASetupError(
+                "No WebDriverAgent URL was provided. Use the CLI so it can resolve the "
+                "CoreDevice tunnel URL, pass --url for debugging, or set OPENCLAW_IPHONE_WDA_URL "
+                "as a debug override."
+            )
+        self.url = normalize_url(url or os.environ["OPENCLAW_IPHONE_WDA_URL"])
         self.timeout = timeout
 
     def status(self) -> WDAStatus:
@@ -182,15 +187,23 @@ class WDAClient:
         return response
 
     def drag(self, from_x: float, from_y: float, to_x: float, to_y: float, *, duration: float = 0.1) -> dict[str, Any]:
-        return self._json_post(
-            "/wda/dragfromtoforduration",
-            {
-                "fromX": from_x,
-                "fromY": from_y,
-                "toX": to_x,
-                "toY": to_y,
-                "duration": duration,
-            },
+        duration_ms = max(0, int(duration * 1000))
+        move_ms = max(100, duration_ms)
+        return self._perform_session_actions(
+            [
+                {
+                    "type": "pointer",
+                    "id": "finger1",
+                    "parameters": {"pointerType": "touch"},
+                    "actions": [
+                        {"type": "pointerMove", "duration": 0, "x": from_x, "y": from_y},
+                        {"type": "pointerDown", "button": 0},
+                        {"type": "pause", "duration": duration_ms},
+                        {"type": "pointerMove", "duration": move_ms, "x": to_x, "y": to_y},
+                        {"type": "pointerUp", "button": 0},
+                    ],
+                }
+            ]
         )
 
     def _json_request(self, path: str) -> dict[str, Any]:
@@ -327,26 +340,6 @@ def run_wda(config: WDARunConfig) -> int:
 
     command = build_xcodebuild_command(config)
     proc = subprocess.Popen(command, env=env)
-    return proc.wait()
-
-
-def find_iproxy() -> str:
-    iproxy = shutil.which("iproxy")
-    if not iproxy:
-        raise WDASetupError(
-            "iproxy is not installed or not on PATH. Install it with "
-            "`brew install libimobiledevice`, or use another tunnel provider such as go-ios, then retry."
-        )
-    return iproxy
-
-
-def iproxy_command(device_id: str, *, local_port: int = 8100, device_port: int = 8100) -> list[str]:
-    iproxy = find_iproxy()
-    return [iproxy, "--udid", device_id, f"{local_port}:{device_port}"]
-
-
-def run_iproxy(device_id: str, *, local_port: int = 8100, device_port: int = 8100) -> int:
-    proc = subprocess.Popen(iproxy_command(device_id, local_port=local_port, device_port=device_port))
     return proc.wait()
 
 

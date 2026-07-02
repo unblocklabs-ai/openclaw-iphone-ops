@@ -27,25 +27,31 @@ Check:
 
 ```sh
 xcrun devicectl device info lockState --device "$DEVICE_ID" --json-output "$TMPDIR/lock-state.json"
+PYTHONPATH=src python3 -m openclaw_iphone doctor
 ```
 
 If locked, try one best-effort WDA unlock:
 
 ```sh
 PYTHONPATH=src python3 -m openclaw_iphone wda unlock --verify
+PYTHONPATH=src python3 -m openclaw_iphone watchdog once
 ```
 
-This agent phone is expected to have no passcode, so WDA unlock should normally
-recover from lock screen without human input. If verification still reports
+WDA unlock can recover only when iOS does not require passcode, Face ID, or
+another secure confirmation. If verification still reports
 `passcode-required: true`, foreground automation is blocked until human unlock.
 Do not loop on unlock attempts.
+
+On unattended hosts, the watchdog LaunchAgent may run this same recovery check
+periodically. It is recovery-only: it does not tap the screen to keep the phone
+awake, because that can corrupt the current foreground workflow.
 
 ## WDA Responds But Is Not Ready
 
 Check:
 
 ```sh
-curl -fsS "$WDA_URL/status"
+PYTHONPATH=src python3 -m openclaw_iphone wda status
 ```
 
 If `ready` is false, restart or rebuild the WDA/XCUITest lane. Do not trust old logs.
@@ -64,7 +70,15 @@ xcode-select -p
 ```
 
 If the runner prints `ServerURLHere->http://...:8100<-ServerURLHere`, WDA
-launched. Start or restart the `iproxy` tunnel and verify `wda status`.
+launched. Run `openclaw-iphone wda url` to confirm CoreDevice has a connected
+USB tunnel, then verify `wda status`.
+
+If the runner installs and starts but fails after about 60 seconds with
+`Timed out while enabling automation mode`, signing, trust, and transport are
+already past their gates. Check the phone is unlocked, Developer Mode is
+enabled, no security prompt is visible, and Xcode can run UI tests on the
+device. Record the `.xcresult` path from the log; the failure is at the
+XCTest/iOS automation handshake layer, before WDA starts serving HTTP.
 
 ## Codesign Keychain Prompt
 
@@ -73,6 +87,21 @@ the login keychain password, which can differ from the Mac login password. On
 OpenClaw-managed hosts, check local operator notes or the keychain unlock launch
 agent for the configured login keychain password. Choose Always Allow so future
 non-interactive builds do not block on the GUI prompt.
+
+If a non-interactive run fails with `errSecInternalComponent`, verify the
+private key ACL with a direct codesign smoke test:
+
+```sh
+security find-identity -v -p codesigning
+tmpdir="$(mktemp -d /tmp/openclaw-codesign.XXXXXX)"
+cp /bin/echo "$tmpdir/echo-test"
+codesign --force --sign "<identity-sha>" --timestamp=none "$tmpdir/echo-test"
+rm -rf "$tmpdir"
+```
+
+`errSecInternalComponent` here means the identity exists but this execution
+context cannot use the private key. Unlock the login keychain or approve the
+private-key access prompt with Always Allow before retrying WDA.
 
 Do not commit keychain passwords, Apple ID passwords, or certificate private-key
 material to this repo.
@@ -114,5 +143,6 @@ Use exact language:
 - "Blocked at lock state: the device is locked and needs human unlock."
 - "Blocked at lock state: WDA unlock was attempted, but passcode is still required."
 - "Blocked at signing: the XCUITest runner is not provisioned for this device."
+- "Blocked at UI automation: WDA installs and launches, but Xcode timed out while enabling automation mode."
 - "Blocked at secure confirmation: the prompt requires Face ID/passcode and cannot be completed remotely."
 - "Blocked at credential: the stored Apple ID password was rejected."

@@ -4,28 +4,26 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.openclaw.iphone-wda-run</string>
+  <string>com.openclaw.iphone-watchdog</string>
 
   <key>ProgramArguments</key>
   <array>
-    <string>__REPO_DIR__/snippets/launchd/openclaw-iphone-wda-run.sh</string>
+    <string>__REPO_DIR__/snippets/launchd/openclaw-iphone-watchdog.sh</string>
   </array>
 
   <key>RunAtLoad</key>
   <true/>
-  <key>KeepAlive</key>
-  <true/>
-  <key>ThrottleInterval</key>
-  <integer>30</integer>
+  <key>StartInterval</key>
+  <integer>120</integer>
   <key>ProcessType</key>
-  <string>Interactive</string>
+  <string>Background</string>
   <key>ExitTimeOut</key>
   <integer>20</integer>
 
   <key>StandardOutPath</key>
-  <string>__HOME__/Library/Logs/openclaw/iphone-wda-run.log</string>
+  <string>__HOME__/Library/Logs/openclaw/iphone-watchdog.log</string>
   <key>StandardErrorPath</key>
-  <string>__HOME__/Library/Logs/openclaw/iphone-wda-run.err.log</string>
+  <string>__HOME__/Library/Logs/openclaw/iphone-watchdog.err.log</string>
   <key>StandardInPath</key>
   <string>/dev/null</string>
 </dict>

@@ -5,14 +5,15 @@ import json
 from pathlib import Path
 import sys
 
+from .config import IPhoneConfig, load_config
 from .devicectl import DeviceCtl
 from .evidence import artifact_path
-from .errors import DeviceLocked, OpenClawIPhoneError
+from .errors import DeviceLocked, OpenClawIPhoneError, WDAUnavailable
 from .instagram_context import capture_instagram_context
 from .instagram_ops import DEFAULT_ANALYSIS_PROMPT, analyze_video, benchmark_discovery, benchmark_ranking_quality, discover_creators, triage_shortlist, verify_handles
 from .recipes.instagram import smoke as instagram_smoke
 from .ui import UIController
-from .wda import WDAClient, WDARunConfig, find_iproxy, resolve_wda_path, run_iproxy, run_wda
+from .wda import DEFAULT_WDA_PORT, WDAClient, WDARunConfig, resolve_wda_path, run_wda
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -48,6 +49,11 @@ def build_parser() -> argparse.ArgumentParser:
     device_subcommands = devices.add_subparsers(dest="devices_command")
     devices_list = device_subcommands.add_parser("list", help="List connected devices.")
     devices_list.set_defaults(handler=handle_devices_list)
+
+    doctor = subcommands.add_parser("doctor", help="Run a read-only iPhone control health check.")
+    add_device_arg(doctor)
+    add_wda_url_arg(doctor)
+    doctor.set_defaults(handler=handle_doctor)
 
     apps = subcommands.add_parser("apps", help="Installed app and process commands.")
     apps_subcommands = apps.add_subparsers(dest="apps_command")
@@ -87,6 +93,7 @@ def build_parser() -> argparse.ArgumentParser:
         "capture-context",
         help="Capture current Instagram screen/source and parse visible creator/content metadata.",
     )
+    add_device_arg(instagram_context)
     add_wda_url_arg(instagram_context)
     instagram_context.add_argument("--output-dir", help="Directory for screenshot/source/manifest artifacts.")
     instagram_context.add_argument("--prefix", default="instagram-context", help="Artifact filename prefix.")
@@ -110,6 +117,7 @@ def build_parser() -> argparse.ArgumentParser:
         "analyze-video",
         help="Capture current Instagram context and hand a supplied video URL/file to video-understand.",
     )
+    add_device_arg(instagram_video)
     add_wda_url_arg(instagram_video)
     instagram_video.add_argument("--video", required=True, help="Direct video URL or local file for video-understand.")
     instagram_video.add_argument("--prompt", default=DEFAULT_ANALYSIS_PROMPT)
@@ -198,11 +206,18 @@ def build_parser() -> argparse.ArgumentParser:
     wda = subcommands.add_parser("wda", help="WebDriverAgent commands.")
     wda_subcommands = wda.add_subparsers(dest="wda_command")
     wda_status = wda_subcommands.add_parser("status", help="Check whether WebDriverAgent is reachable.")
+    add_device_arg(wda_status)
     add_wda_url_arg(wda_status)
     wda_status.add_argument("--output", help="Optional path for raw status JSON.")
     wda_status.set_defaults(handler=handle_wda_status)
 
+    wda_url = wda_subcommands.add_parser("url", help="Resolve the CoreDevice WebDriverAgent URL.")
+    add_device_arg(wda_url)
+    wda_url.add_argument("--port", type=int, default=DEFAULT_WDA_PORT)
+    wda_url.set_defaults(handler=handle_wda_url)
+
     wda_locked = wda_subcommands.add_parser("locked", help="Check WDA-reported screen lock state.")
+    add_device_arg(wda_locked)
     add_wda_url_arg(wda_locked)
     wda_locked.set_defaults(handler=handle_wda_locked)
 
@@ -217,6 +232,7 @@ def build_parser() -> argparse.ArgumentParser:
     wda_unlock.set_defaults(handler=handle_wda_unlock)
 
     wda_lock = wda_subcommands.add_parser("lock", help="Lock the phone through WDA. Mostly for diagnostics.")
+    add_device_arg(wda_lock)
     add_wda_url_arg(wda_lock)
     wda_lock.set_defaults(handler=handle_wda_lock)
 
@@ -227,15 +243,15 @@ def build_parser() -> argparse.ArgumentParser:
     add_device_arg(wda_run)
     wda_run.add_argument(
         "--wda-path",
-        help="Path to WebDriverAgent checkout/project. Defaults to OPENCLAW_IPHONE_WDA_PATH.",
+        help="Debug override for WebDriverAgent checkout/project. Defaults to host config or OPENCLAW_IPHONE_WDA_PATH.",
     )
     wda_run.add_argument("--scheme", default="WebDriverAgentRunner")
     wda_run.add_argument("--configuration", default="Debug")
-    wda_run.add_argument("--destination-timeout", type=int, default=30)
-    wda_run.add_argument("--development-team", help="Apple Developer Team ID to pass to xcodebuild.")
+    wda_run.add_argument("--destination-timeout", type=int)
+    wda_run.add_argument("--development-team", help="Debug override for the Apple Developer Team ID passed to xcodebuild.")
     wda_run.add_argument(
         "--runner-bundle-id",
-        help="Bundle identifier override for WebDriverAgentRunner, usually unique to your team.",
+        help="Debug override for the WebDriverAgentRunner bundle identifier.",
     )
     wda_run.add_argument(
         "--allow-provisioning-updates",
@@ -244,52 +260,62 @@ def build_parser() -> argparse.ArgumentParser:
     )
     wda_run.set_defaults(handler=handle_wda_run)
 
-    wda_tunnel = wda_subcommands.add_parser(
-        "tunnel",
-        help="Forward localhost to the device WDA port as a long-lived iproxy process.",
+    watchdog = subcommands.add_parser("watchdog", help="Lock-state recovery checks for unattended iPhone control.")
+    watchdog_subcommands = watchdog.add_subparsers(dest="watchdog_command")
+    watchdog_once = watchdog_subcommands.add_parser("once", help="Run one conservative lock-state recovery pass.")
+    add_device_arg(watchdog_once)
+    add_wda_url_arg(watchdog_once)
+    watchdog_once.add_argument(
+        "--no-verify",
+        action="store_true",
+        help="Skip CoreDevice passcode verification after a WDA unlock attempt.",
     )
-    add_device_arg(wda_tunnel)
-    wda_tunnel.add_argument("--local-port", type=int, default=8100)
-    wda_tunnel.add_argument("--device-port", type=int, default=8100)
-    wda_tunnel.set_defaults(handler=handle_wda_tunnel)
+    watchdog_once.set_defaults(handler=handle_watchdog_once)
 
     ui = subcommands.add_parser("ui", help="UI capture commands backed by WebDriverAgent.")
     ui_subcommands = ui.add_subparsers(dest="ui_command")
     ui_screenshot = ui_subcommands.add_parser("screenshot", help="Capture a screenshot through WebDriverAgent.")
+    add_device_arg(ui_screenshot)
     add_wda_url_arg(ui_screenshot)
     ui_screenshot.add_argument("--output", help="Optional path for the PNG screenshot.")
     ui_screenshot.set_defaults(handler=handle_ui_screenshot)
 
     ui_source = ui_subcommands.add_parser("source", help="Capture the accessibility source through WebDriverAgent.")
+    add_device_arg(ui_source)
     add_wda_url_arg(ui_source)
     ui_source.add_argument("--output", help="Optional path for the source XML/text.")
     ui_source.set_defaults(handler=handle_ui_source)
 
     ui_elements = ui_subcommands.add_parser("elements", help="Save visible accessibility elements as JSON.")
+    add_device_arg(ui_elements)
     add_wda_url_arg(ui_elements)
     ui_elements.add_argument("--output", help="Optional path for elements JSON.")
     ui_elements.add_argument("--all", action="store_true", help="Include elements marked not visible.")
     ui_elements.set_defaults(handler=handle_ui_elements)
 
     ui_annotated = ui_subcommands.add_parser("annotated-screenshot", help="Capture screenshot plus element map/HTML overlay.")
+    add_device_arg(ui_annotated)
     add_wda_url_arg(ui_annotated)
     ui_annotated.add_argument("--output", help="Optional path for the PNG screenshot.")
     ui_annotated.add_argument("--all", action="store_true", help="Include elements marked not visible.")
     ui_annotated.set_defaults(handler=handle_ui_annotated_screenshot)
 
     ui_tap = ui_subcommands.add_parser("tap", help="Tap absolute screen coordinates through WebDriverAgent.")
+    add_device_arg(ui_tap)
     add_wda_url_arg(ui_tap)
     ui_tap.add_argument("--x", type=float, required=True)
     ui_tap.add_argument("--y", type=float, required=True)
     ui_tap.set_defaults(handler=handle_ui_tap)
 
     ui_tap_text = ui_subcommands.add_parser("tap-text", help="Tap the center of a visible element matching text.")
+    add_device_arg(ui_tap_text)
     add_wda_url_arg(ui_tap_text)
     ui_tap_text.add_argument("text")
     ui_tap_text.add_argument("--exact", action="store_true", help="Require exact text/name/label/value match.")
     ui_tap_text.set_defaults(handler=handle_ui_tap_text)
 
     ui_wait_text = ui_subcommands.add_parser("wait-text", help="Wait until visible text appears.")
+    add_device_arg(ui_wait_text)
     add_wda_url_arg(ui_wait_text)
     ui_wait_text.add_argument("text")
     ui_wait_text.add_argument("--timeout", type=float, default=10.0)
@@ -298,6 +324,7 @@ def build_parser() -> argparse.ArgumentParser:
     ui_wait_text.set_defaults(handler=handle_ui_wait_text)
 
     ui_scroll_until_text = ui_subcommands.add_parser("scroll-until-text", help="Scroll up until visible text appears.")
+    add_device_arg(ui_scroll_until_text)
     add_wda_url_arg(ui_scroll_until_text)
     ui_scroll_until_text.add_argument("text")
     ui_scroll_until_text.add_argument("--max-scrolls", type=int, default=8)
@@ -310,18 +337,21 @@ def build_parser() -> argparse.ArgumentParser:
     ui_scroll_until_text.set_defaults(handler=handle_ui_scroll_until_text)
 
     ui_type = ui_subcommands.add_parser("type", help="Type text into the currently focused field.")
+    add_device_arg(ui_type)
     add_wda_url_arg(ui_type)
     ui_type.add_argument("text")
     ui_type.add_argument("--frequency", type=int, help="Optional WDA typing frequency override.")
     ui_type.set_defaults(handler=handle_ui_type)
 
     ui_clear = ui_subcommands.add_parser("clear-field", help="Clear the focused field or a field matched by text.")
+    add_device_arg(ui_clear)
     add_wda_url_arg(ui_clear)
     ui_clear.add_argument("text", nargs="?", help="Optional visible text/name/label to tap before clearing.")
     ui_clear.add_argument("--exact", action="store_true")
     ui_clear.set_defaults(handler=handle_ui_clear_field)
 
     ui_drag = ui_subcommands.add_parser("drag", help="Drag between absolute screen coordinates.")
+    add_device_arg(ui_drag)
     add_wda_url_arg(ui_drag)
     ui_drag.add_argument("--from-x", type=float, required=True)
     ui_drag.add_argument("--from-y", type=float, required=True)
@@ -331,12 +361,14 @@ def build_parser() -> argparse.ArgumentParser:
     ui_drag.set_defaults(handler=handle_ui_drag)
 
     ui_press_button = ui_subcommands.add_parser("press-button", help="Press an iPhone hardware button.")
+    add_device_arg(ui_press_button)
     add_wda_url_arg(ui_press_button)
     ui_press_button.add_argument("name", help="Button name, for example home, volumeUp, volumeDown, or siri.")
     ui_press_button.add_argument("--duration", type=float, help="Optional press duration in seconds.")
     ui_press_button.set_defaults(handler=handle_ui_press_button)
 
     ui_back = ui_subcommands.add_parser("back", help="Navigate back through WDA.")
+    add_device_arg(ui_back)
     add_wda_url_arg(ui_back)
     ui_back.set_defaults(handler=handle_ui_back)
 
@@ -344,11 +376,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def add_device_arg(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--device", help="Device UDID/identifier/name. Defaults to the only connected device.")
+    parser.add_argument(
+        "--device",
+        help="Device UDID/identifier/name. Defaults to OPENCLAW_IPHONE_DEVICE or the only connected device.",
+    )
 
 
 def add_wda_url_arg(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--url", help="WebDriverAgent base URL. Defaults to OPENCLAW_IPHONE_WDA_URL or localhost.")
+    parser.add_argument(
+        "--url",
+        help="Debug override for WebDriverAgent base URL. Defaults to config/env or the USB CoreDevice tunnel URL.",
+    )
 
 
 def client_from_args(args: argparse.Namespace) -> DeviceCtl:
@@ -360,7 +398,31 @@ def client_from_args(args: argparse.Namespace) -> DeviceCtl:
 
 
 def wda_client_from_args(args: argparse.Namespace) -> WDAClient:
-    return WDAClient(url=getattr(args, "url", None), timeout=args.timeout)
+    return WDAClient(url=resolve_wda_url_from_args(args), timeout=args.timeout)
+
+
+def resolve_wda_url_from_args(args: argparse.Namespace) -> str:
+    explicit = getattr(args, "url", None)
+    if explicit:
+        return explicit
+    config = load_config()
+    config_url = config.wda_url
+    if config_url:
+        return config_url
+
+    client = client_from_args(args)
+    device = client.select_device(device_selector_from_args(args, config=config))
+    url, _ = client.coredevice_wda_url(device.identifier, port=DEFAULT_WDA_PORT)
+    return url
+
+
+def device_selector_from_args(args: argparse.Namespace, *, config: IPhoneConfig | None = None) -> str | None:
+    explicit = getattr(args, "device", None)
+    if explicit:
+        return explicit
+    if config is None:
+        config = load_config()
+    return config.device
 
 
 def handle_devices_list(args: argparse.Namespace) -> int:
@@ -371,9 +433,64 @@ def handle_devices_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def handle_doctor(args: argparse.Namespace) -> int:
+    try:
+        client = client_from_args(args)
+        device = client.select_device(device_selector_from_args(args))
+    except (OpenClawIPhoneError, ValueError) as exc:
+        print("result: device-selection-failed")
+        print(f"blocker: {exc}")
+        return 1
+    print(f"device: {device.name} ({device.identifier})")
+
+    try:
+        lock_data, lock_artifact = client.lock_state(device.identifier)
+    except (OpenClawIPhoneError, ValueError) as exc:
+        print("passcode-required: unknown")
+        print("result: lock-state-failed")
+        print(f"blocker: {exc}")
+        return 1
+    passcode_required = passcode_required_from_lock_state(lock_data)
+    print(f"passcode-required: {bool_value(passcode_required)}")
+    print(f"lock-state evidence: {lock_artifact}")
+
+    try:
+        url = resolve_wda_url_from_args(args)
+    except (OpenClawIPhoneError, ValueError) as exc:
+        print("wda-url: unknown")
+        print("result: wda-url-resolution-failed")
+        print(f"blocker: {exc}")
+        return 1
+    print(f"wda-url: {url}")
+
+    wda = WDAClient(url=url, timeout=args.timeout)
+    try:
+        status = wda.status()
+    except WDAUnavailable as exc:
+        print("wda-reachable: false")
+        print("wda-ready: false")
+        print("result: attention-required")
+        print(f"blocker: {exc}")
+        return 1
+    print("wda-reachable: true")
+    print(f"wda-ready: {bool_value(status.ready)}")
+
+    try:
+        locked = wda.locked()
+    except WDAUnavailable as exc:
+        print("result: lock-check-failed")
+        print(f"blocker: {exc}")
+        return 1
+    print(f"wda-locked: {bool_value(locked)}")
+
+    healthy = passcode_required is False and status.ready is True and locked is False
+    print(f"result: {'ok' if healthy else 'attention-required'}")
+    return 0 if healthy else 1
+
+
 def handle_apps_list(args: argparse.Namespace) -> int:
     client = client_from_args(args)
-    device = client.select_device(args.device)
+    device = client.select_device(device_selector_from_args(args))
     apps, artifact = client.list_apps(device.identifier, include_all=not args.no_all)
     for app in apps:
         print(f"{app.name}\t{app.bundle_identifier}\t{app.version}\t{app.bundle_version}")
@@ -383,7 +500,7 @@ def handle_apps_list(args: argparse.Namespace) -> int:
 
 def handle_apps_find(args: argparse.Namespace) -> int:
     client = client_from_args(args)
-    device = client.select_device(args.device)
+    device = client.select_device(device_selector_from_args(args))
     app = client.find_app(device.identifier, args.query)
     print(f"{app.name}\t{app.bundle_identifier}\t{app.version}\t{app.bundle_version}")
     return 0
@@ -391,7 +508,7 @@ def handle_apps_find(args: argparse.Namespace) -> int:
 
 def handle_apps_launch(args: argparse.Namespace) -> int:
     client = client_from_args(args)
-    device = client.select_device(args.device)
+    device = client.select_device(device_selector_from_args(args))
     app = client.find_app(device.identifier, args.query)
     if not args.skip_lock_check:
         ensure_unlocked_or_attempt_wda(args, client, device.identifier)
@@ -402,7 +519,7 @@ def handle_apps_launch(args: argparse.Namespace) -> int:
 
 def handle_apps_terminate(args: argparse.Namespace) -> int:
     client = client_from_args(args)
-    device = client.select_device(args.device)
+    device = client.select_device(device_selector_from_args(args))
     app = client.find_app(device.identifier, args.query)
     client.terminate_app(device.identifier, app.bundle_identifier)
     print(f"terminated: {app.name} ({app.bundle_identifier}) on {device.name}")
@@ -410,7 +527,7 @@ def handle_apps_terminate(args: argparse.Namespace) -> int:
 
 
 def handle_instagram_smoke(args: argparse.Namespace) -> int:
-    result = instagram_smoke(client_from_args(args), device_selector=args.device)
+    result = instagram_smoke(client_from_args(args), device_selector=device_selector_from_args(args))
     print(f"device: {result.device.name} ({result.device.identifier})")
     print(f"instagram: {result.app_name} ({result.bundle_identifier})")
     print(f"lock-state evidence: {result.lock_state_artifact}")
@@ -445,7 +562,7 @@ def handle_instagram_capture_context(args: argparse.Namespace) -> int:
 def handle_instagram_verify_handles(args: argparse.Namespace) -> int:
     if not args.no_launch:
         client = client_from_args(args)
-        device = client.select_device(args.device)
+        device = client.select_device(device_selector_from_args(args))
         ensure_unlocked_or_attempt_wda(args, client, device.identifier)
         app = client.find_app(device.identifier, "Instagram")
         client.launch_app(device.identifier, app.bundle_identifier)
@@ -600,7 +717,7 @@ def handle_instagram_benchmark_ranking_quality(args: argparse.Namespace) -> int:
 
 def launch_instagram_for_foreground_work(args: argparse.Namespace) -> None:
     client = client_from_args(args)
-    device = client.select_device(args.device)
+    device = client.select_device(device_selector_from_args(args))
     ensure_unlocked_or_attempt_wda(args, client, device.identifier)
     app = client.find_app(device.identifier, "Instagram")
     client.launch_app(device.identifier, app.bundle_identifier)
@@ -620,6 +737,16 @@ def handle_wda_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def handle_wda_url(args: argparse.Namespace) -> int:
+    client = client_from_args(args)
+    device = client.select_device(device_selector_from_args(args))
+    url, artifact = client.coredevice_wda_url(device.identifier, port=args.port)
+    print(f"url: {url}")
+    print(f"device: {device.name} ({device.identifier})")
+    print(f"evidence: {artifact}")
+    return 0
+
+
 def handle_wda_locked(args: argparse.Namespace) -> int:
     locked = wda_client_from_args(args).locked()
     value = "unknown" if locked is None else str(locked).lower()
@@ -628,14 +755,16 @@ def handle_wda_locked(args: argparse.Namespace) -> int:
 
 
 def handle_wda_unlock(args: argparse.Namespace) -> int:
-    wda_client_from_args(args).unlock()
+    wda = wda_client_from_args(args)
+    wda.unlock()
     print("unlock-attempted: true")
-    locked = wda_client_from_args(args).locked()
+    locked = wda.locked()
     if locked is not None:
         print(f"wda-locked: {str(locked).lower()}")
     if args.verify:
-        device = client_from_args(args).select_device(args.device)
-        data, artifact = client_from_args(args).lock_state(device.identifier)
+        client = client_from_args(args)
+        device = client.select_device(device_selector_from_args(args))
+        data, artifact = client.lock_state(device.identifier)
         result = data.get("result", {})
         passcode_required = result.get("passcodeRequired") if isinstance(result, dict) else None
         value = "unknown" if not isinstance(passcode_required, bool) else str(passcode_required).lower()
@@ -654,10 +783,109 @@ def handle_wda_lock(args: argparse.Namespace) -> int:
     return 0
 
 
+def handle_watchdog_once(args: argparse.Namespace) -> int:
+    try:
+        client = client_from_args(args)
+        device = client.select_device(device_selector_from_args(args))
+    except (OpenClawIPhoneError, ValueError) as exc:
+        print("result: device-selection-failed")
+        print(f"blocker: {exc}")
+        return 1
+    print(f"device: {device.name} ({device.identifier})")
+
+    try:
+        wda = wda_client_from_args(args)
+    except (OpenClawIPhoneError, ValueError) as exc:
+        print("wda-url: unknown")
+        print("result: wda-url-resolution-failed")
+        print(f"blocker: {exc}")
+        return 1
+
+    try:
+        status = wda.status()
+    except WDAUnavailable as exc:
+        print(f"result: wda-unreachable")
+        print(f"blocker: {exc}")
+        return 1
+
+    print(f"wda-url: {status.url}")
+    print(f"wda-ready: {bool_value(status.ready)}")
+    if status.ready is not True:
+        print(f"result: {'wda-ready-unknown' if status.ready is None else 'wda-not-ready'}")
+        return 1
+
+    try:
+        locked = wda.locked()
+    except WDAUnavailable as exc:
+        print("result: lock-check-failed")
+        print(f"blocker: {exc}")
+        return 1
+    print(f"wda-locked: {bool_value(locked)}")
+    if locked is False:
+        print("result: ok")
+        return 0
+    if locked is None:
+        print("result: lock-state-unknown")
+        return 1
+
+    try:
+        wda.unlock()
+    except WDAUnavailable as exc:
+        print("result: unlock-failed")
+        print(f"blocker: {exc}")
+        return 1
+    print("unlock-attempted: true")
+    try:
+        locked_after = wda.locked()
+    except WDAUnavailable as exc:
+        print("result: post-unlock-lock-check-failed")
+        print(f"blocker: {exc}")
+        return 1
+    print(f"wda-locked-after-unlock: {bool_value(locked_after)}")
+
+    passcode_required = None
+    if not args.no_verify:
+        try:
+            data, artifact = client.lock_state(device.identifier)
+        except (OpenClawIPhoneError, ValueError) as exc:
+            print("passcode-required: unknown")
+            print("result: lock-state-failed")
+            print(f"blocker: {exc}")
+            return 1
+        passcode_required = passcode_required_from_lock_state(data)
+        print(f"passcode-required: {bool_value(passcode_required)}")
+        print(f"lock-state evidence: {artifact}")
+        if passcode_required is True:
+            print("result: human-unlock-required")
+            return 1
+        if passcode_required is not False:
+            print("result: lock-state-unknown")
+            return 1
+
+    if locked_after is False:
+        print("result: unlocked")
+        return 0
+    if locked_after is None and passcode_required is False:
+        print("result: verified-unlocked")
+        return 0
+    if locked_after is True and passcode_required is False:
+        print("result: lock-state-conflict")
+        return 1
+
+    print("result: still-locked")
+    return 1
+
+
 def handle_wda_run(args: argparse.Namespace) -> int:
-    wda_path = resolve_wda_path(args.wda_path)
+    config = load_config()
+    wda_path = resolve_wda_path(args.wda_path or config.get("OPENCLAW_IPHONE_WDA_PATH"))
+    destination_timeout = args.destination_timeout
+    if destination_timeout is None:
+        destination_timeout = int(config.get("OPENCLAW_IPHONE_DESTINATION_TIMEOUT", "30") or "30")
+    development_team = args.development_team or config.get("OPENCLAW_IPHONE_DEVELOPMENT_TEAM")
+    runner_bundle_id = args.runner_bundle_id or config.get("OPENCLAW_IPHONE_RUNNER_BUNDLE_ID")
     client = client_from_args(args)
-    device = client.select_device(args.device)
+    device = client.select_device(device_selector_from_args(args, config=config))
     client.require_unlocked(device.identifier)
     print(f"device: {device.name} ({device.identifier})")
     print(f"wda path: {wda_path}")
@@ -670,9 +898,9 @@ def handle_wda_run(args: argparse.Namespace) -> int:
             scheme=args.scheme,
             configuration=args.configuration,
             developer_dir=args.developer_dir,
-            destination_timeout=args.destination_timeout,
-            development_team=args.development_team,
-            runner_bundle_id=args.runner_bundle_id,
+            destination_timeout=destination_timeout,
+            development_team=development_team,
+            runner_bundle_id=runner_bundle_id,
             allow_provisioning_updates=args.allow_provisioning_updates,
         )
     )
@@ -689,18 +917,16 @@ def ensure_unlocked_or_attempt_wda(args: argparse.Namespace, client: DeviceCtl, 
     client.require_unlocked(device_id)
 
 
-def handle_wda_tunnel(args: argparse.Namespace) -> int:
-    find_iproxy()
-    device = client_from_args(args).select_device(args.device)
-    tunnel_device_id = device.xcode_identifier
-    print(f"device: {device.name} ({device.identifier})")
-    print(f"forwarding: 127.0.0.1:{args.local_port} -> device:{args.device_port}")
-    print("note: keep this process alive; if it exits, localhost WDA access breaks.")
-    return run_iproxy(
-        tunnel_device_id,
-        local_port=args.local_port,
-        device_port=args.device_port,
-    )
+def passcode_required_from_lock_state(data: dict[str, object]) -> bool | None:
+    result = data.get("result")
+    if not isinstance(result, dict):
+        return None
+    value = result.get("passcodeRequired")
+    return value if isinstance(value, bool) else None
+
+
+def bool_value(value: bool | None) -> str:
+    return "unknown" if value is None else str(value).lower()
 
 
 def handle_ui_screenshot(args: argparse.Namespace) -> int:

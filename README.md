@@ -38,16 +38,26 @@ For the OpenClaw device lane, set `Settings -> Display & Brightness -> Auto-Lock
 to `Never` when the device policy allows it. This is the preferred fix; unlock
 automation is only a fallback.
 
+Run a full health check before agent workflows:
+
+```sh
+PYTHONPATH=src python3 -m openclaw_iphone doctor
+```
+
 If the phone is locked, agents should try a best-effort WDA unlock once:
 
 ```sh
 PYTHONPATH=src python3 -m openclaw_iphone wda unlock --verify
 ```
 
-This agent phone is expected to have no passcode, so WDA unlock should normally
-recover from lock screen without human input. If verification still reports
-`passcode-required: true`, foreground app launches and UI tests are blocked
-until a human unlocks it.
+WDA unlock can recover only when iOS does not require passcode, Face ID, or
+another secure confirmation. If verification reports `passcode-required: true`,
+foreground app launches and UI tests are blocked until a human unlocks it.
+
+For unattended hosts, install the watchdog LaunchAgent from
+`docs/launchagent-service.md`. It runs `watchdog once` on a schedule, attempts
+one WDA unlock only when WDA reports the screen is locked, and never sends
+synthetic keep-alive taps that could interfere with the foreground app.
 
 ## Quick Start
 
@@ -74,7 +84,7 @@ Capture current Instagram context for creator/content analysis:
 
 ```sh
 PYTHONPATH=src python3 -m openclaw_iphone instagram capture-context \
-  --output-dir /Users/pearlperelel/.openclaw/tmp/openclaw-iphone-ops \
+  --output-dir ~/.openclaw/tmp/openclaw-iphone-ops \
   --prefix instagram-current
 ```
 
@@ -91,6 +101,7 @@ Check WebDriverAgent and capture the current UI when WDA is already running:
 PYTHONPATH=src python3 -m openclaw_iphone wda status
 PYTHONPATH=src python3 -m openclaw_iphone wda locked
 PYTHONPATH=src python3 -m openclaw_iphone wda unlock --verify
+PYTHONPATH=src python3 -m openclaw_iphone watchdog once
 PYTHONPATH=src python3 -m openclaw_iphone ui screenshot
 PYTHONPATH=src python3 -m openclaw_iphone ui source
 ```
@@ -131,7 +142,7 @@ then use the logged-in app for evidence:
 
 ```sh
 PYTHONPATH=src python3 -m openclaw_iphone instagram verify-handles prenatal.creator another.creator \
-  --output-dir /Users/pearlperelel/.openclaw/tmp/openclaw-iphone-ops \
+  --output-dir ~/.openclaw/tmp/openclaw-iphone-ops \
   --max-steps-per-handle 12 \
   --deadline-seconds 45
 ```
@@ -143,7 +154,7 @@ PYTHONPATH=src python3 -m openclaw_iphone instagram discover-creators \
   --query "pregnancy journey" \
   --max-candidates 10 \
   --deadline-seconds 600 \
-  --output-dir /Users/pearlperelel/.openclaw/tmp/openclaw-iphone-ops
+  --output-dir ~/.openclaw/tmp/openclaw-iphone-ops
 ```
 
 Discovery opens bounded Instagram hashtag result screens, harvests visible media
@@ -159,7 +170,7 @@ Run the benchmark suite for the three Perelel discovery scenarios:
 
 ```sh
 PYTHONPATH=src python3 -m openclaw_iphone instagram benchmark-discovery \
-  --output-dir /Users/pearlperelel/.openclaw/tmp/openclaw-iphone-ops
+  --output-dir ~/.openclaw/tmp/openclaw-iphone-ops
 ```
 
 The benchmark writes aggregate JSON/Markdown reports with per-scenario candidate
@@ -174,7 +185,7 @@ three-scenario benchmark in about 30 seconds on the physical phone:
 PYTHONPATH=src python3 -m openclaw_iphone instagram benchmark-discovery \
   --verification-mode source-only \
   --max-source-scrolls 0 \
-  --output-dir /Users/pearlperelel/.openclaw/tmp/openclaw-iphone-ops
+  --output-dir ~/.openclaw/tmp/openclaw-iphone-ops
 ```
 
 Source-only mode returns partial candidates from visible result screens. It does
@@ -187,7 +198,7 @@ top-candidate verification in one command:
 
 ```sh
 PYTHONPATH=src python3 -m openclaw_iphone instagram triage-shortlist \
-  --output-dir /Users/pearlperelel/.openclaw/tmp/openclaw-iphone-ops
+  --output-dir ~/.openclaw/tmp/openclaw-iphone-ops
 ```
 
 `triage-shortlist` gathers a source-only pool across the Perelel benchmark
@@ -202,7 +213,7 @@ compare top-ranked candidates with a lower-ranked verification sample:
 
 ```sh
 PYTHONPATH=src python3 -m openclaw_iphone instagram benchmark-ranking-quality \
-  --output-dir /Users/pearlperelel/.openclaw/tmp/openclaw-iphone-ops
+  --output-dir ~/.openclaw/tmp/openclaw-iphone-ops
 ```
 
 The ranking benchmark writes aggregate JSON/Markdown reports plus per-theme
@@ -215,19 +226,33 @@ To pair current Instagram context with a direct video URL or local video file:
 ```sh
 PYTHONPATH=src python3 -m openclaw_iphone instagram analyze-video \
   --video "https://example.com/video.mp4" \
-  --output-dir /Users/pearlperelel/.openclaw/tmp/openclaw-iphone-ops
+  --output-dir ~/.openclaw/tmp/openclaw-iphone-ops
 ```
 
 Use `--dry-run` to validate the context/handoff artifacts without invoking
 `video-understand`.
 
-The WDA URL defaults to `OPENCLAW_IPHONE_WDA_URL`, then
-`http://127.0.0.1:8100`. Pass `--url` to target a different endpoint.
+Host-specific iPhone settings live in `~/.openclaw/iphone/config.env` or a
+repo-local `.env` during development. Start from the committed example:
+
+```sh
+mkdir -p ~/.openclaw/iphone
+cp .env.example ~/.openclaw/iphone/config.env
+$EDITOR ~/.openclaw/iphone/config.env
+```
+
+Set the iPhone selector, WDA checkout path, runner bundle id, team id, and
+destination timeout there. Do not set a WDA URL for normal USB-connected
+operation; the CLI resolves the live Apple CoreDevice tunnel URL dynamically.
+Inspect the resolved endpoint with:
+
+```sh
+PYTHONPATH=src python3 -m openclaw_iphone wda url
+```
 
 Run WebDriverAgentRunner from a local WDA checkout:
 
 ```sh
-OPENCLAW_IPHONE_WDA_PATH="/path/to/WebDriverAgent" \
 PYTHONPATH=src python3 -m openclaw_iphone wda run
 ```
 
@@ -235,7 +260,11 @@ This must be an actual WebDriverAgent Xcode project, such as Appium's maintained
 fork, with signing/provisioning configured for the physical iPhone. Cache marker
 files are not enough.
 
-The Mac must use full Xcode, not just Command Line Tools:
+The Mac must have full Xcode installed, not just Command Line Tools. CLI
+commands resolve full Xcode per command through `DEVELOPER_DIR`, the current
+`xcode-select` path, or common Xcode install locations. On managed OpenClaw
+hosts, switching the global selection is acceptable when launchd and manual
+shells should share the same full-Xcode default:
 
 ```sh
 xcode-select -p
@@ -256,51 +285,47 @@ password and choose Always Allow. On OpenClaw-managed hosts, check the local
 keychain unlock launch agent or operator notes for the login keychain password;
 do not commit that password to this repo.
 
-When signing is not already configured in the project, pass Xcode build settings
-through the CLI:
+For unattended hosts, unlocking the keychain is not always enough. If
+`codesign` fails with `errSecInternalComponent`, grant Apple tools access to the
+private key with `security set-key-partition-list` using the host-local keychain
+password. Keep that password in host-local service configuration only.
+
+When signing is not already configured in the project, set
+`OPENCLAW_IPHONE_DEVELOPMENT_TEAM` and `OPENCLAW_IPHONE_RUNNER_BUNDLE_ID` in the
+host config. CLI flags are still available as debug overrides:
 
 ```sh
-OPENCLAW_IPHONE_WDA_PATH="/path/to/WebDriverAgent" \
 PYTHONPATH=src python3 -m openclaw_iphone wda run \
   --development-team "<team-id>" \
   --runner-bundle-id "com.example.WebDriverAgentRunner" \
   --allow-provisioning-updates
 ```
 
-In a second process, forward the device WDA port when `iproxy` is installed:
+When running WDA through launchd, keep host-specific values in
+`~/.openclaw/iphone/config.env`, not in the plist template.
 
-```sh
-brew install libimobiledevice
-PYTHONPATH=src python3 -m openclaw_iphone wda tunnel
-```
-
-Both commands stay in the foreground while their underlying process is alive. If
-either exits, UI control breaks and needs to be restarted or supervised.
-After the runner and tunnel are up, `wda status`, `ui screenshot`, and
-`ui source` should talk to `http://127.0.0.1:8100`.
+Keep the WDA runner process alive. The CLI reaches WDA through Apple
+CoreDevice's USB tunnel and does not require a separate localhost forwarding
+process.
 
 For always-on agent use, see `docs/launchagent-service.md`. It scopes the
-LaunchAgent wrapper for running the WDA runner and tunnel as restartable
-per-user services with logs.
+LaunchAgent wrapper for running the WDA runner as a restartable per-user service
+with logs.
 
 Validated local example:
 
 ```sh
-OPENCLAW_IPHONE_WDA_PATH=/Users/pearlperelel/.openclaw/iphone/WebDriverAgent \
 PYTHONPATH=src python3 -m openclaw_iphone wda run \
-  --runner-bundle-id ai.unblocklabs.openclaw.WebDriverAgentRunner \
   --allow-provisioning-updates
 
-PYTHONPATH=src python3 -m openclaw_iphone wda tunnel
+PYTHONPATH=src python3 -m openclaw_iphone wda url
 PYTHONPATH=src python3 -m openclaw_iphone wda status
 PYTHONPATH=src python3 -m openclaw_iphone ui screenshot
 PYTHONPATH=src python3 -m openclaw_iphone ui source
 PYTHONPATH=src python3 -m openclaw_iphone ui tap --x 180 --y 420
 ```
 
-The CLI resolves full Xcode through `DEVELOPER_DIR`, the current
-`xcode-select` path, or common Xcode install locations. It does not change the
-host's global Xcode selection.
+The CLI does not change the host's global Xcode selection by itself.
 
 ## Asking OpenClaw To Use The iPhone
 
@@ -308,11 +333,11 @@ Ask for the phone explicitly and include the repo/path context when useful:
 
 ```text
 Use the plugged-in physical iPhone via WebDriverAgent from
-/Users/pearlperelel/Desktop/iphone. First verify WDA with
+the canonical openclaw-iphone checkout. Use the host config at
+~/.openclaw/iphone/config.env. First verify WDA with
 PYTHONPATH=src python3 -m openclaw_iphone wda status. If WDA is not running,
-start the WDA runner and tunnel using the documented bundle id
-ai.unblocklabs.openclaw.WebDriverAgentRunner, then verify with status,
-screenshot, and source before interacting with apps.
+start the WDA runner, then verify with status, screenshot, and source before
+interacting with apps.
 ```
 
 For task-specific work, name the app and desired end state:
@@ -333,29 +358,30 @@ Run a basic device check:
 Check a specific device:
 
 ```sh
-DEVICE_ID="<udid-or-device-name>" ./snippets/iphone-lock-state.sh
+./snippets/iphone-lock-state.sh
 ```
 
 Launch an app by bundle id:
 
 ```sh
-DEVICE_ID="<udid-or-device-name>" BUNDLE_ID="com.apple.mobilesafari" ./snippets/iphone-launch-app.sh
+BUNDLE_ID="com.apple.mobilesafari" ./snippets/iphone-launch-app.sh
 ```
+
+The low-level snippets resolve `OPENCLAW_IPHONE_DEVICE` from
+`~/.openclaw/iphone/config.env` when `DEVICE_ID` is not explicitly provided.
 
 Check WebDriverAgent if it is already running:
 
 ```sh
-WDA_URL="http://127.0.0.1:8100" ./snippets/wda-smoke.sh
+./snippets/wda-smoke.sh
 ```
 
 Run the App Store install example after WDA is already reachable:
 
 ```sh
-WDA_URL="http://127.0.0.1:8100" \
 APP_NAME="Example App" \
 EXPECTED_PUBLISHER="Example Publisher" \
 EXPECTED_BUNDLE_ID="com.example.app" \
-DEVICE_ID="<udid-or-device-name>" \
 python3 ./snippets/wda-app-store-install-example.py
 ```
 

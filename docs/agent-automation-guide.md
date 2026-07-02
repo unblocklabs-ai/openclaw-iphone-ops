@@ -71,9 +71,11 @@ Avoid:
 The reusable UI layer is backed by WebDriverAgent:
 
 ```sh
-openclaw-iphone wda run --wda-path /path/to/WebDriverAgent
-openclaw-iphone wda tunnel
+openclaw-iphone wda run
+openclaw-iphone wda url
 openclaw-iphone wda status
+openclaw-iphone doctor
+openclaw-iphone watchdog once
 openclaw-iphone ui screenshot
 openclaw-iphone ui source
 openclaw-iphone ui tap --x 180 --y 420
@@ -87,10 +89,12 @@ Mechanically, `wda run` executes `xcodebuild test` against the
 keeps the XCTest-hosted WDA process alive on the device. The WDA path must point
 to an actual WebDriverAgent Xcode project, usually Appium's maintained fork, and
 the project must already be signed/provisioned for the phone. Marker files or
-cache directories are not sufficient. If signing is not stored in the project,
-use `--development-team`, `--runner-bundle-id`, and optionally
-`--allow-provisioning-updates`. If no Apple Development identity or Xcode
-account exists on the host, report signing as the blocker.
+cache directories are not sufficient. Host-specific values should live in
+`~/.openclaw/iphone/config.env`, copied from `.env.example`. If signing is not
+stored in the project, set `OPENCLAW_IPHONE_DEVELOPMENT_TEAM`,
+`OPENCLAW_IPHONE_RUNNER_BUNDLE_ID`, and optionally run with
+`--allow-provisioning-updates`. If no Apple Development identity or Xcode account
+exists on the host, report signing as the blocker.
 
 The host must use full Xcode for CoreDevice operations. If `xcode-select -p`
 prints `/Library/Developer/CommandLineTools`, ask for or perform the supervised
@@ -108,14 +112,29 @@ access, the login keychain password may differ from the Mac login password; use
 the locally configured keychain password and choose Always Allow. Never print or
 commit that password.
 
-`wda tunnel` uses `iproxy` to forward local port 8100 to device port 8100.
-Install it with `brew install libimobiledevice` when it is missing. Run `wda
-run` and `wda tunnel` in separate foreground or supervised background processes.
-If either process exits, UI control breaks. Then verify with `wda status`.
+If a headless or launchd run reports `errSecInternalComponent` from `codesign`,
+the signing identity exists but the private key is not usable by Apple tooling
+in that execution context. A host-local operator must unlock the login keychain
+and apply `security set-key-partition-list` for Apple tools; do not put the
+keychain password in repo files or chat.
+
+If WDA reinstalls successfully but Xcode reports that the Developer App
+Certificate is not trusted, stop retrying and ask for phone-side trust at
+`Settings -> General -> VPN & Device Management`.
+
+The CLI resolves the WDA URL through Apple CoreDevice's USB tunnel from the
+configured iPhone. Use `wda url` to inspect the resolved endpoint. Do not set
+`OPENCLAW_IPHONE_WDA_URL` or pass `--url` for normal OpenClaw operation, and do
+not start a separate localhost forwarding tunnel.
 
 Use UI capture after launching the target app. `wda status` should be the first
 check when WebDriverAgent is involved. If WDA is not reachable, report that
 exact runtime boundary instead of inventing app-specific workarounds.
+
+For unattended control, the device should have Auto-Lock set to Never when
+policy allows it. The watchdog is recovery-only: it checks readiness/lock state
+and attempts one WDA unlock if locked. Do not use random taps or gestures as a
+heartbeat.
 
 For interaction, prefer the accessibility-backed commands first. `ui elements`
 returns compact visible labels/values/types/rects. `ui annotated-screenshot`

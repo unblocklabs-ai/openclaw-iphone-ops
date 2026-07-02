@@ -49,6 +49,9 @@ If WDA was already proven in the same run, reuse the warm session unless it goes
 ## Lock State Rule
 
 Always check lock state before foreground launches, tests, or taps.
+For unattended OpenClaw hosts, prevent lock interruptions by setting
+`Settings -> Display & Brightness -> Auto-Lock -> Never` when device policy
+allows it.
 
 Example:
 
@@ -56,10 +59,10 @@ Example:
 xcrun devicectl device info lockState --device "$DEVICE_ID" --json-output "$TMPDIR/lock-state.json"
 ```
 
-If the phone is locked, try `openclaw-iphone wda unlock --verify` once. This
-agent phone is expected to have no passcode, so WDA unlock should normally
-recover without human input. If verification still reports passcode required,
-do not keep pushing UI commands. Ask for an unlock and report the exact boundary.
+If the phone is locked, try `openclaw-iphone wda unlock --verify` once. WDA
+unlock can recover only when iOS does not require passcode, Face ID, or another
+secure confirmation. If verification still reports passcode required, do not
+keep pushing UI commands. Ask for an unlock and report the exact boundary.
 
 ## App Control Pattern
 
