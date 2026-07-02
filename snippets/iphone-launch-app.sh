@@ -1,10 +1,10 @@
 #!/usr/bin/env sh
 set -eu
 
-if [ -z "${DEVICE_ID:-}" ]; then
-  echo "Set DEVICE_ID to a device UDID, serial number, or device name." >&2
-  exit 2
-fi
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+. "$SCRIPT_DIR/iphone-lib.sh"
+REPO_DIR="$(resolve_openclaw_repo_dir "$SCRIPT_DIR")"
+DEVICE_ID="$(resolve_openclaw_device_id "$REPO_DIR")"
 
 if [ -z "${BUNDLE_ID:-}" ]; then
   echo "Set BUNDLE_ID to the app bundle identifier to launch." >&2
@@ -20,9 +20,8 @@ xcrun devicectl device info lockState \
   --json-output "$lock_json" >/dev/null
 
 echo "Checked lock state: $lock_json"
-echo "Launching $BUNDLE_ID..."
+echo "Launching $BUNDLE_ID on $DEVICE_ID..."
 
 xcrun devicectl device process launch \
   --device "$DEVICE_ID" \
   "$BUNDLE_ID"
-

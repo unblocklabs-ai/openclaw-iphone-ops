@@ -1,0 +1,5 @@
+interface:
+  display_name: "iPhone Control"
+  short_description: "Control a physical iPhone from OpenClaw"
+  brand_color: "#2563EB"
+  default_prompt: "Use $iphone-control to verify and control the plugged-in physical iPhone with WebDriverAgent."

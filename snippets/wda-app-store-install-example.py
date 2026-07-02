@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 import subprocess
 import sys
 import time
@@ -17,7 +18,15 @@ import urllib.error
 import urllib.request
 
 
-WDA_URL = os.environ.get("WDA_URL", "http://127.0.0.1:8100").rstrip("/")
+WDA_URL = os.environ.get("WDA_URL", "").rstrip("/")
+REPO_DIR = Path(os.environ.get("OPENCLAW_IPHONE_REPO_DIR", Path(__file__).resolve().parents[1]))
+SRC_DIR = REPO_DIR / "src"
+if SRC_DIR.exists():
+    sys.path.insert(0, str(SRC_DIR))
+
+from openclaw_iphone.config import load_config
+from openclaw_iphone.devicectl import DeviceCtl
+
 APP_NAME = os.environ.get("APP_NAME")
 EXPECTED_PUBLISHER = os.environ.get("EXPECTED_PUBLISHER", "")
 EXPECTED_BUNDLE_ID = os.environ.get("EXPECTED_BUNDLE_ID", "")
@@ -73,30 +82,36 @@ def type_text(text: str) -> None:
 
 
 def devicectl_app_present(bundle_id: str) -> bool:
-    if not DEVICE_ID:
-        print("Skipping devicectl proof because DEVICE_ID is unset.")
-        return False
+    client = DeviceCtl()
+    selector = DEVICE_ID or load_config().device
+    device = client.select_device(selector)
+    apps, _ = client.list_apps(device.identifier, include_all=True)
+    return any(app.bundle_identifier == bundle_id for app in apps)
+
+
+def resolve_wda_url() -> str:
+    env = os.environ.copy()
+    env["PYTHONPATH"] = f"{REPO_DIR / 'src'}{os.pathsep}{env['PYTHONPATH']}" if env.get("PYTHONPATH") else str(REPO_DIR / "src")
     proc = subprocess.run(
-        [
-            "xcrun",
-            "devicectl",
-            "device",
-            "info",
-            "apps",
-            "--device",
-            DEVICE_ID,
-        ],
+        [sys.executable, "-m", "openclaw_iphone", "wda", "url"],
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        env=env,
         check=False,
     )
     if proc.returncode != 0:
-        raise RuntimeError(proc.stderr.strip() or proc.stdout.strip())
-    return bundle_id in proc.stdout
+        raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "Could not resolve WDA URL.")
+    for line in proc.stdout.splitlines():
+        if line.startswith("url: "):
+            return line.split(": ", 1)[1].strip().rstrip("/")
+    raise RuntimeError(f"Could not parse WDA URL from resolver output: {proc.stdout.strip()}")
 
 
 def main() -> int:
+    global WDA_URL
+    if not WDA_URL:
+        WDA_URL = resolve_wda_url()
     app_name = require(APP_NAME, "APP_NAME")
 
     print("Checking WDA status...")
