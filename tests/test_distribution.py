@@ -102,6 +102,7 @@ class DistributionTests(unittest.TestCase):
                 if code == "E404":
                     publish(Path("tested.tgz"))
                     self.assertEqual(run.call_count, 2)
+                    self.assertEqual(run.call_args.args[0][2], str(Path("tested.tgz").resolve()))
                     self.assertIn("--provenance", run.call_args.args[0])
                 else:
                     with self.assertRaisesRegex(ValueError, "lookup failed"):

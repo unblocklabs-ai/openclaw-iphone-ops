@@ -25,7 +25,7 @@ An npm owner must bootstrap the package before enabling trusted publishing:
 2. From a clean, tested commit already on `main`, run the preparation checks
    below and `python3 scripts/check_npm_package.py --output-dir dist`.
 3. Publish that tested archive with `npm publish
-   dist/unblocklabs-openclaw-iphone-ops-X.Y.Z.tgz --access public`. A local first
+   ./dist/unblocklabs-openclaw-iphone-ops-X.Y.Z.tgz --access public`. A local first
    publish cannot provide GitHub Actions provenance; do not claim it does.
 4. In the npm package Settings, configure a **GitHub Actions trusted publisher**:
    organization `unblocklabs-ai`, repository `openclaw-iphone-ops`, workflow

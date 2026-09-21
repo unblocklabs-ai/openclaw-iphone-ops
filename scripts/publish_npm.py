@@ -10,6 +10,7 @@ import sys
 
 
 def publish(tarball: Path) -> None:
+    tarball = tarball.resolve()
     root = Path(__file__).resolve().parents[1]
     package = json.loads((root / "package.json").read_text())
     spec = f"{package['name']}@{package['version']}"
