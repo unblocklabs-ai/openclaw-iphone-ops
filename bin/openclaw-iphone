@@ -1,0 +1,20 @@
+#!/bin/sh
+set -eu
+
+IPHONE_PYTHON="${OPENCLAW_IPHONE_PYTHON:-python3}"
+if ! command -v "$IPHONE_PYTHON" >/dev/null 2>&1; then
+  echo "openclaw-iphone requires Python 3.11+. Install it or set OPENCLAW_IPHONE_PYTHON to its executable path." >&2
+  exit 127
+fi
+
+# Replace the launcher, preserving exit status and signals (including wda run).
+# Isolated mode prevents cwd/PYTHONPATH from shadowing the bundled Python code.
+exec "$IPHONE_PYTHON" -I -c '
+import sys
+if sys.version_info < (3, 11):
+    sys.exit("openclaw-iphone requires Python 3.11+; set OPENCLAW_IPHONE_PYTHON to a supported interpreter.")
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv.pop(1)).resolve().parents[1] / "src"))
+from openclaw_iphone.cli import main
+sys.exit(main())
+' "$0" "$@"

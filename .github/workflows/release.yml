@@ -1,0 +1,63 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: ${{ !github.event.release.prerelease }}
+    runs-on: macos-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          fetch-depth: 0
+      - name: Require a release from main
+        run: git merge-base --is-ancestor HEAD origin/main
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          registry-url: https://registry.npmjs.org
+      - name: Use npm with trusted publishing support
+        run: npm install --global npm@11.13.0
+      - run: npm ci --ignore-scripts
+      - name: Validate tag, versions, tests, and packed install
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: npm run preflight
+      - name: Build release artifacts
+        run: |
+          python3 scripts/check_npm_package.py --output-dir dist
+          python3 -m pip install build==1.6.1
+          python3 -m build
+          python3 -m venv "$RUNNER_TEMP/iphone-wheel"
+          "$RUNNER_TEMP/iphone-wheel/bin/pip" install --no-deps dist/*.whl
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/iphone-wheel/bin/openclaw-iphone" --version
+          "$RUNNER_TEMP/iphone-wheel/bin/openclaw-iphone" --help
+      - name: Attach packages and checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          (cd dist && shasum -a 256 *.tgz *.whl *.tar.gz) > dist/SHA256SUMS
+          gh release upload "$RELEASE_TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+      - name: Publish tested tarball to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: python3 scripts/publish_npm.py dist/unblocklabs-openclaw-iphone-ops-*.tgz

@@ -7,6 +7,7 @@ import math
 from pathlib import Path
 import sys
 
+from . import __version__
 from .config import IPhoneConfig, load_config
 from .control_lock import control_lock
 from .devicectl import Device, DeviceCtl
@@ -68,6 +69,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="openclaw-iphone",
         description="Reusable primitives for controlling a USB-connected iPhone.",
     )
+    parser.add_argument("--version", action="version", version=__version__)
     parser.add_argument("--developer-dir", help="Override DEVELOPER_DIR for Xcode/devicectl.")
     parser.add_argument("--evidence-dir", help="Directory for JSON evidence artifacts.")
     parser.add_argument("--timeout", type=int, default=30, help="External command timeout in seconds.")

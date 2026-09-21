@@ -1,0 +1,40 @@
+{
+  "name": "@unblocklabs/openclaw-iphone-ops",
+  "version": "0.1.0",
+  "description": "Python CLI and agent skills for controlling a dedicated USB-connected iPhone from macOS.",
+  "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/unblocklabs-ai/openclaw-iphone-ops.git"
+  },
+  "homepage": "https://github.com/unblocklabs-ai/openclaw-iphone-ops#readme",
+  "bugs": "https://github.com/unblocklabs-ai/openclaw-iphone-ops/issues",
+  "os": ["darwin"],
+  "bin": {
+    "openclaw-iphone": "bin/openclaw-iphone"
+  },
+  "files": [
+    "bin/openclaw-iphone",
+    "src/openclaw_iphone/**/*.py",
+    "skills/*/SKILL.md",
+    "skills/*/agents/openai.yaml",
+    "snippets/*.sh",
+    "snippets/*.py",
+    "snippets/launchd/*.sh",
+    "snippets/launchd/*.plist.template",
+    "docs/*.md",
+    "RELEASING.md",
+    ".env.example",
+    "pyproject.toml"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "scripts": {
+    "test": "PYTHONPATH=src python3 -m unittest discover -s tests -v",
+    "release:check": "python3 scripts/check_release.py",
+    "pack:check": "python3 scripts/check_npm_package.py",
+    "preflight": "npm run release:check && npm test && npm run pack:check"
+  }
+}

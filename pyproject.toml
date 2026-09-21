@@ -10,9 +10,12 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = []
 
+[project.urls]
+Repository = "https://github.com/unblocklabs-ai/openclaw-iphone-ops"
+Issues = "https://github.com/unblocklabs-ai/openclaw-iphone-ops/issues"
+
 [project.scripts]
 openclaw-iphone = "openclaw_iphone.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-

@@ -62,6 +62,46 @@ synthetic keep-alive taps that could interfere with the foreground app.
 
 ## Quick Start
 
+### Install from npm (macOS)
+
+Requires **Python 3.11+**, full Xcode, and the device/signing setup above. npm
+ships the Python CLI, both agent skills, docs, and service snippets; there are
+no JavaScript/Python runtime dependencies or install-time scripts.
+
+```sh
+npm install -g @unblocklabs/openclaw-iphone-ops@0.1.0
+openclaw-iphone --version
+openclaw-iphone --help
+openclaw-iphone devices list
+```
+
+The launcher uses `python3` from `PATH`. To select a different interpreter, set
+`OPENCLAW_IPHONE_PYTHON=/absolute/path/to/python3.11`. It does not install Python,
+Xcode, WebDriverAgent, signing credentials, or launchd services. This is a CLI
+and skill bundle, **not** a native `openclaw plugins install` package.
+
+For npm installs, use `openclaw-iphone` in place of
+`PYTHONPATH=src python3 -m openclaw_iphone` in the examples below. Find bundled
+assets at `$(npm root -g)/@unblocklabs/openclaw-iphone-ops`. To use the bundled
+skills' checkout-style commands, set `OPENCLAW_IPHONE_REPO_DIR` to that absolute
+package directory and use Python 3.11+ on `PATH`. Skills are not automatically
+registered: add the package's `skills/` directory to your agent's skill paths.
+Do not edit an npm-managed package in place; updates replace its files.
+
+For unattended launchd services, keep using a stable checkout as documented in
+[the service guide](docs/launchagent-service.md); do not point a running service
+at an ephemeral `npx` cache. Configuration and evidence belong outside the
+installed package. npm installation does not establish live-device readiness.
+
+### Python / checkout
+
+The [GitHub release](https://github.com/unblocklabs-ai/openclaw-iphone-ops/releases)
+also provides a Python wheel and source distribution. Install a downloaded
+wheel into a Python 3.11+ virtual environment with `python3 -m pip install
+/path/to/openclaw_iphone_ops-0.1.0-py3-none-any.whl`. The wheel contains only the
+Python CLI; the source distribution and npm package also include the skills,
+docs, and snippets. There is no automated PyPI or ClawHub publication.
+
 Run the reusable Python CLI directly from a checkout:
 
 ```sh
@@ -461,7 +501,8 @@ Do not share screenshots or local evidence paths into user-facing chat unless ex
 - `apps terminate` uses WDA's bundle-targeted route and requires a running WDA.
 
 See [the hardening review](docs/hardening-review.md) for findings, validation,
-and remaining live-device limitations. Run the offline suite with:
+and remaining live-device limitations. See [RELEASING.md](RELEASING.md) for the
+npm/GitHub release process. Run the offline suite with:
 
 ```sh
 PYTHONPATH=src python3 -m unittest discover -s tests -v
