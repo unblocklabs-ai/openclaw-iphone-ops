@@ -104,6 +104,35 @@ class Observation:
         matches = self.matches(selector)
         return matches[0] if len(matches) == 1 else None
 
+    def compact(self, *, include_labels: bool = False, limit: int = 80) -> dict[str, object]:
+        """Planner-facing local projection, not a cloud-sanitization API.
+
+        Values never leave this projection. Labels are opt-in because even a
+        non-secure screen can contain private messages or credentials.
+        Display truncation never changes the executor's full source/targets.
+        """
+        if not 1 <= limit <= 200:
+            raise ValueError("Compact observation limit must be from 1 to 200.")
+        elements = self.elements or ()
+        visible = [e for e in elements if e.visible is True]
+        rows = []
+        for element in visible[:limit]:
+            row = {"id": element.id, "role": element.role, "enabled": element.enabled,
+                   "actionable": element.actionable, "named": bool(element.name or element.label)}
+            if include_labels and self.secure is False:
+                row.update(name=(element.name or "")[:256], label=(element.label or "")[:256])
+            rows.append(row)
+        return {"snapshot_id": self.id, "captured_at": self.captured_at, "app": self.app,
+                "process_id": self.process_id, "generation": self.generation,
+                "capture_seconds": self.finished - self.started, "secure": self.secure,
+                "accessibility_observed": self.elements is not None,
+                "counts": {"source_nodes": len(elements), "visible": len(visible),
+                           "unnamed_visible": sum(not (e.name or e.label) for e in visible),
+                           "unknown_visibility": sum(e.visible is None for e in elements)},
+                "elements": rows, "omitted_visible": max(0, len(visible) - limit),
+                "labels_included": include_labels and self.secure is False,
+                "values_included": False}
+
 
 def parse_observation(source: str, *, generation: int, device_udid: str,
                       app: str, captured_at: str, started: float, finished: float,

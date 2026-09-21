@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import io
+import plistlib
 from pathlib import Path
 import tempfile
 import unittest
@@ -77,6 +78,34 @@ class LockFailingWDA(FakeWDA):
 
 
 class CLIConfigTests(unittest.TestCase):
+    def test_runtime_provenance_reports_configured_paths_without_process_claims(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "repo"
+            source = root / "src/openclaw_iphone/cli.py"
+            source.parent.mkdir(parents=True)
+            source.write_text("# synthetic\n", encoding="utf-8")
+            wda = root / "WebDriverAgent"
+            wda.mkdir()
+            plist = Path(tmp) / "com.openclaw.iphone-wda-run.plist"
+            wrapper = root / "snippets/launchd/openclaw-iphone-wda-run.sh"
+            wrapper.parent.mkdir(parents=True)
+            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+            with plist.open("wb") as stream:
+                plistlib.dump({
+                    "ProgramArguments": [str(wrapper)],
+                    "WorkingDirectory": str(root),
+                }, stream)
+            result = cli.runtime_provenance(
+                IPhoneConfig({
+                    "OPENCLAW_IPHONE_REPO_DIR": str(root),
+                    "OPENCLAW_IPHONE_WDA_PATH": str(wda),
+                }), source_file=source, launchd_plist=plist,
+            )
+        self.assertEqual(result["source-repo"], "match")
+        self.assertEqual(result["wda-path"], "present")
+        self.assertIn("(match)", result["launchd-wrapper"])
+        self.assertIn("(match)", result["launchd-working-directory"])
+
     def test_wda_backed_commands_accept_device_override(self) -> None:
         parser = cli.build_parser()
 

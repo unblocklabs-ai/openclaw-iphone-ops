@@ -11,6 +11,11 @@ snapshot-bound targeting, verified typing/waits, bounded execution and an
 optional Jev decision driver. Existing CLI recipes remain supported without a
 model key. App-specific knowledge remains in caller workflows/skills.
 
+For planner-driven work, use [one reusable session](docs/planner-session.md)
+(`task session`) instead of a new CLI/WDA connection for every step. `ui observe`
+provides compact accessibility-only inspection; `doctor --check-ui` diagnoses
+screen-read health rather than assuming `/status` readiness proves it.
+
 ## What This Enables
 
 - Discovering a connected iPhone
@@ -45,10 +50,10 @@ For the OpenClaw device lane, set `Settings -> Display & Brightness -> Auto-Lock
 to `Never` when the device policy allows it. This is the preferred fix; unlock
 automation is only a fallback.
 
-Run a full health check before agent workflows:
+For initial diagnosis or after a failure (not before every action):
 
 ```sh
-PYTHONPATH=src python3 -m openclaw_iphone doctor
+PYTHONPATH=src python3 -m openclaw_iphone doctor --check-ui
 ```
 
 If the phone is locked, agents should try a best-effort WDA unlock once:
@@ -75,7 +80,7 @@ ships the Python CLI, both agent skills, docs, and service snippets; there are
 no JavaScript/Python runtime dependencies or install-time scripts.
 
 ```sh
-npm install -g @unblocklabs/openclaw-iphone-ops@0.2.2
+npm install -g @unblocklabs/openclaw-iphone-ops@0.3.0
 openclaw-iphone --version
 openclaw-iphone --help
 openclaw-iphone devices list
@@ -89,7 +94,7 @@ and skill bundle, **not** a native `openclaw plugins install` package.
 For npm installs, use `openclaw-iphone` in place of
 `PYTHONPATH=src python3 -m openclaw_iphone` in the examples below. Find bundled
 assets at `$(npm root -g)/@unblocklabs/openclaw-iphone-ops`. To use the bundled
-skills' checkout-style commands, set `OPENCLAW_IPHONE_REPO_DIR` to that absolute
+service snippets, set `OPENCLAW_IPHONE_REPO_DIR` to that absolute
 package directory and use Python 3.11+ on `PATH`. Skills are not automatically
 registered: add the package's `skills/` directory to your agent's skill paths.
 Do not edit an npm-managed package in place; updates replace its files.
@@ -104,7 +109,7 @@ installed package. npm installation does not establish live-device readiness.
 The [GitHub release](https://github.com/unblocklabs-ai/openclaw-iphone-ops/releases)
 also provides a Python wheel and source distribution. Install a downloaded
 wheel into a Python 3.11+ virtual environment with `python3 -m pip install
-/path/to/openclaw_iphone_ops-0.2.2-py3-none-any.whl`. The wheel contains only the
+/path/to/openclaw_iphone_ops-0.3.0-py3-none-any.whl`. The wheel contains only the
 Python CLI; the source distribution and npm package also include the skills,
 docs, and snippets. There is no automated PyPI or ClawHub publication.
 

@@ -5,6 +5,9 @@ recipes keep working; no model, daemon, service changes or new dependencies are
 required. This is experimental control infrastructure, not a claim of universal
 unattended safety.
 
+For interactive planner control, use [one JSON-lines session](planner-session.md)
+with `task session --file TASK.json`; `ui observe` is the one-shot compact read.
+
 ## Transport ownership
 
 `TaskConnection(DeviceCtl(...), device=selector, seconds=60)` is a single-use,
@@ -19,6 +22,15 @@ The shared monotonic budget covers setup, reads, writes and waits. Set
 cannot be retracted. Cleanup uses only the remaining budget; failure is reported
 separately by `cleanup_failed` after context exit and never changes the action
 result. An expired task may leave a server session for the next owner to replace.
+Task session cleanup is additionally capped at two seconds so a stalled reader
+does not add a full command timeout merely releasing ownership.
+
+Source/screenshot requests have a separate 12-second socket timeout, capped by
+the command timeout and remaining task/operation deadline. Override with global
+`--read-timeout SECONDS` (before the subcommand), or Python `read_timeout=`.
+The default allows the previously measured ~9.6-second Settings source capture;
+it is not a claim that every healthy screen is faster than 12 seconds. Socket
+timeouts are not hard real-time guarantees. Mutation timeouts are unchanged.
 
 `WDAClient.type_text` retains its W3C key semantics but reuses one session for
 the whole string. `type_text_bulk` uses WDA's native `/wda/keys` route in one
@@ -34,6 +46,10 @@ Low-level Python callers must invalidate the connection on transport failure.
 checking the original UDID, current endpoint, readiness and lock again. It
 invalidates old generations and never retries the caller's action. It does not
 restart services, repair signing or unlock the device.
+Exact UDID/CoreDevice selectors may first perform one read-only details probe
+of a disconnected device, then re-list and verify physical identity and lock
+state, within ten seconds or the smaller remaining budget. Name/automatic
+selection does not wake a disconnected device or choose an alternative phone.
 
 `connection.metrics.summary()` contains content-free transport attempt counts,
 elapsed time and up to 2,000 event timings. Names use route templates, not session
@@ -91,7 +107,7 @@ No guessed coordinates or icon semantics are used. WDA cannot make all these
 checks atomic with input; external clients, animations or human touches can
 still race. This is a safety improvement, not an isolation guarantee.
 
-Supported grants: `tap`, explicit named `back`, `append`, `clear`, `replace`,
+Supported grants: `tap`, explicit named `back`, `append`, `clear`, `replace`, `keypad`,
 `scroll`, `activate`, `open_url`. App activation requires an installed bundle;
 deep links require an exact destination and expected app postcondition. Back
 requires an explicitly named Back/Go Back button; arbitrary top-left controls
@@ -114,6 +130,32 @@ empty. Missing XML values require a separate successful value-endpoint read:
 WDA's explicit `value: null` confirms empty for an otherwise validated editable
 field; a missing response key/error does not. Placeholder-like values are not
 treated as empty. Chunking and automatic unsupported-route fallback are not enabled.
+
+### Explicit keypad input
+
+`keypad` references a supplied `text_id` containing 1–32 ASCII digits. It is a
+deliberately selected input strategy, **not** a retry on bulk failure. Target a
+named non-secure editable field, or a custom `XCUIElementTypeOther` field that
+actually exposes focus and a readable string value. Before the first key, a
+fresh value-endpoint read must explicitly equal `""`; `null`, placeholders,
+missing attributes and empty OCR output are insufficient. It does not clear.
+If existing content must be reset, do so only in a separately authorized,
+verified workflow; generic custom-field clearing is not implemented.
+
+Every key requires fresh app/PID, field identity, focus, exact prefix and one
+visible/hittable `XCUIElementTypeKey` with the exact digit name or label under
+an accessibility Keyboard. No coordinate/digit inference is used. Each click
+gets bounded prefix verification before the next digit. A missing/duplicate
+key, focus/app change, dropped key, failed read or uncertain write stops input;
+no continuation, fallback, automatic submit or replay occurs. Partial results
+report only acknowledgement counts, never the digits. Completion still needs
+the caller's independent success conditions. Fields that auto-submit before
+final readback may remain unverified even if the app progressed.
+
+Value predicates on custom `Other` fields always use a separate strict-string
+value read, never treat WDA `null` as empty. These are assertions about the
+observed value, not proof a control is an input or permission to mutate it.
+Keypad actions also require independent focus and field/keyboard validation.
 
 Predicates are fixed data: expected app, unique element existence/absence,
 actionability, focus or exact non-secure editable value. `wait()` polls them
@@ -164,6 +206,15 @@ provider failures. HTTP/transport failures or invalid responses escalate as
 `last_decision`; it dispatches no action, including in decision-only mode.
 Known usage is still counted. Replan explicitly rather than rerunning an
 unknown device mutation. Model confidence is never authorization or completion proof.
+
+The Choice request uses structured JSON objects for both `instructions` and
+each `criteria` entry (the documented TypeSafe shape), rather than making the
+model infer policy from vague strings. Device-action criteria contain only the
+opaque choice key, operation, caller-written description and a snapshot
+boundary; `wait`, `done` and `escalate` are explicitly typed non-device
+alternatives. This improves decision context without granting Jev new
+authority: it still cannot emit selectors, coordinates, destinations, text,
+commands or completion claims.
 
 Make `TYPESAFE_API_KEY` available in the invoking process using your existing
 secure credential mechanism. Do not pass it as a CLI argument, add it to the

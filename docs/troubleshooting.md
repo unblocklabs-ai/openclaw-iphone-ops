@@ -2,6 +2,14 @@
 
 ## Device Not Found
 
+Use an exact dedicated-phone UDID/CoreDevice identifier in
+`OPENCLAW_IPHONE_DEVICE`. For an exact pin listed disconnected, selection now
+performs one bounded read-only details probe, re-lists the same physical device,
+and checks passcode state. No name-based wake, substitute phone, pairing repair
+or mutation is attempted. If identity cannot be verified or the ten-second
+probe fails, it stops. This may wake a dormant tunnel; it does not promise to
+repair every Apple connection failure.
+
 Check:
 
 ```sh
@@ -55,6 +63,68 @@ PYTHONPATH=src python3 -m openclaw_iphone wda status
 ```
 
 If `ready` is false, restart or rebuild the WDA/XCUITest lane. Do not trust old logs.
+
+## WDA Is Ready But Screen Reads Stall
+
+`/status` can remain healthy while accessibility or screenshot retrieval hangs.
+Probe once without saving private screen content:
+
+```sh
+openclaw-iphone doctor --check-ui
+# Tune only for a known slow screen; the default read timeout is 12 seconds.
+openclaw-iphone --read-timeout 15 doctor --check-ui
+```
+
+`screen-read-failed` distinguishes this boundary from readiness. A successful
+source probe does not independently prove screenshot health. Do not keep
+alternating full source/screenshots/status commands or reenter a password after
+a read failure. In a task session, `recover_read` allows one same-device
+reacquisition; it does not restart WDA and never revives stopped input.
+
+If that fails and a runner restart is authorized:
+
+1. Close the task session to release its workflow lock. Preserve its action
+   outcome and acknowledgement count; there must be no in-flight mutation.
+2. Check `launchctl print "gui/$(id -u)/com.openclaw.iphone-wda-run"` and the
+   installed LaunchAgent's wrapper/config path. Confirm it runs this dedicated
+   phone's pin and the intended package, not a stale checkout or another device.
+   Coordinate with other controllers before disrupting the shared runner.
+3. Restart **only that runner**, once:
+   `launchctl kickstart -k "gui/$(id -u)/com.openclaw.iphone-wda-run"`.
+4. Allow a bounded startup interval, then run `doctor --check-ui` again. If
+   startup/signing/trust/lock still blocks, escalate with redacted logs rather
+   than cycling services. Do not restart watchdogs or change security settings.
+5. Start a fresh task and independently inspect the actual UI. Reconcile any
+   previous acknowledged/unknown input before authorizing further actions.
+
+This is explicit operator recovery, not an automated session feature. The
+task lock coordinates this package's workflows, not arbitrary external clients.
+
+## Checkout versus launchd provenance
+
+When a fix appears absent, run `openclaw-iphone doctor` and inspect the
+`runtime-source`, `configured-repo`, `source-repo`, `configured-wda-path`, and
+`launchd-*` lines before restarting anything. They identify the Python source
+and configured runner/plist paths and report `match`, `different`, or `absent`.
+The report does not claim which command is currently running; launchd must be
+reloaded separately after an approved installation change. The WDA launchd
+wrapper honors `OPENCLAW_IPHONE_PYTHON` when a host needs a specific supported
+interpreter.
+
+## Typing Or Custom Verification Field Does Not Read Back
+
+Do not infer that input failed just because its screenshot/source failed.
+`ui type` and low-level bulk typing have no exact final-value guarantee. Use
+runtime `replace` for authorized whole-field entry, or `append` on a verified
+empty field. `keypad` is an explicit digits-only strategy with fresh focus,
+field identity, accessible-key and per-prefix checks; see
+[task-runtime.md](task-runtime.md#explicit-keypad-input).
+
+The runtime does not automatically reset or retry a partially entered custom
+code. A fixed number of Delete taps plus empty OCR output is not reliable
+empty-field verification. If the field cannot expose a trustworthy value/focus,
+or secure fields are present, stop for a separately authorized local workflow.
+Never send authentication screenshots/codes to Jev or place them in CLI args.
 
 ## WDA Build Succeeds But Test Does Not Stay Running
 

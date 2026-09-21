@@ -25,6 +25,7 @@ class UIElement:
     rect: dict[str, int | None]
     visible: bool | None
     enabled: bool | None
+    tree_path: tuple[int, ...] = ()
 
     @property
     def text(self) -> str:
@@ -42,6 +43,7 @@ class UIElement:
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
+        data.pop("tree_path")
         data["text"] = self.text
         center = self.center
         data["center"] = None if center is None else {"x": center[0], "y": center[1]}
@@ -129,6 +131,13 @@ class UIController:
     def tap_text(self, query: str, *, exact: bool = False) -> UIElement:
         candidates = [element for element in self.elements() if element.visible is True and element.enabled is not False]
         matches = [element for element in candidates if find_element([element], query, exact=exact)]
+        # A button's nested label is the same logical target, even when its
+        # frame center differs by a fraction of a point. Do not collapse peers
+        # merely because they overlap or have the same label.
+        buttons = [e for e in matches if e.type == "XCUIElementTypeButton" and e.center is not None]
+        matches = [e for e in matches if not (e.type == "XCUIElementTypeStaticText" and any(
+            len(e.tree_path) > len(b.tree_path) and e.tree_path[:len(b.tree_path)] == b.tree_path
+            for b in buttons))]
         centers = {element.center for element in matches if element.center is not None}
         if len(centers) > 1:
             raise WDAUnavailable(f"Multiple visible UI elements matched {query!r}; use a more specific selector.")
@@ -195,8 +204,11 @@ class UIController:
 def parse_elements(source_text: str, *, visible_only: bool = True) -> list[UIElement]:
     root = ET.fromstring(source_text)
     elements: list[UIElement] = []
+    paths = {root: ()}
     hidden = {child for node in root.iter() if node.get("visible") == "false" for child in node.iter()}
     for node in root.iter():
+        for index, child in enumerate(node):
+            paths[child] = paths[node] + (index,)
         if visible_only and node in hidden:
             continue
         name = attr(node, "name")
@@ -217,6 +229,7 @@ def parse_elements(source_text: str, *, visible_only: bool = True) -> list[UIEle
             rect=rect,
             visible=visible,
             enabled=enabled,
+            tree_path=paths[node],
         )
         if visible_only and visible is False:
             continue

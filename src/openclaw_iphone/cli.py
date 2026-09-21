@@ -4,6 +4,7 @@ import argparse
 from contextlib import nullcontext
 import json
 import math
+import plistlib
 from pathlib import Path
 import sys
 import time
@@ -13,12 +14,12 @@ from .config import IPhoneConfig, load_config
 from .control_lock import control_lock
 from .devicectl import Device, DeviceCtl
 from .evidence import artifact_path, write_private
-from .errors import DeviceLocked, OpenClawIPhoneError, WDAUnavailable
+from .errors import DeviceLocked, OpenClawIPhoneError, SessionOutputUnavailable, WDAUnavailable
 from .instagram_context import capture_instagram_context
 from .instagram_ops import DEFAULT_ANALYSIS_PROMPT, analyze_video, benchmark_discovery, benchmark_ranking_quality, discover_creators, triage_shortlist, verify_handles
 from .recipes.instagram import smoke as instagram_smoke
 from .ui import UIController
-from .wda import DEFAULT_WDA_PORT, WDAClient, WDARunConfig, resolve_wda_path, run_wda
+from .wda import DEFAULT_SCREEN_READ_TIMEOUT, DEFAULT_WDA_PORT, WDAClient, WDARunConfig, resolve_wda_path, run_wda
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -74,6 +75,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--developer-dir", help="Override DEVELOPER_DIR for Xcode/devicectl.")
     parser.add_argument("--evidence-dir", help="Directory for JSON evidence artifacts.")
     parser.add_argument("--timeout", type=int, default=30, help="External command timeout in seconds.")
+    parser.add_argument("--read-timeout", type=float, default=DEFAULT_SCREEN_READ_TIMEOUT, help="Source/screenshot request timeout (default 12s), also capped by the task deadline.")
 
     subcommands = parser.add_subparsers(dest="command")
 
@@ -85,6 +87,7 @@ def build_parser() -> argparse.ArgumentParser:
     doctor = subcommands.add_parser("doctor", help="Run a read-only iPhone control health check.")
     add_device_arg(doctor)
     add_wda_url_arg(doctor)
+    doctor.add_argument("--check-ui", action="store_true", help="Also probe accessibility capture; /status alone does not prove read health.")
     doctor.set_defaults(handler=handle_doctor)
 
     apps = subcommands.add_parser("apps", help="Installed app and process commands.")
@@ -306,6 +309,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     ui = subcommands.add_parser("ui", help="UI capture commands backed by WebDriverAgent.")
     ui_subcommands = ui.add_subparsers(dest="ui_command")
+    ui_observe = ui_subcommands.add_parser("observe", help="One compact, identity-checked accessibility observation; no screenshot.")
+    add_device_arg(ui_observe)
+    ui_observe.add_argument("--include-labels", action="store_true", help="Include local, potentially private UI labels (never field values).")
+    ui_observe.add_argument("--deadline-seconds", type=float, default=30)
+    ui_observe.set_defaults(handler=handle_ui_observe)
     ui_screenshot = ui_subcommands.add_parser("screenshot", help="Capture a screenshot through WebDriverAgent.")
     add_device_arg(ui_screenshot)
     add_wda_url_arg(ui_screenshot)
@@ -415,6 +423,11 @@ def build_parser() -> argparse.ArgumentParser:
     task_run.add_argument("--min-confidence", type=float, default=0.6, help="Jev escalation threshold, not authorization or completion proof.")
     task_run.add_argument("--json", action="store_true", help="Emit the result as JSON (also the default).")
     task_run.set_defaults(handler=handle_task_run)
+    task_session = task_subcommands.add_parser("session", help="Keep one bounded task/session open for a planner over stdin/stdout JSON lines.")
+    add_device_arg(task_session)
+    task_session.add_argument("--file", type=Path, required=True, help="Trusted grants/text/success conditions; same schema as task run.")
+    task_session.add_argument("--include-labels", action="store_true", help="Opt into local private UI labels; no cloud calls are made by this interface.")
+    task_session.set_defaults(handler=handle_task_session)
     task_summary = task_subcommands.add_parser("summarize", help="Summarize saved task results offline; does not control a device.")
     task_summary.add_argument("files", nargs="+", type=Path)
     task_summary.set_defaults(handler=handle_task_summary)
@@ -440,7 +453,7 @@ def handle_task_run(args: argparse.Namespace) -> int:
         if config.wda_url:
             raise ValueError("Task mode requires a resolved CoreDevice endpoint, not a debug override.")
         connection = TaskConnection(client_from_args(args), device=device_selector_from_args(args, config=config),
-                                    seconds=spec.limits.seconds)
+                                    seconds=spec.limits.seconds, read_timeout=args.read_timeout)
         connection.budget.deadline = started + spec.limits.seconds
         with connection:
             executor = Executor(connection, spec.grants, texts=spec.texts,
@@ -464,6 +477,80 @@ def handle_task_run(args: argparse.Namespace) -> int:
         result["evidence_warning"] = "result_not_persisted_action_outcome_unchanged"
     print(json.dumps(result, indent=2))
     return 0 if result["status"] in {"completed", "decision_only"} else 1
+
+
+def handle_task_session(args: argparse.Namespace) -> int:
+    from .actions import Executor
+    from .connection import TaskConnection
+    from .execution import TaskStopped
+    from .planner import PlannerSession, json_line_emitter, read_requests, serve
+    from .tasks import load_task
+
+    started = time.monotonic()
+    connection = None
+    output_failed = False
+    emit = None
+    try:
+        spec = load_task(args.file)
+        config = load_config()
+        if config.wda_url:
+            raise ValueError("Planner sessions require a resolved CoreDevice endpoint.")
+        connection = TaskConnection(client_from_args(args), device=device_selector_from_args(args, config=config),
+                                    seconds=spec.limits.seconds, read_timeout=args.read_timeout)
+        connection.budget.deadline = started + spec.limits.seconds
+        with connection:
+            emit = json_line_emitter(sys.stdout, connection.budget)
+            executor = Executor(connection, spec.grants, texts=spec.texts, freshness=spec.limits.freshness,
+                                verification_seconds=spec.limits.verification_seconds)
+            session = PlannerSession(executor, spec, include_labels=args.include_labels)
+            emit({"status": "ready", "protocol": 1, "seconds_remaining": connection.budget.remaining()})
+            code = serve(session, read_requests(sys.stdin.fileno(), connection.budget), emit)
+    except SessionOutputUnavailable:
+        output_failed = True
+        code = 1
+    except TaskStopped:
+        code = 1
+        if emit is not None:
+            try:
+                emit({"status": "blocked", "reason": "deadline_or_limit"})
+            except SessionOutputUnavailable:
+                output_failed = True
+    except (ValueError, OSError, OpenClawIPhoneError):
+        code = 1
+        if emit is not None:
+            try:
+                emit({"status": "blocked", "reason": "session_unavailable_or_invalid_input"})
+            except SessionOutputUnavailable:
+                output_failed = True
+    except KeyboardInterrupt:
+        code = 1
+        if emit is not None:
+            try:
+                emit({"status": "escalated", "reason": "interrupted_outcome_unknown"})
+            except SessionOutputUnavailable:
+                output_failed = True
+    if emit is not None and not output_failed:
+        try:
+            emit({"status": "session_end", "seconds": time.monotonic() - started,
+                  "cleanup": "warning" if connection and connection.cleanup_failed else "completed" if connection else "not_started",
+                  "transport": connection.metrics.summary() if connection else None})
+        except SessionOutputUnavailable:
+            pass
+    return code
+
+
+def handle_ui_observe(args: argparse.Namespace) -> int:
+    from .actions import Executor
+    from .connection import TaskConnection
+    config = load_config()
+    if config.wda_url:
+        raise ValueError("Compact observation requires a resolved CoreDevice endpoint.")
+    with TaskConnection(client_from_args(args), device=device_selector_from_args(args, config=config),
+                        seconds=args.deadline_seconds, read_timeout=args.read_timeout) as connection:
+        result = Executor(connection, ()).observe().compact(include_labels=args.include_labels)
+    result["cleanup"] = "warning" if connection.cleanup_failed else "completed"
+    print(json.dumps(result, ensure_ascii=True))
+    return 0
 
 
 def handle_task_summary(args: argparse.Namespace) -> int:
@@ -506,7 +593,7 @@ def client_from_args(args: argparse.Namespace) -> DeviceCtl:
 
 
 def wda_client_from_args(args: argparse.Namespace) -> WDAClient:
-    return WDAClient(url=resolve_wda_url_from_args(args), timeout=args.timeout)
+    return WDAClient(url=resolve_wda_url_from_args(args), timeout=args.timeout, read_timeout=getattr(args, "read_timeout", DEFAULT_SCREEN_READ_TIMEOUT))
 
 
 def resolve_wda_url_from_args(args: argparse.Namespace) -> str:
@@ -542,9 +629,12 @@ def handle_devices_list(args: argparse.Namespace) -> int:
 
 
 def handle_doctor(args: argparse.Namespace) -> int:
+    config = load_config()
+    for key, value in runtime_provenance(config).items():
+        print(f"{key}: {value}")
     try:
         client = client_from_args(args)
-        device = selected_device(args, client)
+        device = selected_device(args, client, config=config)
     except (OpenClawIPhoneError, ValueError) as exc:
         print("result: device-selection-failed")
         print(f"blocker: {exc}")
@@ -571,7 +661,7 @@ def handle_doctor(args: argparse.Namespace) -> int:
         return 1
     print(f"wda-url: {url}")
 
-    wda = WDAClient(url=url, timeout=args.timeout)
+    wda = WDAClient(url=url, timeout=args.timeout, read_timeout=getattr(args, "read_timeout", DEFAULT_SCREEN_READ_TIMEOUT))
     try:
         status = wda.status()
     except WDAUnavailable as exc:
@@ -592,8 +682,76 @@ def handle_doctor(args: argparse.Namespace) -> int:
     print(f"wda-locked: {bool_value(locked)}")
 
     healthy = passcode_required is False and status.ready is True and locked is False
+    if healthy and getattr(args, "check_ui", False):
+        try:
+            wda.source()
+        except WDAUnavailable:
+            print("screen-read: unavailable")
+            print("result: screen-read-failed")
+            return 1
+        print("screen-read: ok")
     print(f"result: {'ok' if healthy else 'attention-required'}")
     return 0 if healthy else 1
+
+
+def runtime_provenance(config: IPhoneConfig, *, source_file: Path | None = None,
+                       launchd_plist: Path | None = None) -> dict[str, str]:
+    """Report source/config/runner paths without claiming process provenance.
+
+    A doctor invocation may use an editable checkout while launchd runs an
+    installed copy (or vice versa).  This intentionally reports configured
+    paths and plist metadata only; it never reads a running process command
+    line or prints plist contents that could contain unrelated settings.
+    """
+    source = (source_file or Path(__file__)).resolve()
+    configured_repo = config.get("OPENCLAW_IPHONE_REPO_DIR")
+    repo_path = Path(configured_repo).expanduser().resolve() if configured_repo else None
+    configured_wda = config.get("OPENCLAW_IPHONE_WDA_PATH")
+    wda_path = Path(configured_wda).expanduser().resolve() if configured_wda else None
+    plist_path = launchd_plist or (Path.home() / "Library/LaunchAgents/com.openclaw.iphone-wda-run.plist")
+
+    def relation(path: Path | None, root: Path | None) -> str:
+        if path is None:
+            return "not-configured"
+        if root is None:
+            return "configured"
+        try:
+            path.relative_to(root)
+        except ValueError:
+            return "different"
+        return "match"
+
+    result = {
+        "runtime-version": __version__,
+        "runtime-python": sys.executable,
+        "runtime-source": str(source),
+        "configured-repo": str(repo_path) if repo_path else "absent",
+        "source-repo": relation(source, repo_path) if repo_path else "not-configured",
+        "configured-wda-path": str(wda_path) if wda_path else "absent",
+        "wda-path": "absent" if wda_path is None else "present" if wda_path.exists() else "missing",
+        "launchd-plist": "absent",
+        "launchd-wrapper": "absent",
+        "launchd-working-directory": "absent",
+    }
+    if not plist_path.is_file():
+        return result
+    result["launchd-plist"] = str(plist_path.resolve())
+    try:
+        with plist_path.open("rb") as stream:
+            plist = plistlib.load(stream)
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        result["launchd-plist"] = f"{plist_path.resolve()} (unreadable)"
+        return result
+    arguments = plist.get("ProgramArguments") if isinstance(plist, dict) else None
+    if isinstance(arguments, list):
+        wrappers = [item for item in arguments if isinstance(item, str) and item.endswith(".sh")]
+        if wrappers:
+            wrapper = Path(wrappers[0]).expanduser().resolve()
+            result["launchd-wrapper"] = f"{wrapper} ({relation(wrapper, repo_path)})"
+    working_directory = plist.get("WorkingDirectory") if isinstance(plist, dict) else None
+    if isinstance(working_directory, str) and working_directory:
+        result["launchd-working-directory"] = f"{Path(working_directory).expanduser().resolve()} ({relation(Path(working_directory).expanduser().resolve(), repo_path)})"
+    return result
 
 
 def handle_apps_list(args: argparse.Namespace) -> int:

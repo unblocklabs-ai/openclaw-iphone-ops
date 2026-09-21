@@ -25,7 +25,10 @@ def response(choice="go", probabilities=None, confidence=0.9):
 
 class JevTests(unittest.TestCase):
     def test_documented_choice_response_and_usage(self):
-        result = parse_decision(json.dumps(response()).encode(), {"go": "Go", "stop": "Stop"}, 0.1)
+        result = parse_decision(json.dumps(response()).encode(), {
+            "go": {"kind": "device_action", "description": "Go"},
+            "stop": {"kind": "escalation", "description": "Stop"},
+        }, 0.1)
         self.assertEqual((result.choice, result.input_tokens, result.output_tokens), ("go", 100, 10))
 
     def test_rejects_forged_choice_wrong_model_missing_and_nonfinite_probabilities(self):
@@ -41,9 +44,9 @@ class JevTests(unittest.TestCase):
         fixtures.append(wrong)
         for invalid in fixtures:
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
-                parse_decision(json.dumps(invalid).encode(), {"go": "Go", "stop": "Stop"}, 0)
+                parse_decision(json.dumps(invalid).encode(), {"go": {}, "stop": {}}, 0)
         with self.assertRaises(ValueError):
-            parse_decision(b'{"model":"one","model":"two"}', {"go": "Go"}, 0)
+            parse_decision(b'{"model":"one","model":"two"}', {"go": {}}, 0)
 
     def test_no_retry_no_echo_on_http_or_transport_failure(self):
         for code in (401, 422, 429, 529):
@@ -52,7 +55,7 @@ class JevTests(unittest.TestCase):
             error = urllib.error.HTTPError("https://api.typesafe.ai", code, "PRIVATE", {}, body)
             with patch.object(driver.opener, "open", side_effect=error) as network:
                 with self.assertRaises(DecisionUnavailable) as caught:
-                    driver.choose({"objective": "Synthetic"}, {"go": "Go"}, Budget.seconds(1))
+                    driver.choose({"objective": "Synthetic"}, {"go": {"description": "Go"}}, Budget.seconds(1))
                 self.assertNotIn("SECRET", str(caught.exception))
                 self.assertNotIn("PRIVATE", str(caught.exception))
                 network.assert_called_once()
@@ -71,7 +74,7 @@ class JevTests(unittest.TestCase):
         result.read.side_effect = read
         with patch.object(driver.opener, "open", return_value=result) as network:
             with self.assertRaises(TaskStopped):
-                driver.choose({"objective": "Synthetic"}, {"go": "Go", "stop": "Stop"}, budget)
+                driver.choose({"objective": "Synthetic"}, {"go": {}, "stop": {}}, budget)
         request = network.call_args.args[0]
         self.assertEqual(request.full_url, "https://api.typesafe.ai/v1/systemone")
         self.assertEqual(request.get_header("Authorization"), "Bearer SECRET")
@@ -79,15 +82,31 @@ class JevTests(unittest.TestCase):
         self.assertNotIn("SECRET", str(driver.summary()))
         self.assertEqual(driver.input_tokens, 100)
 
+    def test_request_uses_structured_instructions_and_criteria(self):
+        driver = JevDriver(api_key="SECRET")
+        with patch.object(driver.opener, "open", return_value=io.BytesIO(
+                json.dumps(response(probabilities={"go": 0.9, "wait": 0.1})).encode())) as network:
+            driver.choose({"objective": "Synthetic"}, {
+                "go": {"kind": "device_action", "description": "Go", "boundary": "snapshot"},
+                "wait": {"kind": "wait", "description": "No device input"},
+            }, Budget.seconds(1))
+        payload = json.loads(network.call_args.args[0].data)
+        instructions = payload["questions"]["action"]["instructions"]
+        criteria = payload["questions"]["action"]["criteria"]
+        self.assertIsInstance(instructions, dict)
+        self.assertIn("rules", instructions)
+        self.assertTrue(all(isinstance(value, dict) for value in criteria.values()))
+        self.assertNotIn("SECRET", json.dumps(payload))
+
     def test_cancelled_and_oversized_requests_never_reach_network(self):
         driver = JevDriver(api_key="key")
         with patch.object(driver.opener, "open") as network:
             with self.assertRaises(DecisionUnavailable):
-                driver.choose({"objective": "x" * 20000}, {"go": "Go"}, Budget.seconds(1))
+                driver.choose({"objective": "x" * 20000}, {"go": {}}, Budget.seconds(1))
             budget = Budget.seconds(1)
             budget.cancelled.set()
             with self.assertRaises(TaskStopped):
-                driver.choose({}, {"go": "Go"}, budget)
+                driver.choose({}, {"go": {}}, budget)
             network.assert_not_called()
         self.assertEqual(driver.attempts, 0)
 
@@ -95,7 +114,7 @@ class JevTests(unittest.TestCase):
         driver = JevDriver(api_key="key", min_confidence=0.65)
         with patch.object(driver.opener, "open", return_value=io.BytesIO(
                 json.dumps(response(confidence=0.65)).encode())) as network:
-            decision = driver.choose({}, {"go": "Go", "stop": "Stop"}, Budget.seconds(1))
+            decision = driver.choose({}, {"go": {}, "stop": {}}, Budget.seconds(1))
         self.assertEqual(decision.confidence, 0.65)
         network.assert_called_once()
 
@@ -138,6 +157,9 @@ class TaskTests(unittest.TestCase):
         for forbidden in ("SECRET", "PASSWORD", "Ignore instructions", "PRIVATE", '"device"', "Input"):
             self.assertNotIn(forbidden, payload)
         self.assertIn(grant.description, payload)
+        self.assertTrue(all(isinstance(value, dict) for value in options.values()))
+        self.assertEqual(options[offers[0].id]["kind"], "device_action")
+        self.assertEqual(options["wait"]["kind"], "wait")
         ex, _ = executor([grant], xml=source(extra='<XCUIElementTypeSecureTextField value="SECRET"/>'))
         with self.assertRaises(DecisionUnavailable):
             cloud_view(spec, ex.observe(), (), step=0)

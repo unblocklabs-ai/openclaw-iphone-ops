@@ -119,7 +119,7 @@ def load_task(path: Path) -> TaskSpec:
 
 
 def cloud_view(spec: TaskSpec, observation: Observation, offers: tuple[Offer, ...],
-               *, step: int) -> tuple[dict[str, object], dict[str, str]]:
+               *, step: int) -> tuple[dict[str, object], dict[str, object]]:
     """Positive projection. Never include raw labels, values, selectors or UDID.
 
     Only caller-authored objective/descriptions, known app identity, roles and
@@ -129,10 +129,29 @@ def cloud_view(spec: TaskSpec, observation: Observation, offers: tuple[Offer, ..
     apps |= {c.app for g in spec.grants for c in g.after}
     if observation.secure is not False or observation.elements is None or observation.app not in apps:
         raise DecisionUnavailable("Screen is unobserved, secure or outside approved app scope.")
-    options = {offer.id: spec.grants[offer.grant_index].description for offer in offers}
-    options.update({"wait": "Wait briefly for expected state, without device input.",
-                    "done": "Request independent completion verification.",
-                    "escalate": "Stop and return control to the planner."})
+    options: dict[str, object] = {
+        offer.id: {
+            "kind": "device_action",
+            "operation": spec.grants[offer.grant_index].operation,
+            "description": spec.grants[offer.grant_index].description,
+            "boundary": "Only this caller-approved action from this exact snapshot.",
+        }
+        for offer in offers
+    }
+    options.update({
+        "wait": {
+            "kind": "wait",
+            "description": "Wait briefly for an expected state change; send no device input.",
+        },
+        "done": {
+            "kind": "verification",
+            "description": "Request an independent completion check; do not claim success.",
+        },
+        "escalate": {
+            "kind": "escalation",
+            "description": "Stop and return control to the planner without device input.",
+        },
+    })
     view = {"objective": spec.objective,
             "snapshot": {"id": observation.id, "captured_at": observation.captured_at, "app": observation.app},
             "available_actions": [{"id": offer.id, "operation": spec.grants[offer.grant_index].operation,

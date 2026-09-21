@@ -7,6 +7,7 @@ from typing import Any
 
 from .errors import AppNotFound, DeviceLocked, DeviceSelectionError
 from .evidence import artifact_path
+from .execution import Budget
 from .runner import Runner
 from .xcode import resolve_developer_dir
 
@@ -98,12 +99,18 @@ class DeviceCtl:
             if device.state.lower() == "connected" and device.identifier
             and device.model.casefold().startswith("iphone")
         ]
-        pool = connected
-
         if requested:
+            # Resolve identity before filtering connection state. Never wake a
+            # name match or substitute another phone for a dormant pinned one.
+            exact = [d for d in devices if d.identifier and d.model.casefold().startswith("iphone")
+                     and requested.casefold() in {d.identifier.casefold(), d.udid.casefold()}]
+            if len(exact) > 1:
+                raise DeviceSelectionError("Device identity matched multiple records.")
+            if exact:
+                return exact[0] if exact[0] in connected else self._wake_pinned(exact[0])
             matches = [
                 device
-                for device in pool
+                for device in connected
                 if requested in {device.identifier, device.name, device.udid}
                 or requested.lower() in {device.identifier.lower(), device.name.lower(), device.udid.lower()}
             ]
@@ -113,15 +120,41 @@ class DeviceCtl:
                 raise DeviceSelectionError(f"Device selector {requested!r} matched multiple devices.")
             return matches[0]
 
-        if len(pool) == 1:
-            return pool[0]
-        if not pool:
+        if len(connected) == 1:
+            return connected[0]
+        if not connected:
             raise DeviceSelectionError("No connected iPhone was found.")
-        names = ", ".join(f"{device.name} ({device.identifier})" for device in pool)
+        names = ", ".join(f"{device.name} ({device.identifier})" for device in connected)
         raise DeviceSelectionError(
             "Multiple devices found; set OPENCLAW_IPHONE_DEVICE in config.env "
             f"or pass --device where supported. Candidates: {names}"
         )
+
+    def _wake_pinned(self, original: Device) -> Device:
+        """One read-only details probe and recheck, bounded by 10s/task budget."""
+        if not original.udid:
+            raise DeviceSelectionError("Disconnected device has no physical UDID; reconnect it manually.")
+        previous = self.runner.budget
+        budget = Budget.seconds(min(10, self.runner.timeout))
+        if previous is not None:
+            budget.deadline = min(budget.deadline, previous.deadline)
+            budget.cancelled = previous.cancelled
+        self.runner.budget = budget
+        try:
+            details, _ = self.device_details(original.identifier)
+            udid = value_at(details, "result.hardwareProperties.udid")
+            if not isinstance(udid, str) or udid.casefold() != original.udid.casefold():
+                raise DeviceSelectionError("Device identity unavailable or changed during reconnect.")
+            devices, _ = self.list_devices()
+            matches = [d for d in devices if d.identifier == original.identifier
+                       and d.udid.casefold() == original.udid.casefold()
+                       and d.model.casefold().startswith("iphone") and d.state.lower() == "connected"]
+            if len(matches) != 1:
+                raise DeviceSelectionError("Pinned iPhone is still disconnected; no alternative device selected.")
+            self.require_unlocked(matches[0].identifier)
+            return matches[0]
+        finally:
+            self.runner.budget = previous
 
     def lock_state(self, device_id: str) -> tuple[dict[str, Any], Path]:
         output = artifact_path("lock-state", base=self.evidence_base)

@@ -48,5 +48,9 @@ class WDAOutcomeUnknown(WDAUnavailable):
     """A mutating request may have executed. Observe state before any retry."""
 
 
+class SessionOutputUnavailable(OpenClawIPhoneError):
+    """The planner stopped consuming output; ownership must be released."""
+
+
 class WDASetupError(OpenClawIPhoneError):
     """Raised when WebDriverAgent cannot be built, run, or tunneled."""
