@@ -11,12 +11,10 @@ from openclaw_iphone.instagram_ops import (
     benchmark_ranking_quality,
     discover_creators,
     parse_follower_count,
-    query_field_candidates,
     query_to_hashtags,
     triage_shortlist,
     verify_handles,
 )
-from openclaw_iphone.ui import parse_elements
 
 
 PNG_BYTES = b"\x89PNG\r\n\x1a\nfake-png"
@@ -137,17 +135,6 @@ class InstagramOpsTests(unittest.TestCase):
             self.assertEqual(item["status"], "captured_deep_link")
             self.assertEqual(item["profile"]["followers"], "9,812 followers")
             self.assertIn("deep_link_manifest", item["artifacts"])
-
-    def test_query_field_candidates_ignore_keyboard_search_key(self) -> None:
-        source = """<XCUIElementTypeApplication bundleId="com.burbn.instagram" name="Instagram" label="Instagram">
-          <XCUIElementTypeKey name="Search" label="search" visible="true" x="321" y="806" width="107" height="56" />
-          <XCUIElementTypeTextView name="search-bar-text-view" visible="true" x="32" y="556" width="337" height="33" />
-        </XCUIElementTypeApplication>"""
-
-        candidates = query_field_candidates(parse_elements(source))
-
-        self.assertEqual(candidates[0].type, "XCUIElementTypeTextView")
-        self.assertEqual(candidates[0].name, "search-bar-text-view")
 
     def test_verify_handles_does_not_treat_reel_as_profile_verification(self) -> None:
         source = """<XCUIElementTypeApplication bundleId="com.burbn.instagram" name="Instagram" label="Instagram">

@@ -14,7 +14,7 @@ from .instagram_context import capture_instagram_context, visible_elements
 from .evidence import evidence_dir, validate_prefix, write_private
 from .errors import CommandFailed
 from .runner import Runner
-from .ui import UIController, UIElement
+from .ui import UIController
 from .wda import WDAClient
 
 
@@ -1834,42 +1834,3 @@ def record_profile_verification(result: dict[str, Any], payload: dict[str, Any],
     else:
         result["status"] = "identity_mismatch" if observed else "identity_uncertain"
         result["warning"] = "Requested profile identity was not confirmed. No search-field typing or result taps attempted."
-
-
-def focus_query_field(controller: UIController) -> UIElement:
-    candidates = query_field_candidates(controller.elements())
-    if not candidates:
-        raise RuntimeError("No usable Instagram search/follow-up field was visible.")
-    element = candidates[0]
-    center = element.center
-    if center is None:
-        raise RuntimeError(f"Matched query field has no tappable frame: {element.text}")
-    controller.tap(center[0], center[1])
-    return element
-
-
-def query_field_candidates(elements: list[UIElement]) -> list[UIElement]:
-    def y(element: UIElement) -> int:
-        return element.rect.get("y") or 0
-
-    priorities: list[tuple[int, UIElement]] = []
-    for element in elements:
-        name = (element.name or "").casefold()
-        label = (element.label or "").casefold()
-        value = (element.value or "").casefold()
-        text = element.text.casefold()
-        if element.type == "XCUIElementTypeKey":
-            continue
-        if element.center is None:
-            continue
-        if "search-bar-text-view" in name and element.type in {"XCUIElementTypeTextView", "XCUIElementTypeOther"}:
-            priorities.append((0, element))
-        elif value == "ask a follow up..." or label == "ask a follow up...":
-            priorities.append((1, element))
-        elif "search-bar" in name:
-            priorities.append((2, element))
-        elif "search" in {name, label} and y(element) < 780:
-            priorities.append((3, element))
-        elif "search" in text and y(element) < 780:
-            priorities.append((4, element))
-    return [element for _, element in sorted(priorities, key=lambda item: (item[0], y(item[1])))]

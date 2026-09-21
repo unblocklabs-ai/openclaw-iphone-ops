@@ -289,41 +289,58 @@ class DeviceAndSetupTests(unittest.TestCase):
 class ProtocolAndSnippetTests(unittest.TestCase):
     def test_real_http_cleanup_failure_preserves_action_and_no_proxy(self):
         requests = []
+        release_cleanup = threading.Event()
 
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *args):
                 pass
 
-            def respond(self, status, payload):
+            def respond(self, status, payload, *, incomplete=False):
                 requests.append((self.command, self.path))
                 self.rfile.read(int(self.headers.get("Content-Length", "0")))
                 body = json.dumps(payload).encode()
                 self.send_response(status)
-                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Content-Length", str(len(body) + (100 if incomplete else 0)))
                 self.end_headers()
                 self.wfile.write(body)
+                self.wfile.flush()
 
             def do_GET(self):
                 self.respond(200, {"value": False})
 
             def do_POST(self):
-                self.respond(200, {"sessionId": "one", "value": None})
+                if action_fails and self.path.endswith("/actions"):
+                    self.respond(500, {"value": {"error": "unknown error"}})
+                else:
+                    self.respond(200, {"sessionId": "one", "value": None})
 
             def do_DELETE(self):
-                self.respond(500, {"value": {"error": "unknown error"}})
+                self.respond(500, {"value": {"error": "unknown error"}}, incomplete=cleanup_body != "complete")
+                if cleanup_body == "stalled":
+                    release_cleanup.wait(timeout=5)
 
-        with HTTPServer(("127.0.0.1", 0), Handler) as server:
-            thread = threading.Thread(target=server.serve_forever)
-            thread.start()
-            try:
-                with patch.dict(os.environ, {"http_proxy": "http://127.0.0.1:1", "no_proxy": ""}):
-                    client = WDAClient(url=f"http://127.0.0.1:{server.server_port}")
-                    with self.assertLogs("openclaw_iphone.wda", level="WARNING"):
-                        self.assertEqual(client.tap(1, 2)["value"], None)
-            finally:
-                server.shutdown()
-                thread.join()
-        self.assertEqual(requests, [("GET", "/wda/locked"), ("POST", "/session"), ("POST", "/session/one/actions"), ("DELETE", "/session/one")])
+        for cleanup_body in ("complete", "truncated", "stalled"):
+            for action_fails in (False, True):
+                with self.subTest(cleanup_body=cleanup_body, action_fails=action_fails):
+                    requests.clear()
+                    release_cleanup.clear()
+                    with HTTPServer(("127.0.0.1", 0), Handler) as server:
+                        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
+                        thread.start()
+                        try:
+                            with patch.dict(os.environ, {"http_proxy": "http://127.0.0.1:1", "no_proxy": ""}):
+                                client = WDAClient(url=f"http://127.0.0.1:{server.server_port}", timeout=1)
+                                with self.assertLogs("openclaw_iphone.wda", level="WARNING"):
+                                    if action_fails:
+                                        with self.assertRaisesRegex(WDAOutcomeUnknown, "/session/one/actions"):
+                                            client.tap(1, 2)
+                                    else:
+                                        self.assertEqual(client.tap(1, 2)["value"], None)
+                        finally:
+                            release_cleanup.set()
+                            server.shutdown()
+                            thread.join()
+                    self.assertEqual(requests, [("GET", "/wda/locked"), ("POST", "/session"), ("POST", "/session/one/actions"), ("DELETE", "/session/one")])
 
     def test_app_store_requires_authorization_before_device_access(self):
         path = Path(__file__).resolve().parents[1] / "snippets/wda-app-store-install-example.py"

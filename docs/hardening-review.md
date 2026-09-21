@@ -94,17 +94,31 @@ deletions, reboots, signing changes, or service installations were performed.
   Documentation corrects Back behavior, context command syntax, private evidence,
   service recovery limits, and historical benchmark claims.
 
+## PR review follow-up
+
+- HTTP error-body reads now share the transport-error guard. Truncated/stalled
+  cleanup responses cannot replace a successful action or its original failure.
+- `clear_field` selects one visible, non-disabled editable target from one source
+  snapshot and taps that same target. Same-label buttons cannot replace it;
+  missing, disabled, frameless, and ambiguous editable targets fail before taps.
+- Removed the unused Instagram query-field fallback helpers and their obsolete
+  helper test. The workflow regression forbidding speculative typing remains.
+
 ## Validation
 
 - Baseline: `PYTHONPATH=src python3 -m unittest discover -s tests -q` — **98 passed**.
-- Hardened: same full suite on Python **3.12 and 3.14 — 125 passed each**.
+- Hardened, including PR review fixes: same full suite on Python
+  **3.12 and 3.14 — 126 passed each**. Python 3.14 also passes with
+  `ResourceWarning` treated as an error.
 - Regressions exercise cleanup vs action failure, no retry after ambiguous Back,
   unsafe Back/Clear controls, private paths/permissions, identity mismatch and
   unknown identity, device pinning, non-iPhones/disconnected devices, screen-lock
   failures, deadline clipping, concurrency, launchd config/log permissions, and
   App Store authorization/ambiguous selectors.
 - Loopback HTTP test uses the real urllib transport with a fake WDA server:
-  successful action plus HTTP-500 cleanup stays successful, with no proxy use.
+  complete, truncated, and stalled HTTP-500 cleanup preserves successful actions
+  and primary action errors, with no proxy use. Clear-field regressions cover
+  disabled fields sharing a button label and single-snapshot target selection.
 - `python3 -m compileall -q src snippets/wda-app-store-install-example.py`,
   `sh -n` for every shell script, and `git diff --check` pass.
 - `uv build` produces sdist and wheel; isolated wheel installation and

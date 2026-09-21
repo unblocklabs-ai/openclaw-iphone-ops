@@ -296,17 +296,22 @@ class WDAClient:
             headers["Content-Type"] = "application/json"
         req = urllib.request.Request(f"{self.url}{path}", data=data, headers=headers, method=method)
         try:
-            with self.opener.open(req, timeout=timeout) as resp:
-                return resp.read()
-        except urllib.error.HTTPError as exc:
             try:
-                parsed = parse_json_bytes(exc.read())
-            finally:
-                exc.close()
-            if isinstance(parsed, dict):
-                check_response(parsed, path, mutating=method != "GET")
-            error = WDAOutcomeUnknown if method != "GET" else WDAUnavailable
-            raise error(f"WDA {method} {path} failed with HTTP {exc.code}. Inspect state before retrying.") from exc
+                resp = self.opener.open(req, timeout=timeout)
+            except urllib.error.HTTPError as exc:
+                # Error bodies can also time out or end early. Keep their reads
+                # inside the transport guard so cleanup cannot mask the action.
+                try:
+                    body = exc.read()
+                finally:
+                    exc.close()
+                parsed = parse_json_bytes(body)
+                if isinstance(parsed, dict):
+                    check_response(parsed, path, mutating=method != "GET")
+                error = WDAOutcomeUnknown if method != "GET" else WDAUnavailable
+                raise error(f"WDA {method} {path} failed with HTTP {exc.code}. Inspect state before retrying.") from exc
+            with resp as response:
+                return response.read()
         except (urllib.error.URLError, TimeoutError, socket.timeout, ConnectionError, http.client.HTTPException) as exc:
             error = WDAOutcomeUnknown if method != "GET" else WDAUnavailable
             raise error(f"WDA {method} {path} transport failed. Outcome unknown; inspect state before retrying.") from exc

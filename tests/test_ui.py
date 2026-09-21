@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import Mock, patch
 
 from openclaw_iphone.errors import WDAUnavailable, WDAUnsupportedCommand
 from openclaw_iphone.ui import UIController, parse_elements
@@ -120,6 +121,35 @@ class UITests(unittest.TestCase):
         element = UIController(client).clear_field("Search field", exact=True)  # type: ignore[arg-type]
 
         self.assertEqual(element.name, "Search field")
+        self.assertEqual(client.calls, [("tap", (60.0, 40.0), {}), ("clear_text", (), {})])
+
+    def test_clear_field_refuses_invalid_or_ambiguous_editable_targets(self) -> None:
+        field = '<XCUIElementTypeTextField name="Search" visible="true" enabled="true" x="10" y="20" width="100" height="40" />'
+        button = '<XCUIElementTypeButton name="Search" visible="true" enabled="true" x="200" y="400" width="100" height="40" />'
+        for controls in (
+            button,
+            field.replace('enabled="true"', 'enabled="false"') + button,
+            field.replace('visible="true"', 'visible="false"') + button,
+            field.replace('width="100"', 'width="0"'),
+            field + field.replace('x="10"', 'x="200"'),
+        ):
+            with self.subTest(controls=controls):
+                client = FakeClient(f"<App>{controls}</App>")
+                with self.assertRaises(WDAUnavailable):
+                    UIController(client).clear_field("Search", exact=True)
+                self.assertEqual(client.calls, [])
+
+    def test_clear_field_taps_the_validated_target_without_requerying(self) -> None:
+        field = '<XCUIElementTypeTextView name="Search" visible="true" enabled="true" x="10" y="20" width="100" height="40" />'
+        button = '<XCUIElementTypeButton name="Search" visible="true" enabled="true" x="200" y="400" width="100" height="40" />'
+        client = FakeClient()
+        client.source = Mock(side_effect=[f"<App>{field}{button}</App>", f"<App>{button}</App>"])
+
+        with patch("openclaw_iphone.ui.time.sleep"):
+            element = UIController(client).clear_field("Search", exact=True)
+
+        self.assertEqual(element.type, "XCUIElementTypeTextView")
+        client.source.assert_called_once()
         self.assertEqual(client.calls, [("tap", (60.0, 40.0), {}), ("clear_text", (), {})])
 
     def test_press_button_delegates_to_client(self) -> None:

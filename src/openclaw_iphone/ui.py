@@ -72,10 +72,17 @@ class UIController:
     def clear_field(self, query: str | None = None, *, exact: bool = False) -> UIElement | None:
         element = None
         if query:
-            target = self.find_text(query, exact=exact)
-            if target is None or target.type not in {"XCUIElementTypeTextField", "XCUIElementTypeSecureTextField", "XCUIElementTypeTextView", "XCUIElementTypeSearchField"}:
-                raise WDAUnavailable("Clear target must identify an editable field.")
-            element = self.tap_text(query, exact=exact)
+            matches = [
+                candidate for candidate in self.elements()
+                if candidate.type in {"XCUIElementTypeTextField", "XCUIElementTypeSecureTextField", "XCUIElementTypeTextView", "XCUIElementTypeSearchField"}
+                and candidate.visible is True and candidate.enabled is not False
+                and find_element([candidate], query, exact=exact) is not None
+            ]
+            if len(matches) != 1 or matches[0].center is None:
+                raise WDAUnavailable("Clear target must identify one visible, non-disabled editable field with a tappable frame.")
+            element = matches[0]
+            x, y = element.center
+            self.tap(x, y)
             time.sleep(0.2)
         self.client.clear_text()
         return element
