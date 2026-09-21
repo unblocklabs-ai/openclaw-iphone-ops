@@ -10,6 +10,7 @@ import http.client
 import logging
 import math
 import os
+import re
 from pathlib import Path
 import socket
 import time
@@ -20,6 +21,7 @@ import urllib.parse
 import urllib.request
 
 from .errors import DeviceLocked, WDAOutcomeUnknown, WDASetupError, WDAUnavailable, WDAUnsupportedCommand
+from .execution import Budget, Metrics, TaskStopped
 from .xcode import resolve_developer_dir
 
 
@@ -39,6 +41,12 @@ class WDAStatus:
         return True
 
 
+@dataclass
+class SessionState:
+    identifier: str | None = None
+    cleanup_failed: bool = False
+
+
 class WDAClient:
     def __init__(self, *, url: str | None = None, timeout: int = 30) -> None:
         if url is None and not os.environ.get("OPENCLAW_IPHONE_WDA_URL"):
@@ -52,6 +60,9 @@ class WDAClient:
             raise ValueError("WDA timeout must be finite and positive.")
         self.timeout = timeout
         self.deadline: float | None = None
+        self.budget: Budget | None = None
+        self.metrics = Metrics()
+        self._session = SessionState()
         # Device control must not traverse a host HTTP proxy or follow redirects.
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
 
@@ -138,18 +149,57 @@ class WDAClient:
         )
 
     def type_text(self, text: str, *, frequency: int | None = None) -> dict[str, Any]:
+        if not text:
+            return {"value": None}
+        # Preserve the existing key semantics, but own one session for the string.
+        self.require_unlocked()
+        with self.session():
+            return self._type_keys(text, frequency=frequency)
+
+    def _type_keys(self, text: str, *, frequency: int | None = None) -> dict[str, Any]:
         response: dict[str, Any] = {"value": None}
         for index, char in enumerate(text):
             try:
                 response = self._perform_key_press(char)
-            except (WDAUnavailable, DeviceLocked) as exc:
+            except (WDAUnavailable, DeviceLocked, TaskStopped) as exc:
                 raise WDAOutcomeUnknown(
                     f"Typing stopped after {index} confirmed characters; the next character may have been entered. "
                     "Inspect the field before retrying; do not replay the full text."
                 ) from exc
             if frequency is not None and frequency > 0:
-                time.sleep(1 / frequency)
+                if self.budget:
+                    self.budget.sleep(1 / frequency)
+                else:
+                    time.sleep(1 / frequency)
         return response
+
+    def type_text_bulk(self, text: str, *, frequency: int | None = None) -> dict[str, Any]:
+        """Append to the focused field. No automatic fallback or replay on failure.
+
+        The caller must verify focus and read back the value. A failed request
+        may have entered any prefix, including the entire string.
+        """
+        if not text:
+            return {"value": None}
+        if frequency is not None and (type(frequency) is not int or frequency <= 0):
+            raise ValueError("Typing frequency must be a positive integer.")
+        self.require_unlocked()
+        with self.session() as session_id:
+            payload: dict[str, Any] = {"value": [text]}
+            if frequency is not None:
+                payload["frequency"] = frequency
+            return self._json_post(f"/session/{session_id}/wda/keys", payload)
+
+    def active_app(self) -> dict[str, Any]:
+        value = self._json_request("/wda/activeAppInfo").get("value")
+        if not isinstance(value, dict) or not isinstance(value.get("bundleId"), str):
+            raise WDAUnavailable("Foreground app identity is unavailable.")
+        return value
+
+    def activate_app(self, bundle_id: str) -> dict[str, Any]:
+        self.require_unlocked()
+        with self.session() as session_id:
+            return self._json_post(f"/session/{session_id}/wda/apps/activate", {"bundleId": bundle_id})
 
     def clear_text(self) -> dict[str, Any]:
         self.require_unlocked()
@@ -182,13 +232,20 @@ class WDAClient:
 
     @contextmanager
     def session(self) -> Iterator[str]:
+        if self._session.identifier is not None:
+            yield self._session.identifier
+            return
         session_id = self._create_session()
+        self._session.identifier = session_id
+        self._session.cleanup_failed = False
         try:
             yield session_id
         finally:
+            self._session.identifier = None
             try:
                 self._delete_session(session_id)
-            except WDAUnavailable:
+            except (WDAUnavailable, TaskStopped):
+                self._session.cleanup_failed = True
                 logging.getLogger(__name__).warning(
                     "WDA session cleanup failed; action outcome is unchanged. "
                     "Do not replay completed actions. Check WDA before the next workflow."
@@ -283,12 +340,23 @@ class WDAClient:
         check_response(parsed, "session cleanup")
 
     def _request(self, path: str, *, method: str = "GET", payload: dict[str, Any] | None = None) -> bytes:
+        timeout = self._request_timeout()
+        route = re.sub(r"/(session|element)/[^/]+", r"/\1/:id", path.split("?", 1)[0])
+        with self.metrics.measure(f"wda {method} {route}"):
+            return self._send(path, method=method, payload=payload, timeout=timeout)
+
+    def _request_timeout(self) -> float:
         timeout = self.timeout
+        if self.budget is not None:
+            timeout = min(timeout, self.budget.remaining())
         if self.deadline is not None:
             remaining = self.deadline - time.monotonic()
             if remaining <= 0:
                 raise WDAUnavailable("Workflow deadline expired before sending a WDA request.")
             timeout = min(timeout, remaining)
+        return timeout
+
+    def _send(self, path: str, *, method: str, payload: dict[str, Any] | None, timeout: float) -> bytes:
         data = None
         headers = {}
         if payload is not None:
