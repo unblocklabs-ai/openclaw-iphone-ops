@@ -13,6 +13,11 @@ REPO = Path(__file__).resolve().parents[1]
 
 
 class LaunchdInstallerTests(unittest.TestCase):
+    def test_wda_wrapper_allows_supported_python_override(self) -> None:
+        wrapper = (REPO / "snippets/launchd/openclaw-iphone-wda-run.sh").read_text(encoding="utf-8")
+        self.assertIn('IPHONE_PYTHON="${OPENCLAW_IPHONE_PYTHON:-python3}"', wrapper)
+        self.assertIn('"$IPHONE_PYTHON" -m openclaw_iphone wda run', wrapper)
+
     def run_installer(self, script: str, *, home: Path, config: Path, interval: str | None = None) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         env.update(

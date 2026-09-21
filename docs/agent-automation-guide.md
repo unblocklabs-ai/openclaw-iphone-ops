@@ -1,5 +1,15 @@
 # Agent Automation Guide
 
+## Choose a control path
+
+Start with the bundled [iPhone skill](../skills/iphone-control/SKILL.md).
+Prefer known deterministic recipes; use `task run` for bounded deterministic or
+Jev execution, or [one planner session](planner-session.md) when the agent needs
+to choose steps. Do not rebuild DeviceCtl/WDA for every action. `ui observe`
+replaces ad hoc observation formatting; raw source/screenshots are explicit
+local diagnostic fallbacks. See [task-runtime.md](task-runtime.md) for verified
+replace/keypad input, predicates and the distinction from raw `ui type`.
+
 ## Design Rule
 
 Build app-specific automation on top of generic primitives. Do not put device
@@ -128,8 +138,9 @@ configured iPhone. Use `wda url` to inspect the resolved endpoint. Do not set
 `OPENCLAW_IPHONE_WDA_URL` or pass `--url` for normal OpenClaw operation, and do
 not start a separate localhost forwarding tunnel.
 
-Use UI capture after launching the target app. `wda status` should be the first
-check when WebDriverAgent is involved. If WDA is not reachable, report that
+Use UI observation after launching the target app. For diagnosis, prefer
+`doctor --check-ui`: `wda status` readiness alone cannot prove screen reads work.
+If WDA is not reachable, report that
 exact runtime boundary instead of inventing app-specific workarounds.
 
 For unattended control, the device should have Auto-Lock set to Never when

@@ -28,6 +28,7 @@ from .xcode import resolve_developer_dir
 DEFAULT_WDA_PORT = 8100
 DEFAULT_WDA_SCHEME = "WebDriverAgentRunner"
 DEFAULT_WDA_CONFIGURATION = "Debug"
+DEFAULT_SCREEN_READ_TIMEOUT = 12.0
 
 
 @dataclass(frozen=True)
@@ -48,7 +49,8 @@ class SessionState:
 
 
 class WDAClient:
-    def __init__(self, *, url: str | None = None, timeout: int = 30) -> None:
+    def __init__(self, *, url: str | None = None, timeout: int = 30,
+                 read_timeout: float = DEFAULT_SCREEN_READ_TIMEOUT) -> None:
         if url is None and not os.environ.get("OPENCLAW_IPHONE_WDA_URL"):
             raise WDASetupError(
                 "No WebDriverAgent URL was provided. Use the CLI so it can resolve the "
@@ -59,6 +61,9 @@ class WDAClient:
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("WDA timeout must be finite and positive.")
         self.timeout = timeout
+        if not math.isfinite(read_timeout) or read_timeout <= 0:
+            raise ValueError("Screen read timeout must be finite and positive.")
+        self.read_timeout = read_timeout
         self.deadline: float | None = None
         self.budget: Budget | None = None
         self.metrics = Metrics()
@@ -224,10 +229,12 @@ class WDAClient:
             path = f"/session/{session_id}/element/{urllib.parse.quote(element_id, safe='')}/attribute/hittable"
             return self._json_request(path).get("value") is True
 
-    def element_value(self, element_id: str) -> str:
+    def element_value(self, element_id: str, *, allow_null_empty: bool = True) -> str:
         """Explicit WDA value read: null means empty; a missing key is unknown.
 
         Call only for an independently validated non-secure editable element.
+        Custom keypad fields require allow_null_empty=False: null on an Other
+        element does not prove it exposes a readable input value.
         WDA may return a placeholder instead of empty; do not erase that fact.
         """
         with self.session() as session_id:
@@ -235,6 +242,8 @@ class WDAClient:
             payload = self._json_request(path)
         if "value" not in payload or payload["value"] is not None and not isinstance(payload["value"], str):
             raise WDAUnavailable("Editable value is unavailable.")
+        if payload["value"] is None and not allow_null_empty:
+            raise WDAUnavailable("Custom field must expose an explicit string value.")
         return payload["value"] or ""
 
     def element_scroll(self, element_id: str, direction: str) -> dict[str, Any]:
@@ -394,6 +403,8 @@ class WDAClient:
 
     def _request(self, path: str, *, method: str = "GET", payload: dict[str, Any] | None = None) -> bytes:
         timeout = self._request_timeout()
+        if method == "GET" and path in {"/source", "/screenshot"}:
+            timeout = min(timeout, self.read_timeout)
         route = re.sub(r"/(session|element)/(?!active(?:/|$))[^/]+", r"/\1/:id", path.split("?", 1)[0])
         with self.metrics.measure(f"wda {method} {route}"):
             return self._send(path, method=method, payload=payload, timeout=timeout)

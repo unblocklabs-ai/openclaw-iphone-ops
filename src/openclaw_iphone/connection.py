@@ -3,13 +3,14 @@ from __future__ import annotations
 
 from contextlib import ExitStack
 from pathlib import Path
+import time
 from types import TracebackType
 
 from .control_lock import control_lock
 from .devicectl import Device, DeviceCtl
 from .errors import DeviceSelectionError, WDAUnavailable
 from .execution import Budget, Metrics, TaskStopped
-from .wda import WDAClient
+from .wda import DEFAULT_SCREEN_READ_TIMEOUT, WDAClient
 
 
 class TaskConnection:
@@ -21,12 +22,14 @@ class TaskConnection:
     """
 
     def __init__(self, ctl: DeviceCtl, *, device: str | None = None,
-                 seconds: float = 60, lock_path: Path | None = None) -> None:
+                 seconds: float = 60, lock_path: Path | None = None,
+                 read_timeout: float = DEFAULT_SCREEN_READ_TIMEOUT) -> None:
         self.ctl = ctl
         self.requested = device
         self.budget = Budget.seconds(seconds)
         self.metrics = Metrics()
         self.lock_path = lock_path
+        self.read_timeout = read_timeout
         self.device: Device | None = None
         self.wda: WDAClient | None = None
         self.generation = 0
@@ -66,7 +69,7 @@ class TaskConnection:
             raise DeviceSelectionError("A task requires the same explicit physical UDID; device identity unavailable or changed.")
         self.ctl.require_unlocked(device.identifier)
         url, _ = self.ctl.coredevice_wda_url(device.identifier)
-        wda = WDAClient(url=url, timeout=self.ctl.runner.timeout)
+        wda = WDAClient(url=url, timeout=self.ctl.runner.timeout, read_timeout=self.read_timeout)
         wda.budget, wda.metrics = self.budget, self.metrics
         if not wda.is_ready():
             raise WDAUnavailable("WDA is not ready; no task action dispatched.")
@@ -97,8 +100,15 @@ class TaskConnection:
         self._connect(self.device.udid)
 
     def _close_session(self) -> None:
-        self._sessions.close()
-        if self.wda is not None:
+        if self.wda is None:
+            self._sessions.close()
+            return
+        previous = self.wda.deadline
+        self.wda.deadline = min(previous, time.monotonic() + 2) if previous is not None else time.monotonic() + 2
+        try:
+            self._sessions.close()
+        finally:
+            self.wda.deadline = previous
             self.cleanup_failed |= self.wda._session.cleanup_failed
 
     def __exit__(self, exc_type: type[BaseException] | None,

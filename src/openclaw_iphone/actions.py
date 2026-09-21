@@ -49,7 +49,7 @@ class Grant:
     max_uses: int = 1
 
     def __post_init__(self) -> None:
-        targeted = {"tap", "back", "append", "replace", "clear", "scroll"}
+        targeted = {"tap", "back", "append", "replace", "clear", "scroll", "keypad"}
         if self.operation not in targeted | {"activate", "open_url"} or not self.app:
             raise ValueError("Invalid grant operation or source app.")
         if type(self.max_uses) is not int or not 1 <= self.max_uses <= 10:
@@ -58,7 +58,7 @@ class Grant:
             raise ValueError("A short caller-approved action description is required.")
         if (self.operation in targeted) != (self.target is not None):
             raise ValueError("Target is required only for element operations.")
-        if (self.operation in {"append", "replace"}) != (self.text_id is not None):
+        if (self.operation in {"append", "replace", "keypad"}) != (self.text_id is not None):
             raise ValueError("Typing must reference exact caller-supplied text.")
         if self.operation == "scroll":
             if self.direction not in {"up", "down"} or self.target.role not in SCROLLABLE:
@@ -81,6 +81,9 @@ class Grant:
             raise ValueError("Back requires an explicit Back control, never a top-left guess.")
         if self.operation in {"append", "replace", "clear"} and (self.target.role not in EDITABLE or not (self.target.name or self.target.label)):
             raise ValueError("Typing requires a named non-secure editable target.")
+        if self.operation == "keypad" and (self.target.role not in EDITABLE | {"XCUIElementTypeOther"}
+                                           or not (self.target.name or self.target.label)):
+            raise ValueError("Keypad requires a named non-secure input target.")
 
 
 @dataclass(frozen=True)
@@ -116,9 +119,12 @@ class Executor:
                 text = self.texts.get(grant.text_id)
                 if not isinstance(text, str) or not text or len(text) > 4096 or any(ord(c) < 32 or ord(c) == 127 for c in text):
                     raise ValueError("Typing requires 1–4096 supplied characters, without submission/control keys.")
+                if grant.operation == "keypad" and (len(text) > 32 or any(c not in "0123456789" for c in text)):
+                    raise ValueError("Keypad accepts 1–32 supplied ASCII digits only.")
         self.freshness, self.verification_seconds = freshness, verification_seconds
         self.latest: Observation | None = None
         self._offers: dict[str, Offer] = {}
+        self._offer_blockers: tuple[dict[str, object], ...] = ()
         self._uses = [0] * len(grants)
         self.stopped = False
         destinations = {g.destination for g in grants if g.operation == "activate"}
@@ -131,6 +137,8 @@ class Executor:
     def observe(self, *, app_only: bool = False) -> Observation:
         """Read a full screen by default; app-only evidence cannot authorize input."""
         wda = self.connection.require_active()
+        self._offers.clear()
+        self.latest = None
         started = time.monotonic()
         stamp = datetime.now(timezone.utc).isoformat()
         try:
@@ -184,14 +192,16 @@ class Executor:
                 return "satisfied" if len(refs) == 1 and wda.active_element() == refs[0] else "unsatisfied"
             except WDAUnavailable:
                 return "unknown"
-        if element.role not in EDITABLE:
+        if element.role not in EDITABLE | {"XCUIElementTypeOther"}:
             return "unknown"
         value = element.value
-        if value is None:
+        if value is None or element.role == "XCUIElementTypeOther":
             try:
                 reference = self._reference(element)
                 self._guard_app(observation.app, observation.process_id)
-                value = self.connection.require_active().element_value(reference)
+                wda = self.connection.require_active()
+                value = (wda.element_value(reference, allow_null_empty=False)
+                         if element.role == "XCUIElementTypeOther" else wda.element_value(reference))
             except OpenClawIPhoneError:
                 return "unknown"
         return "satisfied" if value == condition.value else "unsatisfied"
@@ -231,28 +241,57 @@ class Executor:
 
     def offers(self, observation: Observation) -> tuple[Offer, ...]:
         self._offers.clear()
+        blockers: list[dict[str, object]] = []
+        self._offer_blockers = ()
         self._check_snapshot(observation)
-        if self.stopped or observation.secure is not False or observation.elements is None:
+        if self.stopped:
+            self._offer_blockers = ({"scope": "all", "reason": "executor_stopped"},)
+            return ()
+        if observation.elements is None:
+            self._offer_blockers = ({"scope": "all", "reason": "accessibility_unavailable"},)
+            return ()
+        if observation.secure is not False:
+            self._offer_blockers = ({"scope": "all", "reason": "secure_screen"},)
             return ()
         for index, grant in enumerate(self.grants):
             if self._uses[index] >= grant.max_uses:
+                blockers.append({"grant_index": index, "operation": grant.operation, "reason": "grant_exhausted"})
                 continue
-            if grant.app != observation.app or grant.before and self.verify(observation, grant.before) != "satisfied":
+            if grant.app != observation.app:
+                blockers.append({"grant_index": index, "operation": grant.operation, "reason": "foreground_app_mismatch"})
+                continue
+            if grant.before:
+                before_state = self.verify(observation, grant.before)
+                if before_state != "satisfied":
+                    blockers.append({"grant_index": index, "operation": grant.operation,
+                                     "reason": "precondition_unknown" if before_state == "unknown" else "precondition_unsatisfied"})
+                    continue
+            if grant.target and observation.unique(grant.target) is None:
+                blockers.append({"grant_index": index, "operation": grant.operation, "reason": "target_missing_or_ambiguous"})
                 continue
             target = observation.unique(grant.target) if grant.target else None
-            if grant.target and (target is None or not target.actionable):
+            if grant.target and target is not None and not target.actionable:
+                blockers.append({"grant_index": index, "operation": grant.operation, "reason": "target_not_actionable"})
                 continue
-            if grant.operation == "append" and target.value not in (None, ""):
+            if grant.operation in {"append", "keypad"} and target.value not in (None, ""):
                 # WDA inserts at the current caret/selection, not necessarily
                 # the end. Never offer an append to existing text.
+                blockers.append({"grant_index": index, "operation": grant.operation, "reason": "field_not_verified_empty"})
                 continue
             if grant.after and self.verify(observation, grant.after) == "satisfied":
+                blockers.append({"grant_index": index, "operation": grant.operation, "reason": "postcondition_already_satisfied"})
                 continue
-            if target and grant.operation in {"tap", "back", "append", "replace", "clear"} and not (target.name or target.label):
+            if target and grant.operation in {"tap", "back", "append", "replace", "clear", "keypad"} and not (target.name or target.label):
+                blockers.append({"grant_index": index, "operation": grant.operation, "reason": "target_unnamed"})
                 continue
             offer = Offer(uuid.uuid4().hex, observation.id, index, target.id if target else None)
             self._offers[offer.id] = offer
+        self._offer_blockers = tuple(blockers)
         return tuple(self._offers.values())
+
+    @property
+    def offer_blockers(self) -> tuple[dict[str, object], ...]:
+        return self._offer_blockers
 
     def _check_snapshot(self, observation: Observation) -> None:
         self.connection.require_active()
@@ -305,7 +344,48 @@ class Executor:
             operation = grant.operation
             conditions = grant.after
             self._uses[offer.grant_index] += 1
-            if operation in {"append", "replace", "clear"}:
+            if operation == "keypad":
+                # Deliberate input strategy, never an automatic retry after bulk
+                # typing. Re-read field and key identity for every digit.
+                supplied = self.texts[grant.text_id]
+                initial_target = target
+                for index, digit in enumerate(supplied):
+                    # The preceding prefix wait already returned a fresh full
+                    # snapshot; reuse it rather than taking a duplicate read.
+                    self._check_snapshot(current)
+                    target = current.unique(grant.target)
+                    if (current.secure is not False or current.app != grant.app
+                            or current.process_id != original.process_id or target is None
+                            or not target.actionable or (target.name, target.label) != (initial_target.name, initial_target.label)
+                            or target.path != initial_target.path
+                            or target.bounds != initial_target.bounds or target.ancestors != initial_target.ancestors):
+                        raise ObservationRejected("Keypad field identity changed; input stopped.")
+                    reference = self._reference(target)
+                    self._guard_app(grant.app, current.process_id)
+                    if (wda.active_element() != reference
+                            or wda.element_value(reference, allow_null_empty=False) != supplied[:index]):
+                        raise ObservationRejected("Keypad requires verified focus and exact prefix (empty before first key).")
+                    keys = [e for e in current.elements if e.role == "XCUIElementTypeKey"
+                            and (e.name == digit or e.label == digit) and e.visible is True
+                            and any(role == "XCUIElementTypeKeyboard" for role, _, _ in e.ancestors)]
+                    if len(keys) != 1 or not keys[0].actionable:
+                        raise ObservationRejected("No unique accessible keyboard key; no coordinate fallback.")
+                    key_ref = self._reference(keys[0])
+                    self._guard_app(grant.app, current.process_id)
+                    if time.monotonic() - current.started > self.freshness:
+                        raise ObservationRejected("Keypad observation expired before dispatch.")
+                    dispatching = True
+                    wda.element_action(key_ref, "click")
+                    acknowledged += 1
+                    dispatching = False
+                    state, current = self.wait((Condition("value", grant.app, grant.target, supplied[:index + 1]),))
+                    if state != "satisfied":
+                        self.stopped = True
+                        return StepResult("acknowledged", state, "keypad_prefix_not_verified", current, acknowledged)
+                if not conditions:
+                    return StepResult("acknowledged", "satisfied", "verified", current, acknowledged)
+                conditions = (Condition("value", grant.app, grant.target, supplied),) + conditions
+            elif operation in {"append", "replace", "clear"}:
                 if wda.active_element() != reference:
                     raise ObservationRejected("Intended editable field is not focused.")
                 if operation == "append" and (target.value not in (None, "") or wda.element_value(reference) != ""):
