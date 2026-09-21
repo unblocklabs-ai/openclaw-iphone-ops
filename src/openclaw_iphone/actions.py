@@ -98,12 +98,13 @@ class StepResult:
     reason: str
     observation: Observation | None = field(default=None, repr=False)
     acknowledged_substeps: int = 0
+    error_type: str | None = None
 
 
 class Executor:
     def __init__(self, connection: TaskConnection, grants: tuple[Grant, ...], *,
-                 texts: dict[str, str] | None = None, freshness: float = 10,
-                 verification_seconds: float = 5) -> None:
+                 texts: dict[str, str] | None = None, freshness: float = 30,
+                 verification_seconds: float = 15) -> None:
         if any(not math.isfinite(v) or v <= 0 for v in (freshness, verification_seconds)):
             raise ValueError("Freshness and verification bounds must be finite and positive.")
         if len(grants) > 252:
@@ -175,9 +176,17 @@ class Executor:
                 return "satisfied" if len(refs) == 1 and wda.active_element() == refs[0] else "unsatisfied"
             except WDAUnavailable:
                 return "unknown"
-        if element.role not in EDITABLE or element.value is None:
+        if element.role not in EDITABLE:
             return "unknown"
-        return "satisfied" if element.value == condition.value else "unsatisfied"
+        value = element.value
+        if value is None:
+            try:
+                reference = self._reference(element)
+                self._guard_app(observation.app, observation.process_id)
+                value = self.connection.require_active().element_value(reference)
+            except OpenClawIPhoneError:
+                return "unknown"
+        return "satisfied" if value == condition.value else "unsatisfied"
 
     def verify(self, observation: Observation, conditions: tuple[Condition, ...]) -> str:
         if not conditions:
@@ -195,7 +204,15 @@ class Executor:
         wda.deadline = min(previous, end) if previous is not None else end
         try:
             while True:
-                observation = self.observe()
+                try:
+                    observation = self.observe()
+                except ObservationRejected:
+                    # A transitioning app may change during a read. Retrying
+                    # observation is safe; never repeat the preceding input.
+                    if time.monotonic() >= end:
+                        raise
+                    self.connection.budget.sleep(min(0.2, end - time.monotonic()))
+                    continue
                 state = self.verify(observation, conditions)
                 if state == "satisfied" or time.monotonic() >= end:
                     return state, observation
@@ -277,8 +294,10 @@ class Executor:
             if operation in {"append", "replace", "clear"}:
                 if wda.active_element() != reference:
                     raise ObservationRejected("Intended editable field is not focused.")
-                if operation == "append" and target.value is None:
-                    raise ObservationRejected("Initial field value is unknown; cannot verify append.")
+                if operation == "append" and target.value is None and wda.element_value(reference) != "":
+                    raise ObservationRejected("Initial field value changed or is unknown; cannot verify append.")
+                if operation == "append" and target.value and target.value in {target.name, target.label}:
+                    raise ObservationRejected("Value may be a placeholder; cannot infer the initial text.")
                 expected = (target.value or "") + self.texts[grant.text_id] if operation == "append" else self.texts[grant.text_id] if operation == "replace" else ""
                 if operation in {"replace", "clear"}:
                     dispatching = True
@@ -332,7 +351,8 @@ class Executor:
             if isinstance(exc, WDAUnavailable):
                 self.connection.invalidate()
             return StepResult("acknowledged" if acknowledged else "not_sent", "unknown",
-                              "verification_unavailable" if acknowledged else "validation_failed", acknowledged_substeps=acknowledged)
+                              "verification_unavailable" if acknowledged else "validation_failed",
+                              acknowledged_substeps=acknowledged, error_type=type(exc).__name__)
 
 
 def scoped_items(observation: Observation, container: Element) -> tuple[object, ...]:

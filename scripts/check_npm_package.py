@@ -47,6 +47,8 @@ def check_package(output_dir: Path | None = None) -> None:
             raise ValueError("Installed CLI version differs from the release.")
         if "Reusable primitives" not in run([cli, "--help"], cwd=work, env=env):
             raise ValueError("Installed CLI help is unavailable.")
+        if "--allow-cloud" not in run([cli, "task", "run", "--help"], cwd=work, env=env):
+            raise ValueError("Packed task driver is unavailable.")
         if output_dir is not None:
             output_dir.mkdir(parents=True, exist_ok=True)
             # Never overwrite a previously tested artifact.

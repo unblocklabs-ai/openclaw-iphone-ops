@@ -103,7 +103,10 @@ control/submission characters, and uses one native targeted append request for
 up to 4,096 supplied characters. `replace` verifies clear before append. If WDA
 reports a placeholder instead of an observable empty value, replacement stops
 after clear with uncertain verification; it does not guess that the field is
-empty. Chunking and automatic unsupported-route fallback are not enabled.
+empty. Missing XML values require a separate successful value-endpoint read:
+WDA's explicit `value: null` confirms empty for an otherwise validated editable
+field; a missing response key/error does not. Placeholder-like values are not
+treated as empty. Chunking and automatic unsupported-route fallback are not enabled.
 
 Predicates are fixed data: expected app, unique element existence/absence,
 actionability, focus or exact non-secure editable value. `wait()` polls them
@@ -117,3 +120,121 @@ Routine operations use accessibility only. No screenshot or raw source is
 automatically saved on failures, including private or secure screens. Explicit
 local CLI evidence capture remains available under the existing private-file
 rules. Cleanup status is read from the connection **after** context exit.
+
+## Optional Jev task driver
+
+Jev selects from the same offers used by deterministic Python callers. It does
+not generate text, coordinates, destinations, selectors, commands or code. The
+planner/skill must supply all permissions and observable completion conditions.
+Keep known deterministic recipes/deep links as the first choice; this driver is
+for bounded routine decisions, not a universal iPhone agent or vision model.
+
+The dependency-free adapter uses TypeSafe's documented
+[`POST /v1/systemone`](https://docs.typesafe.ai/api), Bearer authentication and
+Choice questions, pinned to `jev-1.13.0`. It does not load an invented SDK, honor
+endpoint overrides, forward credentials through proxies/redirects or retry
+provider failures. A 401/429/529, invalid response or low confidence escalates;
+replan explicitly rather than rerunning an unknown device mutation. Model
+confidence is never authorization or completion proof.
+
+Make `TYPESAFE_API_KEY` available in the invoking process using your existing
+secure credential mechanism. Do not pass it as a CLI argument, add it to the
+task file or commit it. The driver expects the **value**, not the contents of an
+`env` assignment file. The runtime does not read another plugin's credentials.
+No TypeSafe key is required for any existing command or deterministic task.
+
+Create an owner-only task JSON file. Example (replace app identities and targets
+with ones actually observed and authorized; this example only activates an app):
+
+```json
+{
+  "version": 1,
+  "objective": "Open Settings from Calculator; finish when Settings is foreground.",
+  "grants": [{
+    "operation": "activate",
+    "app": "com.apple.calculator",
+    "description": "Open the installed Settings application.",
+    "destination": "com.apple.Preferences",
+    "after": [{"kind": "app", "app": "com.apple.Preferences"}]
+  }],
+  "success": [{"kind": "app", "app": "com.apple.Preferences"}],
+  "limits": {"seconds": 60, "max_steps": 6, "max_decisions": 6}
+}
+```
+
+```sh
+# No model or cloud; proceeds only when there is one eligible grant.
+openclaw-iphone task run --file /private/task.json --driver deterministic
+
+# Inspect the approved choice without UI input. Still a paid cloud request.
+openclaw-iphone task run --file /private/task.json --driver jev --allow-cloud --decision-only
+
+# Real bounded execution; requires authorized effects as well as cloud consent.
+openclaw-iphone task run --file /private/task.json --driver jev --allow-cloud
+```
+
+`--min-confidence` defaults to 0.6 (uncalibrated conservative escalation policy).
+Changing it does not relax target validation, grants or verification. Evaluate
+held-out decision cases before changing it for autonomous use. The `done`
+choice runs the independent verifier; it cannot declare success. `wait` polls
+without UI mutation; repeated no-progress terminates. Failures return stable
+status/reason codes and safe metadata, not exception bodies or model prompts.
+
+Task files reject unknown fields, duplicate JSON keys, non-finite numbers,
+unknown operations, missing text IDs and empty success conditions. Schema v1:
+
+- `version`, `objective`, `grants`, `success` are required.
+- `texts` optionally maps IDs to exact supplied strings. Text stays local even
+  when Jev is used; grant descriptions should explain intent without repeating
+  the input. Control/submission characters are rejected.
+- A `target` has exact `role`, optional exact `name`/`label` and optional
+  `ancestor_label`. Matching is not substring-based. Roles use full
+  `XCUIElementType…` names. No XPath/predicate/code from the task is executed.
+- Grants accept `before`/`after` condition lists and `max_uses` (default 1, max
+  10). Typing uses `text_id`; scroll uses `direction` (`up`/`down`); app
+  transitions use `destination`. Incompatible parameters are rejected.
+- Conditions have `kind` and `app`; element conditions add `target`; `value`
+  conditions also require an exact string `value`. See supported kinds above.
+- Optional `limits`: `seconds` (60), `max_steps` (12), `max_decisions` (12),
+  `max_no_progress` (3), `freshness` (30 seconds), `verification_seconds` (15).
+  Counts are 1–100, total time ≤3,600 seconds, per-observation/wait bounds ≤60.
+  Limits include model attempts; requests are additionally capped at 16 KiB.
+
+Task result JSON is printed and saved in a unique owner-only evidence directory.
+Exit 0 means verified completion or successful **decision-only** mode, not that
+every result with exit 0 mutated/completed the device task. Noncompletion exits
+1. `dispatch`, `verification`, acknowledged substeps, last decision metadata,
+cleanup and telemetry remain separate. Evidence-write failure does not erase a
+successful action result. The task connection owns the workflow lock for the
+whole invocation, including model inference.
+
+### Cloud privacy boundary
+
+Only the caller-written objective/action descriptions, approved bundle ID,
+snapshot ID/time, eligible operations/roles, opaque target IDs and availability
+are sent. Raw accessibility labels, field values, supplied input, selectors,
+device UDID/PID, source XML and screenshots are **not** sent. Unknown apps and
+secure-field screens block cloud inference. This strict projection deliberately
+limits what Jev can understand; ambiguity goes back to the planner rather than
+uploading more of the screen. Caller-written objectives/descriptions must also
+be reviewed for private data. No-training does not mean zero retention; review
+[TypeSafe's account/privacy terms](https://docs.typesafe.ai/legal) before use.
+
+### Measurements and remaining acceptance
+
+`task summarize RESULT.json ...` aggregates saved task results offline, grouping
+drivers and including failures in total-time median/p95. It reports transport
+counts, missing telemetry, inference latency/tokens and estimated known cost
+using the published $0.042/M input-token rate (2026-09-21). Missing usage is
+unknown cost, not free. Limits bound attempts/bytes/time, not exact dollar cost.
+Optional independent annotations `wrong_target_actions`, `unintended_actions`
+and `false_successes` remain null unless supplied; transport logs cannot prove
+the absence of external effects.
+
+Use equivalent tasks and starting state to compare `legacy`, `planner`,
+`deterministic` and `jev`; annotate externally timed legacy/planner runs rather
+than inventing model timings. Separate cold setup from warm actions using
+transport event timings. Small-sample p95 is exploratory. No automatic live
+benchmark runs, social actions, purchases or destructive operations are bundled.
+Live acceptance evidence and exact remaining steps are recorded in
+[runtime-validation.md](runtime-validation.md).
