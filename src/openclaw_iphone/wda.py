@@ -201,6 +201,40 @@ class WDAClient:
         with self.session() as session_id:
             return self._json_post(f"/session/{session_id}/wda/apps/activate", {"bundleId": bundle_id})
 
+    def find_elements(self, xpath: str) -> list[str]:
+        """Read-only query (WDA uses POST); no implicit retries."""
+        with self.session() as session_id:
+            value = self._json_post(f"/session/{session_id}/elements", {"using": "xpath", "value": xpath}).get("value")
+        if not isinstance(value, list):
+            raise WDAUnavailable("Invalid WDA element query response.")
+        return [element_identifier(item) for item in value]
+
+    def active_element(self) -> str:
+        with self.session() as session_id:
+            return element_identifier(self._json_request(f"/session/{session_id}/element/active").get("value"))
+
+    def element_hittable(self, element_id: str) -> bool:
+        with self.session() as session_id:
+            path = f"/session/{session_id}/element/{urllib.parse.quote(element_id, safe='')}/attribute/hittable"
+            return self._json_request(path).get("value") is True
+
+    def element_scroll(self, element_id: str, direction: str) -> dict[str, Any]:
+        if direction not in {"up", "down"}:
+            raise ValueError("Unsupported scroll direction.")
+        self.require_unlocked()
+        with self.session() as session_id:
+            path = f"/session/{session_id}/wda/element/{urllib.parse.quote(element_id, safe='')}/scroll"
+            return self._json_post(path, {"direction": direction, "distance": 0.5})
+
+    def element_action(self, element_id: str, action: str, *, text: str = "") -> dict[str, Any]:
+        """Targeted click, clear or native append; callers own authorization."""
+        if action not in {"click", "clear", "value"}:
+            raise ValueError("Unsupported element action.")
+        self.require_unlocked()
+        with self.session() as session_id:
+            path = f"/session/{session_id}/element/{urllib.parse.quote(element_id, safe='')}/{action}"
+            return self._json_post(path, {"value": [text]} if action == "value" else {})
+
     def clear_text(self) -> dict[str, Any]:
         self.require_unlocked()
         with self.session() as session_id:
@@ -388,6 +422,13 @@ class WDAClient:
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
+
+
+def element_identifier(value: object) -> str:
+    identifier = (value.get("element-6066-11e4-a52e-4f735466cecf") or value.get("ELEMENT")) if isinstance(value, dict) else None
+    if not isinstance(identifier, str) or not identifier:
+        raise WDAUnavailable("No valid WDA element reference returned.")
+    return identifier
 
 
 def check_response(payload: dict[str, Any], path: str, *, mutating: bool = False) -> None:
