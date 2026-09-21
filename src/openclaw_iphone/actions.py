@@ -242,6 +242,10 @@ class Executor:
             target = observation.unique(grant.target) if grant.target else None
             if grant.target and (target is None or not target.actionable):
                 continue
+            if grant.operation == "append" and target.value not in (None, ""):
+                # WDA inserts at the current caret/selection, not necessarily
+                # the end. Never offer an append to existing text.
+                continue
             if grant.after and self.verify(observation, grant.after) == "satisfied":
                 continue
             if target and grant.operation in {"tap", "back", "append", "replace", "clear"} and not (target.name or target.label):
@@ -304,11 +308,9 @@ class Executor:
             if operation in {"append", "replace", "clear"}:
                 if wda.active_element() != reference:
                     raise ObservationRejected("Intended editable field is not focused.")
-                if operation == "append" and target.value is None and wda.element_value(reference) != "":
-                    raise ObservationRejected("Initial field value changed or is unknown; cannot verify append.")
-                if operation == "append" and target.value and target.value in {target.name, target.label}:
-                    raise ObservationRejected("Value may be a placeholder; cannot infer the initial text.")
-                expected = (target.value or "") + self.texts[grant.text_id] if operation == "append" else self.texts[grant.text_id] if operation == "replace" else ""
+                if operation == "append" and (target.value not in (None, "") or wda.element_value(reference) != ""):
+                    raise ObservationRejected("Append requires a verified empty field; caret position is unknown. Use an explicit replace grant for whole-field entry.")
+                expected = self.texts[grant.text_id] if operation in {"append", "replace"} else ""
                 if operation in {"replace", "clear"}:
                     dispatching = True
                     wda.element_action(reference, "clear")

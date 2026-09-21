@@ -32,6 +32,19 @@ class Decision:
     input_tokens: int | None
     output_tokens: int | None
 
+    def summary(self) -> dict[str, object]:
+        return {"confidence": self.confidence, "latency_seconds": self.latency_seconds,
+                "input_tokens": self.input_tokens, "output_tokens": self.output_tokens}
+
+
+class LowConfidenceDecision(OpenClawIPhoneError):
+    """A valid response rejected by policy, not a provider outage."""
+
+    def __init__(self, decision: Decision, min_confidence: float) -> None:
+        super().__init__("Model confidence below configured escalation threshold.")
+        self.decision = decision
+        self.min_confidence = min_confidence
+
 
 def strict_json(text: str | bytes) -> object:
     def pairs(items):
@@ -105,7 +118,7 @@ class JevDriver:
             self.output_tokens += decision.output_tokens or 0
         budget.remaining()  # A late inference must never dispatch a device action.
         if decision.confidence < self.min_confidence:
-            raise DecisionUnavailable("Model confidence below configured escalation threshold.")
+            raise LowConfidenceDecision(decision, self.min_confidence)
         return decision
 
     def summary(self) -> dict[str, object]:

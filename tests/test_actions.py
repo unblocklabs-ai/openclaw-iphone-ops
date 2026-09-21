@@ -282,6 +282,39 @@ class ExecutorTests(unittest.TestCase):
         self.assertEqual(ex.execute(offer.id).dispatch, "not_sent")
         wda.element_action.assert_not_called()
 
+    def test_nonempty_append_is_not_offered_or_silently_replaced(self):
+        grant = Grant("append", APP, "Enter supplied text", FIELD, text_id="query")
+        for value in ("abCD", "Input"):
+            with self.subTest(value=value):
+                ex, wda = executor([grant], xml=source(value=value), texts={"query": "X"})
+                self.assertEqual(ex.offers(ex.observe()), ())
+                wda.element_action.assert_not_called()
+
+    def test_append_requires_fresh_empty_value_even_when_xml_says_empty(self):
+        grant = Grant("append", APP, "Enter supplied text", FIELD, text_id="query")
+        for xml in (source(), source().replace('value=""', '')):
+            for value in ("abCD", WDAUnavailable("private read error")):
+                with self.subTest(xml=xml, value=value):
+                    ex, wda = executor([grant], xml=xml, texts={"query": "X"})
+                    offer, = ex.offers(ex.observe())
+                    wda.element_value.side_effect = [value]
+                    result = ex.execute(offer.id)
+                    self.assertEqual((result.dispatch, result.reason), ("not_sent", "validation_failed"))
+                    self.assertEqual(ex.execute(offer.id).dispatch, "not_sent")
+                    wda.element_action.assert_not_called()
+
+    def test_append_bad_readback_never_replays_or_repairs_text(self):
+        grant = Grant("append", APP, "Enter supplied text", FIELD, text_id="query")
+        ex, wda = executor([grant], texts={"query": "X"})
+        offer, = ex.offers(ex.observe())
+        wda.source.side_effect = lambda: source(value="abXCD" if wda.element_action.called else "")
+        result = ex.execute(offer.id)
+        self.assertEqual((result.dispatch, result.verification), ("acknowledged", "unsatisfied"))
+        self.assertTrue(ex.stopped)
+        self.assertEqual(ex.execute(offer.id).dispatch, "not_sent")
+        self.assertEqual(ex.offers(ex.observe()), ())
+        wda.element_action.assert_called_once_with("ref", "value", text="X")
+
     def test_replace_stops_after_clear_if_empty_cannot_be_verified(self):
         grant = Grant("replace", APP, "Replace supplied text", FIELD, text_id="query")
         ex, wda = executor([grant], xml=source(value="placeholder"), texts={"query": "hello"})
