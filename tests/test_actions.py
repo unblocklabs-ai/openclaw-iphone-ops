@@ -1,12 +1,12 @@
 from dataclasses import replace
 import time
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 from openclaw_iphone.actions import Condition, Executor, Grant
 from openclaw_iphone.devicectl import Device
-from openclaw_iphone.errors import WDAOutcomeUnknown, WDAUnavailable
-from openclaw_iphone.execution import Budget
+from openclaw_iphone.errors import DeviceLocked, WDAOutcomeUnknown, WDAUnavailable
+from openclaw_iphone.execution import Budget, TaskStopped
 from openclaw_iphone.observations import ObservationRejected, Selector, parse_observation, xpath_literal
 
 
@@ -77,6 +77,95 @@ class ObservationTests(unittest.TestCase):
 
 
 class ExecutorTests(unittest.TestCase):
+    def test_app_wait_checks_lock_and_stable_identity_without_source(self):
+        ex, wda = executor([])
+        state, obs = ex.wait((Condition("app", APP),))
+        self.assertEqual(state, "satisfied")
+        self.assertEqual(wda.method_calls, [call.require_unlocked(), call.active_app(), call.active_app()])
+        self.assertEqual((obs.app, obs.process_id, obs.device_udid, obs.generation), (APP, 1, "device", 1))
+        self.assertIsNone(obs.elements)
+        self.assertIsNone(obs.secure)
+        self.assertEqual(ex.offers(obs), ())
+        for kind in ("exists", "absent", "actionable", "focused", "value"):
+            with self.subTest(kind=kind):
+                condition = Condition(kind, APP, FIELD, "" if kind == "value" else None)
+                self.assertEqual(ex.verify(obs, (condition,)), "unknown")
+        with self.assertRaises(ObservationRejected):
+            obs.unique(BUTTON)
+
+    def test_app_wait_supersedes_offers_and_needs_full_observation_for_input(self):
+        ex, wda = executor([tap_grant()])
+        offer, = ex.offers(ex.observe())
+        _, obs = ex.wait((Condition("app", APP),))
+        self.assertEqual(ex.execute(offer.id).dispatch, "not_sent")
+        self.assertEqual(ex.offers(obs), ())
+        self.assertEqual(len(ex.offers(ex.observe())), 1)
+        wda.element_action.assert_not_called()
+        self.assertEqual(wda.source.call_count, 2)
+
+    def test_app_wait_cannot_offer_even_untargeted_transitions(self):
+        grant = Grant("open_url", APP, "Open approved URL", destination="https://example.com",
+                      after=(Condition("app", "next.app"),))
+        ex, wda = executor([grant])
+        self.assertEqual(len(ex.offers(ex.observe())), 1)
+        _, obs = ex.wait((Condition("app", APP),))
+        self.assertEqual(ex.offers(obs), ())
+        wda.open_url.assert_not_called()
+
+    def test_mixed_or_element_wait_still_reads_source(self):
+        for conditions in ((Condition("exists", APP, BUTTON),),
+                           (Condition("app", APP), Condition("exists", APP, BUTTON))):
+            with self.subTest(conditions=conditions):
+                ex, wda = executor([])
+                state, obs = ex.wait(conditions)
+                self.assertEqual(state, "satisfied")
+                self.assertIsNotNone(obs.elements)
+                self.assertIs(obs.secure, False)
+                wda.source.assert_called_once()
+
+    def test_app_wait_refuses_lock_unknown_lock_and_read_failure(self):
+        for error in (DeviceLocked("locked or unknown"), WDAUnavailable("read failed")):
+            with self.subTest(error=type(error).__name__):
+                ex, wda = executor([tap_grant()])
+                ex.offers(ex.observe())
+                wda.reset_mock()
+                wda.require_unlocked.side_effect = error
+                with self.assertRaises(type(error)):
+                    ex.wait((Condition("app", APP),))
+                ex.connection.invalidate.assert_called_once()
+                self.assertEqual(ex._offers, {})
+                wda.active_app.assert_not_called()
+                wda.source.assert_not_called()
+                self.assertIsNone(wda.deadline)
+
+    def test_app_only_observation_rejects_missing_invalid_or_changed_process(self):
+        for pid in (None, True, 0, -1, "1", 2):
+            with self.subTest(pid=pid):
+                ex, wda = executor([])
+                wda.active_app.side_effect = [{"bundleId": APP, "pid": 1}, {"bundleId": APP, "pid": pid}]
+                with self.assertRaises(ObservationRejected):
+                    ex.observe(app_only=True)
+                wda.source.assert_not_called()
+
+    def test_app_wait_preserves_outer_deadline_on_timeout_and_cancellation(self):
+        ex, wda = executor([])
+        outer = time.monotonic() + 0.001
+        wda.deadline = outer
+        def timed_out():
+            self.assertLessEqual(wda.deadline, outer)
+            raise WDAUnavailable("deadline expired")
+        wda.active_app.side_effect = timed_out
+        with self.assertRaises(WDAUnavailable):
+            ex.wait((Condition("app", APP),), seconds=10)
+        self.assertEqual(wda.deadline, outer)
+        wda.source.assert_not_called()
+
+        ex, wda = executor([])
+        ex.connection.require_active.side_effect = TaskStopped("cancelled")
+        with self.assertRaises(TaskStopped):
+            ex.wait((Condition("app", APP),))
+        self.assertEqual(wda.method_calls, [])
+
     def test_wait_reobserves_transient_app_change_without_repeating_input(self):
         ex, wda = executor([])
         ex.verification_seconds = 1
@@ -85,6 +174,7 @@ class ExecutorTests(unittest.TestCase):
         state, _ = ex.wait((Condition("app", APP),))
         self.assertEqual(state, "satisfied")
         wda.element_action.assert_not_called()
+        wda.source.assert_not_called()
         self.assertIsNone(wda.deadline)
 
     def test_offer_consumed_and_fresh_target_used_with_postcondition(self):
@@ -144,6 +234,23 @@ class ExecutorTests(unittest.TestCase):
                          ("acknowledged", "unknown", "verification_unavailable"))
         self.assertTrue(ex.stopped)
         self.assertIsNone(wda.deadline)
+
+    def test_app_readback_failure_preserves_acknowledgement_without_replay(self):
+        grant = replace(tap_grant(), after=(Condition("app", "next.app"),))
+        ex, wda = executor([grant])
+        offer, = ex.offers(ex.observe())
+        def active_app():
+            if wda.element_action.called:
+                raise WDAUnavailable("post-dispatch read failed")
+            return {"bundleId": APP, "pid": 1}
+        wda.active_app.side_effect = active_app
+        result = ex.execute(offer.id)
+        self.assertEqual((result.dispatch, result.verification, result.reason),
+                         ("acknowledged", "unknown", "verification_unavailable"))
+        self.assertTrue(ex.stopped)
+        self.assertEqual(ex.execute(offer.id).dispatch, "not_sent")
+        wda.element_action.assert_called_once_with("ref", "click")
+        self.assertEqual(wda.source.call_count, 2)
 
     def test_append_requires_focus_and_verifies_exact_unicode(self):
         grant = Grant("append", APP, "Enter supplied text", FIELD, text_id="query")

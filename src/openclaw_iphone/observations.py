@@ -89,12 +89,15 @@ class Observation:
     captured_at: str
     started: float
     finished: float
-    elements: tuple[Element, ...] = field(repr=False)
-    secure: bool
+    # None means app identity only, not an empty or non-secure screen.
+    elements: tuple[Element, ...] | None = field(repr=False)
+    secure: bool | None
     signature: str
     process_id: int | None = None
 
     def matches(self, selector: Selector) -> tuple[Element, ...]:
+        if self.elements is None:
+            raise ObservationRejected("App-only observation has no accessibility evidence; observe the full screen first.")
         return tuple(e for e in self.elements if e.visible is True and e.matches(selector))
 
     def unique(self, selector: Selector) -> Element | None:

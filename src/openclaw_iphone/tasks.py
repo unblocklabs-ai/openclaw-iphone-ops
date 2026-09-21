@@ -127,8 +127,8 @@ def cloud_view(spec: TaskSpec, observation: Observation, offers: tuple[Offer, ..
     """
     apps = {g.app for g in spec.grants} | {c.app for c in spec.success}
     apps |= {c.app for g in spec.grants for c in g.after}
-    if observation.secure or observation.app not in apps:
-        raise DecisionUnavailable("Screen is secure or outside approved app scope.")
+    if observation.secure is not False or observation.elements is None or observation.app not in apps:
+        raise DecisionUnavailable("Screen is unobserved, secure or outside approved app scope.")
     options = {offer.id: spec.grants[offer.grant_index].description for offer in offers}
     options.update({"wait": "Wait briefly for expected state, without device input.",
                     "done": "Request independent completion verification.",
@@ -165,7 +165,7 @@ def run_task(executor: Executor, spec: TaskSpec, *, driver: JevDriver | None = N
             state = executor.verify(observation, spec.success)
             if state == "satisfied":
                 return finish("completed", "conditions_verified", state)
-            if observation.secure:
+            if observation.secure is not False:
                 return finish("blocked", "secure_screen")
             no_progress = no_progress + 1 if observation.signature == previous_signature else 0
             previous_signature = observation.signature
@@ -209,7 +209,13 @@ def run_task(executor: Executor, spec: TaskSpec, *, driver: JevDriver | None = N
             if result.verification != "satisfied":
                 return finish("escalated", result.reason, result.verification)
             # Even the final allowed action gets an independent success check.
-            if executor.verify(observation, spec.success) == "satisfied":
+            state = executor.verify(observation, spec.success)
+            if state == "unknown" and observation.elements is None:
+                # App-only postconditions cannot prove element-based task success.
+                # Read under the remaining task budget; never replay the action.
+                observation = executor.observe()
+                state = executor.verify(observation, spec.success)
+            if state == "satisfied":
                 return finish("completed", "conditions_verified", "satisfied")
         return finish("escalated", "step_limit")
     except TaskStopped:
