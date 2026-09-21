@@ -46,11 +46,14 @@ class Grant:
     destination: str | None = field(default=None, repr=False)
     after: tuple[Condition, ...] = ()
     before: tuple[Condition, ...] = ()
+    max_uses: int = 1
 
     def __post_init__(self) -> None:
         targeted = {"tap", "back", "append", "replace", "clear", "scroll"}
         if self.operation not in targeted | {"activate", "open_url"} or not self.app:
             raise ValueError("Invalid grant operation or source app.")
+        if type(self.max_uses) is not int or not 1 <= self.max_uses <= 10:
+            raise ValueError("Grant max_uses must be an integer from 1 to 10.")
         if not self.description or len(self.description) > 256:
             raise ValueError("A short caller-approved action description is required.")
         if (self.operation in targeted) != (self.target is not None):
@@ -115,6 +118,7 @@ class Executor:
         self.freshness, self.verification_seconds = freshness, verification_seconds
         self.latest: Observation | None = None
         self._offers: dict[str, Offer] = {}
+        self._uses = [0] * len(grants)
         self.stopped = False
         destinations = {g.destination for g in grants if g.operation == "activate"}
         if destinations:
@@ -205,6 +209,8 @@ class Executor:
         if self.stopped or observation.secure:
             return ()
         for index, grant in enumerate(self.grants):
+            if self._uses[index] >= grant.max_uses:
+                continue
             if grant.app != observation.app or grant.before and self.verify(observation, grant.before) != "satisfied":
                 continue
             target = observation.unique(grant.target) if grant.target else None
@@ -267,6 +273,7 @@ class Executor:
             wda = self.connection.require_active()
             operation = grant.operation
             conditions = grant.after
+            self._uses[offer.grant_index] += 1
             if operation in {"append", "replace", "clear"}:
                 if wda.active_element() != reference:
                     raise ObservationRejected("Intended editable field is not focused.")
