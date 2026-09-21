@@ -22,8 +22,9 @@ result. An expired task may leave a server session for the next owner to replace
 
 `WDAClient.type_text` retains its W3C key semantics but reuses one session for
 the whole string. `type_text_bulk` uses WDA's native `/wda/keys` route in one
-request. It appends to the focused field: trusted callers must validate focus
-and read back the field. No fallback, suffix continuation or replay occurs after
+request. It inserts at the focused field's current caret/selection, not
+necessarily the end: trusted callers must validate focus and read back the
+field. No fallback, suffix continuation or replay occurs after
 an error. Neither transport acknowledgement nor session cleanup proves typing
 was correct. Bulk route compatibility must be checked on the deployed WDA.
 
@@ -99,8 +100,14 @@ half-container distance; it checks scoped visible-item change, not unrelated
 screen activity. Change is progress, not independent task completion.
 
 Text entry requires the exact field to be focused, excludes secure fields and
-control/submission characters, and uses one native targeted append request for
-up to 4,096 supplied characters. `replace` verifies clear before append. If WDA
+control/submission characters, and uses one native targeted input request for
+up to 4,096 supplied characters. WDA inserts at the current caret/selection;
+the runtime cannot establish an end-of-text caret. Consequently, `append` is
+only supported for empty fields: known nonempty values (including placeholders)
+are not offered, and a fresh value-endpoint read must confirm empty before input,
+even when XML says empty. For whole-field entry, explicitly authorize `replace`
+and supply the complete desired text. Append never silently clears or replaces
+existing text. `replace` verifies clear before typing. If WDA
 reports a placeholder instead of an observable empty value, replacement stops
 after clear with uncertain verification; it does not guess that the field is
 empty. Missing XML values require a separate successful value-endpoint read:
@@ -151,9 +158,12 @@ The dependency-free adapter uses TypeSafe's documented
 [`POST /v1/systemone`](https://docs.typesafe.ai/api), Bearer authentication and
 Choice questions, pinned to `jev-1.13.0`. It does not load an invented SDK, honor
 endpoint overrides, forward credentials through proxies/redirects or retry
-provider failures. A 401/429/529, invalid response or low confidence escalates;
-replan explicitly rather than rerunning an unknown device mutation. Model
-confidence is never authorization or completion proof.
+provider failures. HTTP/transport failures or invalid responses escalate as
+`model_unavailable`. A valid answer below the configured threshold escalates as
+`low_confidence`, with confidence, `min_confidence`, latency and token usage in
+`last_decision`; it dispatches no action, including in decision-only mode.
+Known usage is still counted. Replan explicitly rather than rerunning an
+unknown device mutation. Model confidence is never authorization or completion proof.
 
 Make `TYPESAFE_API_KEY` available in the invoking process using your existing
 secure credential mechanism. Do not pass it as a CLI argument, add it to the

@@ -246,7 +246,7 @@ class WDAClient:
             return self._json_post(path, {"direction": direction, "distance": 0.5})
 
     def element_action(self, element_id: str, action: str, *, text: str = "") -> dict[str, Any]:
-        """Targeted click, clear or native append; callers own authorization."""
+        """Targeted click, clear or caret-based input; callers own authorization."""
         if action not in {"click", "clear", "value"}:
             raise ValueError("Unsupported element action.")
         self.require_unlocked()

@@ -91,6 +91,14 @@ class JevTests(unittest.TestCase):
             network.assert_not_called()
         self.assertEqual(driver.attempts, 0)
 
+    def test_confidence_equal_to_threshold_is_accepted(self):
+        driver = JevDriver(api_key="key", min_confidence=0.65)
+        with patch.object(driver.opener, "open", return_value=io.BytesIO(
+                json.dumps(response(confidence=0.65)).encode())) as network:
+            decision = driver.choose({}, {"go": "Go", "stop": "Stop"}, Budget.seconds(1))
+        self.assertEqual(decision.confidence, 0.65)
+        network.assert_called_once()
+
 
 class TaskTests(unittest.TestCase):
     def test_benchmark_includes_failures_and_unknown_safety_annotations(self):
@@ -147,6 +155,52 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(result["reason"], "completion_not_verified")
         self.assertNotEqual(result["status"], "completed")
         wda.element_action.assert_not_called()
+
+    def test_low_confidence_reports_latest_decision_without_device_input(self):
+        for decision_only, prior_wait in ((False, False), (True, False), (False, True)):
+            with self.subTest(decision_only=decision_only, prior_wait=prior_wait):
+                grant = tap_grant()
+                ex, wda = executor([grant])
+                ex.wait = Mock(return_value=("unsatisfied", ex.observe()))
+                driver = JevDriver(api_key="SECRET", min_confidence=0.65)
+
+                def reply(request, **kwargs):
+                    options = json.loads(request.data)["questions"]["action"]["criteria"]
+                    wait = prior_wait and driver.attempts == 1
+                    choice = "wait" if wait else next(iter(options))
+                    return io.BytesIO(json.dumps(response(choice,
+                        {key: int(key == choice) for key in options},
+                        confidence=0.9 if wait else 0.2)).encode())
+
+                with patch.object(driver.opener, "open", side_effect=reply) as network:
+                    result = run_task(ex, TaskSpec("Navigate", (grant,), grant.after),
+                                      driver=driver, decision_only=decision_only)
+                self.assertEqual((result["status"], result["reason"]), ("escalated", "low_confidence"))
+                self.assertEqual(result["last_decision"], {
+                    "confidence": 0.2, "min_confidence": 0.65,
+                    "latency_seconds": driver.latencies[-1], "input_tokens": 100, "output_tokens": 10})
+                self.assertEqual(result["model"]["unknown_usage_requests"], 0)
+                self.assertEqual(result["model"]["input_tokens"], 100 * (1 + prior_wait))
+                self.assertEqual(network.call_count, 1 + prior_wait)
+                self.assertEqual(result["steps"], int(prior_wait))
+                self.assertNotIn("SECRET", json.dumps(result))
+                wda.element_action.assert_not_called()
+
+    def test_provider_failure_remains_unavailable_without_a_decision(self):
+        for failure in (urllib.error.URLError("private transport error"), b'{"private":"invalid"}'):
+            with self.subTest(failure=failure):
+                grant = tap_grant()
+                ex, wda = executor([grant])
+                driver = JevDriver(api_key="SECRET")
+                reply = io.BytesIO(failure) if isinstance(failure, bytes) else failure
+                with patch.object(driver.opener, "open", side_effect=[reply]) as network:
+                    result = run_task(ex, TaskSpec("Navigate", (grant,), grant.after), driver=driver)
+                self.assertEqual(result["reason"], "model_unavailable")
+                self.assertIsNone(result["last_decision"])
+                self.assertEqual(result["model"]["unknown_usage_requests"], 1)
+                self.assertNotIn("private", json.dumps(result))
+                network.assert_called_once()
+                wda.element_action.assert_not_called()
 
     def test_deterministic_task_verifies_last_allowed_step(self):
         grant = tap_grant()

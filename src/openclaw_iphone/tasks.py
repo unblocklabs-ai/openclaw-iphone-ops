@@ -9,7 +9,7 @@ import time
 from .actions import Condition, Executor, Grant, Offer
 from .errors import OpenClawIPhoneError
 from .execution import TaskStopped
-from .jev import DecisionUnavailable, JevDriver, strict_json
+from .jev import DecisionUnavailable, JevDriver, LowConfidenceDecision, strict_json
 from .observations import Observation, Selector
 
 
@@ -179,8 +179,7 @@ def run_task(executor: Executor, spec: TaskSpec, *, driver: JevDriver | None = N
                 decisions += 1
                 decision = driver.choose(view, options, executor.connection.budget)
                 choice = decision.choice
-                last_decision = {"confidence": decision.confidence, "latency_seconds": decision.latency_seconds,
-                                 "input_tokens": decision.input_tokens, "output_tokens": decision.output_tokens}
+                last_decision = decision.summary()
             else:
                 if len(offers) != 1:
                     return finish("escalated", "no_unique_deterministic_action")
@@ -220,6 +219,9 @@ def run_task(executor: Executor, spec: TaskSpec, *, driver: JevDriver | None = N
         return finish("escalated", "step_limit")
     except TaskStopped:
         return finish("blocked", "deadline_or_cancelled")
+    except LowConfidenceDecision as exc:
+        last_decision = {**exc.decision.summary(), "min_confidence": exc.min_confidence}
+        return finish("escalated", "low_confidence")
     except DecisionUnavailable:
         return finish("escalated", "model_unavailable")
     except OpenClawIPhoneError:
