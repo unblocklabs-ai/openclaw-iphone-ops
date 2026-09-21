@@ -141,6 +141,9 @@ class ExecutorTests(unittest.TestCase):
         wda.source.side_effect = [source(), source(value="hé🙂")]
         self.assertEqual(ex.execute(offer.id).verification, "satisfied")
         wda.element_action.assert_called_once_with("ref", "value", text="hé🙂")
+        wda.source.side_effect = None
+        wda.source.return_value = source(value="hé🙂")
+        self.assertEqual(ex.offers(ex.observe()), ())  # Cannot repeat the same input grant.
         ex, wda = executor([grant], texts={"query": "hi"})
         offer, = ex.offers(ex.observe())
         wda.active_element.return_value = "different"

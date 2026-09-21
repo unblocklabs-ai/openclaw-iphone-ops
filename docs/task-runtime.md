@@ -50,6 +50,9 @@ text ID/destination/direction, preconditions and expected postconditions. Grant
 descriptions must be caller-written, non-sensitive aliases suitable for cloud
 use. A label does not prove an action is harmless: callers authorize **effects**,
 not just matching words. No actions are authorized by default.
+Each grant defaults to one use for the entire executor lifetime. Repetition
+requires an explicit `max_uses` (1–10), including scrolling. Reobserving does
+not replenish typing or tap permissions.
 
 ```python
 from openclaw_iphone.actions import Condition, Executor, Grant
