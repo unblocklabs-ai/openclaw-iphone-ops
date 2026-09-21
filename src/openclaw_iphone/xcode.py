@@ -5,6 +5,8 @@ import os
 import shutil
 import subprocess
 
+from .errors import WDASetupError
+
 
 DEFAULT_XCODE_PATHS = (
     "/Applications/Xcode.app/Contents/Developer",
@@ -16,7 +18,9 @@ def resolve_developer_dir(explicit: str | None = None) -> str | None:
     """Return a Developer dir that contains devicectl, without changing global xcode-select."""
     candidates: list[str] = []
     if explicit:
-        candidates.append(explicit)
+        if not Path(explicit, "usr/bin/devicectl").is_file():
+            raise WDASetupError(f"Explicit developer directory does not contain devicectl: {explicit}")
+        return explicit
     if os.environ.get("DEVELOPER_DIR"):
         candidates.append(os.environ["DEVELOPER_DIR"])
 
@@ -46,8 +50,8 @@ def selected_developer_dir() -> str | None:
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         check=False,
+        timeout=5,
     )
     if proc.returncode != 0:
         return None
     return proc.stdout.strip() or None
-

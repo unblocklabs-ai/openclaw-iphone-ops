@@ -4,13 +4,14 @@ from dataclasses import asdict, dataclass
 import base64
 import html
 import json
+import math
 from pathlib import Path
 import time
 from typing import Any
 from xml.etree import ElementTree as ET
 
-from .evidence import artifact_path
-from .errors import WDAUnavailable
+from .evidence import artifact_path, write_private
+from .errors import WDAUnavailable, WDAUnsupportedCommand
 from .wda import WDAClient
 
 
@@ -35,7 +36,7 @@ class UIElement:
         y = self.rect.get("y")
         width = self.rect.get("width")
         height = self.rect.get("height")
-        if None in (x, y, width, height):
+        if None in (x, y, width, height) or width <= 0 or height <= 0:
             return None
         return (float(x + width / 2), float(y + height / 2))
 
@@ -54,12 +55,12 @@ class UIController:
 
     def capture_source(self, output: str | None = None) -> Path:
         path = output_path(output, "wda-source", ".xml", self.evidence_base)
-        path.write_text(self.client.source(), encoding="utf-8")
+        write_private(path, self.client.source())
         return path
 
     def capture_screenshot(self, output: str | None = None) -> Path:
         path = output_path(output, "wda-screenshot", ".png", self.evidence_base)
-        path.write_bytes(self.client.screenshot())
+        write_private(path, self.client.screenshot())
         return path
 
     def tap(self, x: float, y: float) -> None:
@@ -71,12 +72,11 @@ class UIController:
     def clear_field(self, query: str | None = None, *, exact: bool = False) -> UIElement | None:
         element = None
         if query:
+            target = self.find_text(query, exact=exact)
+            if target is None or target.type not in {"XCUIElementTypeTextField", "XCUIElementTypeSecureTextField", "XCUIElementTypeTextView", "XCUIElementTypeSearchField"}:
+                raise WDAUnavailable("Clear target must identify an editable field.")
             element = self.tap_text(query, exact=exact)
             time.sleep(0.2)
-        clear_button = self.find_text("Clear", exact=True)
-        if clear_button is not None and clear_button.center is not None:
-            self.tap(clear_button.center[0], clear_button.center[1])
-            return clear_button
         self.client.clear_text()
         return element
 
@@ -87,19 +87,22 @@ class UIController:
         try:
             self.client.back()
             return
-        except WDAUnavailable as exc:
+        except WDAUnsupportedCommand as exc:
             wda_error = exc
 
-        for element in self.elements():
-            text = element.text.lower()
-            rect = element.rect
-            is_backish = any(token in text for token in ("back", "close", "cancel", "dismiss"))
-            is_top_left_button = element.type == "XCUIElementTypeButton" and (rect.get("x") or 0) < 90 and (rect.get("y") or 0) < 120
-            if (is_backish or is_top_left_button) and element.center is not None:
-                self.tap(element.center[0], element.center[1])
-                return
+        candidates = [
+            element for element in self.elements()
+            if element.type == "XCUIElementTypeButton"
+            and element.visible is True and element.enabled is not False
+            and element.center is not None
+            and any(normalize(value) in {"back", "go back"} for value in (element.name, element.label) if value)
+        ]
+        if len(candidates) == 1:
+            x, y = candidates[0].center
+            self.tap(x, y)
+            return
 
-        raise WDAUnavailable(f"No WDA back route or visible back/close control was available. Last WDA error: {wda_error}")
+        raise WDAUnavailable(f"No WDA back route or unambiguous visible Back button was available. Last WDA error: {wda_error}")
 
     def drag(self, from_x: float, from_y: float, to_x: float, to_y: float, *, duration: float = 0.1) -> None:
         self.client.drag(from_x, from_y, to_x, to_y, duration=duration)
@@ -110,14 +113,19 @@ class UIController:
     def save_elements(self, output: str | None = None, *, visible_only: bool = True) -> Path:
         path = output_path(output, "wda-elements", ".json", self.evidence_base)
         payload = [element.to_dict() for element in self.elements(visible_only=visible_only)]
-        path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        write_private(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
         return path
 
     def find_text(self, query: str, *, exact: bool = False, visible_only: bool = True) -> UIElement | None:
         return find_element(self.elements(visible_only=visible_only), query, exact=exact)
 
     def tap_text(self, query: str, *, exact: bool = False) -> UIElement:
-        element = self.find_text(query, exact=exact)
+        candidates = [element for element in self.elements() if element.visible is True and element.enabled is not False]
+        matches = [element for element in candidates if find_element([element], query, exact=exact)]
+        centers = {element.center for element in matches if element.center is not None}
+        if len(centers) > 1:
+            raise WDAUnavailable(f"Multiple visible UI elements matched {query!r}; use a more specific selector.")
+        element = best_tappable_candidate(matches)
         if element is None:
             raise WDAUnavailable(f"No visible UI element matched text: {query!r}")
         center = element.center
@@ -127,14 +135,17 @@ class UIController:
         return element
 
     def wait_text(self, query: str, *, timeout: float = 10.0, interval: float = 0.5, exact: bool = False) -> UIElement:
+        if not math.isfinite(timeout) or timeout <= 0 or not math.isfinite(interval) or interval <= 0:
+            raise ValueError("Wait timeout and interval must be finite and positive.")
         deadline = time.monotonic() + timeout
+        controller = UIController(self.client.with_deadline(timeout))
         while True:
-            element = self.find_text(query, exact=exact)
+            element = controller.find_text(query, exact=exact)
             if element is not None:
                 return element
             if time.monotonic() >= deadline:
                 raise WDAUnavailable(f"Timed out waiting for visible text: {query!r}")
-            time.sleep(interval)
+            time.sleep(min(interval, max(0, deadline - time.monotonic())))
 
     def scroll_until_text(
         self,
@@ -160,24 +171,27 @@ class UIController:
 
     def annotated_screenshot(self, output: str | None = None, *, visible_only: bool = True) -> tuple[Path, Path, Path]:
         screenshot = output_path(output, "wda-annotated", ".png", self.evidence_base)
-        screenshot.write_bytes(self.client.screenshot())
+        write_private(screenshot, self.client.screenshot())
         elements = self.elements(visible_only=visible_only)
 
         json_path = screenshot.with_suffix(".elements.json")
-        json_path.write_text(
+        write_private(json_path,
             json.dumps([element.to_dict() for element in elements], indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
 
         html_path = screenshot.with_suffix(".html")
-        html_path.write_text(render_annotation_html(screenshot, elements), encoding="utf-8")
+        write_private(html_path, render_annotation_html(screenshot, elements))
         return screenshot, json_path, html_path
 
 
 def parse_elements(source_text: str, *, visible_only: bool = True) -> list[UIElement]:
     root = ET.fromstring(source_text)
     elements: list[UIElement] = []
+    hidden = {child for node in root.iter() if node.get("visible") == "false" for child in node.iter()}
     for node in root.iter():
+        if visible_only and node in hidden:
+            continue
         name = attr(node, "name")
         label = attr(node, "label")
         value = attr(node, "value")
@@ -207,6 +221,8 @@ def parse_elements(source_text: str, *, visible_only: bool = True) -> list[UIEle
 
 def find_element(elements: list[UIElement], query: str, *, exact: bool = False) -> UIElement | None:
     normalized = normalize(query)
+    if not normalized:
+        raise ValueError("UI text query must not be empty.")
     candidates: list[UIElement] = []
     for element in elements:
         values = [element.label, element.name, element.value, element.text]
@@ -288,6 +304,6 @@ def parse_bool(value: str | None) -> bool | None:
 
 
 def output_path(output: str | None, prefix: str, suffix: str, evidence_base: str | None) -> Path:
-    path = Path(output) if output else artifact_path(prefix, suffix, base=evidence_base)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path = Path(output).expanduser().absolute() if output else artifact_path(prefix, suffix, base=evidence_base)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     return path

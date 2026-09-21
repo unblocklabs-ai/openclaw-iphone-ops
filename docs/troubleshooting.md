@@ -26,7 +26,7 @@ Prevent this where possible by setting the agent phone to
 Check:
 
 ```sh
-xcrun devicectl device info lockState --device "$DEVICE_ID" --json-output "$TMPDIR/lock-state.json"
+./snippets/iphone-lock-state.sh
 PYTHONPATH=src python3 -m openclaw_iphone doctor
 ```
 
@@ -99,8 +99,9 @@ codesign --force --sign "<identity-sha>" --timestamp=none "$tmpdir/echo-test"
 rm -rf "$tmpdir"
 ```
 
-`errSecInternalComponent` here means the identity exists but this execution
-context cannot use the private key. Unlock the login keychain or approve the
+`errSecInternalComponent` can indicate this execution context cannot use the
+private key; it is not a unique diagnosis. Check the signing output and identity,
+then unlock the login keychain or approve the
 private-key access prompt with Always Allow before retrying WDA.
 
 Do not commit keychain passwords, Apple ID passwords, or certificate private-key
@@ -112,6 +113,9 @@ If the phone says the Developer App certificate is not trusted, go to
 `Settings -> General -> VPN & Device Management` and trust the developer profile.
 
 If tapping Verify flashes but does not complete:
+
+The following are operator-led recovery options, not permission for an agent to
+delete apps, reboot, or disable network protections without approval:
 
 - Confirm the phone has working internet.
 - Temporarily disable VPN, DNS filtering, firewall profiles, or content blockers.

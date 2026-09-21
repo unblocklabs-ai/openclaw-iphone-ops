@@ -1,5 +1,9 @@
 # Instagram Ranking Quality Benchmark
 
+Historical pre-hardening observations, not current validation. Earlier scoring
+treated the search query/tag as topical evidence and identity checks were weaker.
+The precision/yield claims below must be re-measured with the corrected code.
+
 Goal: validate whether Instagram creator triage ranking is measurably useful,
 not just fast. Across at least five varied pregnancy/motherhood themes, the
 verified top 10 should produce at least five credible leads in at least 80% of

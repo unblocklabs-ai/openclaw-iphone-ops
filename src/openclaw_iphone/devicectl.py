@@ -93,8 +93,12 @@ class DeviceCtl:
     def select_device(self, requested: str | None = None) -> Device:
         requested = requested or None
         devices, _ = self.list_devices()
-        connected = [device for device in devices if device.state.lower() == "connected"]
-        pool = connected or devices
+        connected = [
+            device for device in devices
+            if device.state.lower() == "connected" and device.identifier
+            and device.model.casefold().startswith("iphone")
+        ]
+        pool = connected
 
         if requested:
             matches = [
@@ -182,8 +186,10 @@ class DeviceCtl:
             return exact_bundle[0]
 
         exact_name = [app for app in apps if app.name.lower() == query_lower]
-        if exact_name:
+        if len(exact_name) == 1:
             return exact_name[0]
+        if len(exact_name) > 1:
+            raise AppNotFound(f"App name {query!r} matched multiple apps; use an exact bundle identifier.")
 
         contains = [
             app
@@ -211,23 +217,11 @@ class DeviceCtl:
             ]
         )
 
-    def terminate_app(self, device_id: str, bundle_id: str) -> None:
-        self.runner.run(
-            [
-                "xcrun",
-                "devicectl",
-                "device",
-                "process",
-                "terminate",
-                "--device",
-                device_id,
-                bundle_id,
-            ]
-        )
-
-
 def read_json(path: Path) -> dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8"))
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("devicectl JSON response must be an object.")
+    return data
 
 
 def find_list(data: Any, key: str) -> list[dict[str, Any]]:

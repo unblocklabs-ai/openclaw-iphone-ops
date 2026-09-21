@@ -12,7 +12,8 @@ Prefer:
 
 1. CLI flags
 2. Environment variables
-3. Auto-detection when the result is unambiguous
+3. Host config file (or repo-local `.env` when no host config exists)
+4. Auto-detection when the result is unambiguous
 
 For Xcode, prefer per-command `DEVELOPER_DIR` resolution instead of mutating the
 host's global `xcode-select` setting.
@@ -146,10 +147,10 @@ ambiguous. Use `ui type` only after the intended field is focused. Use
 `ui press-button` for hardware buttons such as `home`, `volumeUp`, and
 `volumeDown`.
 
-`ui back` is best-effort. Some WDA runners do not expose `/wda/back` or WebDriver
-session back routes, so the command falls back to visible back/close/cancel or
-top-left controls. If no such control is visible, treat the clean error as a
-navigation boundary and choose an app-specific route instead of retrying.
+`ui back` only falls back on an explicit unsupported-command response, and then
+only to one visible button named `Back` or `Go Back`. Position, Close/Cancel,
+and substring matches are not sufficient. Transport failures never trigger
+another action. Inspect the screen before retrying an uncertain action.
 
 For Instagram search/recommendation work, run `instagram capture-context` after
 opening a result grid, reel, or creator profile. The command writes screenshot,
@@ -235,13 +236,12 @@ openclaw-iphone instagram verify-handles creator1 creator2 \
   --deadline-seconds 45
 ```
 
-This bounded recipe launches Instagram, attempts a semantic search/open flow for
-each known handle, and writes per-handle profile/context/failure artifacts. Use
-the step and deadline options to prevent open-ended UI driving. The recipe first
-accepts matching current context, then tries the Instagram profile deep link
-`instagram://user?username=<handle>`, then falls back to visible Search controls
-or visible Instagram follow-up/search-bar fields. The manifest records the deep
-link or matched query field so failures are easier to diagnose.
+This bounded recipe accepts a matching current profile or opens
+`instagram://user?username=<handle>` and requires the same visible profile-header
+identity. Reels/grid tiles are not profile verification. Mismatches and missing
+identity produce `identity_mismatch`/`identity_uncertain` and a nonzero exit;
+no guessed search or AI follow-up field is used. The manifest retains the
+requested/observed identity and evidence paths.
 
 For video analysis handoff:
 
@@ -256,3 +256,8 @@ evidence bundle shape.
 
 Screenshot/source artifacts belong in the local evidence directory. Do not
 commit them or paste local paths into user-facing chat unless explicitly asked.
+
+Evidence is written in private unique run/capture directories. Use returned
+paths; explicit files are never overwritten. See README safety limits before
+building unattended recipes. CLI workflows serialize mutations per user; direct
+library callers must acquire `control_lock` around the entire workflow.

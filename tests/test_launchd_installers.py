@@ -75,6 +75,11 @@ class LaunchdInstallerTests(unittest.TestCase):
                 [f"{configured_repo}/snippets/launchd/openclaw-iphone-watchdog.sh"],
             )
             self.assertEqual(watchdog_data["StartInterval"], 300)
+            for data in (wda_data, watchdog_data):
+                self.assertEqual(data["Umask"], 0o077)
+                self.assertEqual(data["EnvironmentVariables"]["OPENCLAW_IPHONE_CONFIG"], str(config.resolve()))
+                for key in ("StandardOutPath", "StandardErrorPath"):
+                    self.assertEqual(Path(data[key]).stat().st_mode & 0o777, 0o600)
 
     def test_watchdog_installer_rejects_zero_interval(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

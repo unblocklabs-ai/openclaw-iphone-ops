@@ -2,14 +2,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import math
 from pathlib import Path
 import re
 import shutil
-import subprocess
 import time
 from typing import Any
+from xml.etree import ElementTree as ET
 
-from .instagram_context import capture_instagram_context
+from .instagram_context import capture_instagram_context, visible_elements
+from .evidence import evidence_dir, validate_prefix, write_private
+from .errors import CommandFailed
+from .runner import Runner
 from .ui import UIController, UIElement
 from .wda import WDAClient
 
@@ -114,8 +118,14 @@ def verify_handles(
     max_steps_per_handle: int = 12,
     deadline_seconds: float | None = None,
 ) -> InstagramVerifyResult:
-    base = output_base(output_dir)
-    controller = UIController(client, evidence_base=str(base))
+    normalized_handles: list[str] = []
+    for raw_handle in handles:
+        handle = normalize_handle(raw_handle)
+        if handle is None:
+            raise ValueError("Invalid Instagram handle; expected 1-30 letters, digits, underscores or periods.")
+        if handle not in normalized_handles:
+            normalized_handles.append(handle)
+    base = output_base(output_dir, prefix=prefix)
     payload: dict[str, Any] = {
         "kind": "instagram_handle_verification",
         "handles": [],
@@ -123,10 +133,7 @@ def verify_handles(
         "deadline_seconds": deadline_seconds,
     }
 
-    for raw_handle in handles:
-        handle = raw_handle.strip().lstrip("@")
-        if not handle:
-            continue
+    for handle in normalized_handles:
         handle_prefix = f"{prefix}-{handle}"
         result: dict[str, Any] = {
             "handle": handle,
@@ -135,64 +142,36 @@ def verify_handles(
             "artifacts": {},
         }
         steps = StepBudget(max_steps_per_handle, deadline_seconds=deadline_seconds)
+        handle_client = client.with_deadline(deadline_seconds)
         try:
             steps.take(result, "capture-start")
-            start = capture_instagram_context(client, output_dir=str(base), prefix=f"{handle_prefix}-start")
+            start = capture_instagram_context(handle_client, output_dir=str(base), prefix=f"{handle_prefix}-start")
             result["artifacts"]["start_manifest"] = str(start.manifest)
             if context_matches_handle(start.payload, handle):
                 result["profile"] = start.payload.get("current_profile")
                 result["current_reel"] = start.payload.get("current_reel")
                 result["visible_videos"] = start.payload.get("visible_videos", [])
                 result["status"] = "captured_current_context_match"
+                result["identity_verified"] = True
+                result["observed_handle"] = handle
                 payload["handles"].append(result)
                 continue
 
             steps.take(result, "open-profile-deep-link")
             deep_link = f"instagram://user?username={handle}"
             result["deep_link"] = deep_link
-            client.open_url(deep_link)
-            time.sleep(2.0)
+            handle_client.open_url(deep_link)
+            steps.sleep(2.0)
 
             steps.take(result, "capture-deep-link")
-            linked = capture_instagram_context(client, output_dir=str(base), prefix=f"{handle_prefix}-deep-link")
+            linked = capture_instagram_context(handle_client, output_dir=str(base), prefix=f"{handle_prefix}-deep-link")
             result["artifacts"]["deep_link_manifest"] = str(linked.manifest)
-            if context_matches_handle(linked.payload, handle) or linked.payload.get("current_profile"):
-                result["profile"] = linked.payload.get("current_profile")
-                result["current_reel"] = linked.payload.get("current_reel")
-                result["visible_videos"] = linked.payload.get("visible_videos", [])
-                result["status"] = "captured_deep_link"
-                payload["handles"].append(result)
-                continue
-
-            steps.take(result, "focus-query-field")
-            field = focus_query_field(controller)
-            result["query_field"] = field.to_dict()
-            time.sleep(0.8)
-
-            steps.take(result, "clear-query-field")
-            controller.clear_field()
-            time.sleep(0.3)
-
-            steps.take(result, "type-handle")
-            controller.type_text(handle, frequency=12)
-            time.sleep(1.5)
-
-            steps.take(result, "tap-result")
-            controller.tap_text(handle)
-            time.sleep(2.0)
-
-            steps.take(result, "capture-profile")
-            profile = capture_instagram_context(client, output_dir=str(base), prefix=f"{handle_prefix}-profile")
-            result["artifacts"]["profile_manifest"] = str(profile.manifest)
-            result["profile"] = profile.payload.get("current_profile")
-            result["current_reel"] = profile.payload.get("current_reel")
-            result["visible_videos"] = profile.payload.get("visible_videos", [])
-            result["status"] = "captured" if profile.payload.get("current_profile") else "captured_without_profile_parse"
+            record_profile_verification(result, linked.payload, handle)
         except Exception as exc:
             result["status"] = "failed"
             result["error"] = str(exc)
             try:
-                screenshot, elements, annotation = controller.annotated_screenshot(str(base / f"{handle_prefix}-failure.png"))
+                screenshot, elements, annotation = UIController(handle_client).annotated_screenshot(str(base / f"{handle_prefix}-failure.png"))
                 result["artifacts"]["failure_screenshot"] = str(screenshot)
                 result["artifacts"]["failure_elements"] = str(elements)
                 result["artifacts"]["failure_annotation"] = str(annotation)
@@ -201,7 +180,7 @@ def verify_handles(
         payload["handles"].append(result)
 
     manifest = base / f"{prefix}.json"
-    manifest.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    write_private(manifest, json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return InstagramVerifyResult(manifest=manifest, payload=payload)
 
 
@@ -215,7 +194,7 @@ def analyze_video(
     dry_run: bool = False,
     timeout: int = 300,
 ) -> InstagramVideoAnalysisResult:
-    base = output_base(output_dir)
+    base = output_base(output_dir, prefix=prefix)
     context = capture_instagram_context(client, output_dir=str(base), prefix=f"{prefix}-context")
     analysis_output = base / f"{prefix}-gemini.json"
     command = [
@@ -246,14 +225,15 @@ def analyze_video(
         payload["status"] = "blocked"
         payload["blocker"] = "video-understand CLI was not found on PATH."
     else:
-        completed = subprocess.run(command, text=True, capture_output=True, timeout=timeout, check=False)
-        payload["returncode"] = completed.returncode
-        payload["stdout"] = completed.stdout
-        payload["stderr"] = completed.stderr
-        payload["status"] = "analyzed" if completed.returncode == 0 else "failed"
+        try:
+            completed = Runner(timeout=timeout).run(command)
+        except CommandFailed as exc:
+            payload.update(status="failed", returncode=exc.returncode, timed_out=exc.timed_out, stdout=exc.stdout, stderr=exc.stderr)
+        else:
+            payload.update(status="analyzed", returncode=completed.returncode, stdout=completed.stdout, stderr=completed.stderr)
 
     manifest = base / f"{prefix}.json"
-    manifest.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    write_private(manifest, json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return InstagramVideoAnalysisResult(manifest=manifest, payload=payload)
 
 
@@ -274,7 +254,8 @@ def discover_creators(
 ) -> InstagramDiscoveryResult:
     if verification_mode not in {"profile", "source-only"}:
         raise ValueError("verification_mode must be 'profile' or 'source-only'.")
-    base = output_base(output_dir)
+    client = client.with_deadline(deadline_seconds)
+    base = output_base(output_dir, prefix=prefix)
     started = time.monotonic()
     controller = UIController(client, evidence_base=str(base))
     steps = StepBudget(max_steps, deadline_seconds=deadline_seconds)
@@ -321,7 +302,7 @@ def discover_creators(
             url = f"instagram://tag?name={tag}"
             payload["actions_taken"].append({"action": "open_url", "url": url})
             client.open_url(url)
-            time.sleep(source_open_wait_seconds)
+            steps.sleep(source_open_wait_seconds)
             for scroll_index in range(max_source_scrolls + 1):
                 if len(source_candidates) >= source_pool_size:
                     break
@@ -364,7 +345,7 @@ def discover_creators(
                 steps.take(payload, f"scroll-source:{tag}:{scroll_index}")
                 payload["actions_taken"].append({"action": "drag", "purpose": "scroll_source_results"})
                 controller.drag(200, 735, 200, 260, duration=0.2)
-                time.sleep(0.8)
+                steps.sleep(0.8)
         except Exception as exc:
             errors.append({"stage": "source", "tag": tag, "error": str(exc)})
             try:
@@ -407,7 +388,7 @@ def discover_creators(
                     handle,
                     output_dir=str(base),
                     prefix=f"{prefix}-verify-{handle}",
-                    deadline_seconds=per_candidate_deadline_seconds,
+                    deadline_seconds=min(per_candidate_deadline_seconds, deadline_seconds - (time.monotonic() - started)),
                     max_steps=max_steps_per_candidate,
                 )
                 candidate = build_discovery_candidate(query, source_candidate, verification)
@@ -424,8 +405,8 @@ def discover_creators(
     payload["ui_steps"] = steps.used
     manifest = base / f"{prefix}.json"
     report = base / f"{prefix}.md"
-    manifest.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    report.write_text(render_discovery_markdown(payload), encoding="utf-8")
+    write_private(manifest, json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    write_private(report, render_discovery_markdown(payload), encoding="utf-8")
     return InstagramDiscoveryResult(manifest=manifest, report=report, payload=payload)
 
 
@@ -441,7 +422,7 @@ def benchmark_discovery(
     verification_mode: str = "profile",
     source_open_wait_seconds: float = 1.5,
 ) -> InstagramBenchmarkResult:
-    base = output_base(output_dir)
+    base = output_base(output_dir, prefix=prefix)
     started = time.monotonic()
     scenario_payloads: list[dict[str, Any]] = []
     payload: dict[str, Any] = {
@@ -488,8 +469,8 @@ def benchmark_discovery(
     payload["elapsed_seconds"] = round(time.monotonic() - started, 2)
     manifest = base / f"{prefix}.json"
     report = base / f"{prefix}.md"
-    manifest.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    report.write_text(render_benchmark_markdown(payload), encoding="utf-8")
+    write_private(manifest, json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    write_private(report, render_benchmark_markdown(payload), encoding="utf-8")
     return InstagramBenchmarkResult(manifest=manifest, report=report, payload=payload)
 
 
@@ -508,7 +489,7 @@ def triage_shortlist(
     shortlist_size: int = 5,
     source_open_wait_seconds: float = 1.5,
 ) -> InstagramTriageShortlistResult:
-    base = output_base(output_dir)
+    base = output_base(output_dir, prefix=prefix)
     started = time.monotonic()
     scenario_payloads: list[dict[str, Any]] = []
     source_candidates: list[dict[str, Any]] = []
@@ -577,7 +558,7 @@ def triage_shortlist(
                 handle,
                 output_dir=str(base),
                 prefix=f"{prefix}-verify-{handle}",
-                deadline_seconds=min(per_candidate_deadline_seconds, max(1.0, verification_deadline_seconds - elapsed)),
+                deadline_seconds=min(per_candidate_deadline_seconds, verification_deadline_seconds - elapsed),
                 max_steps=4,
             )
             verified = build_discovery_candidate(
@@ -611,8 +592,8 @@ def triage_shortlist(
 
     manifest = base / f"{prefix}.json"
     report = base / f"{prefix}.md"
-    manifest.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    report.write_text(render_triage_shortlist_markdown(payload), encoding="utf-8")
+    write_private(manifest, json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    write_private(report, render_triage_shortlist_markdown(payload), encoding="utf-8")
     return InstagramTriageShortlistResult(manifest=manifest, report=report, payload=payload)
 
 
@@ -632,7 +613,7 @@ def benchmark_ranking_quality(
     max_source_scrolls: int = 1,
     source_open_wait_seconds: float = 1.5,
 ) -> InstagramRankingQualityBenchmarkResult:
-    base = output_base(output_dir)
+    base = output_base(output_dir, prefix=prefix)
     themes = themes or RANKING_QUALITY_THEMES
     started = time.monotonic()
     runs: list[dict[str, Any]] = []
@@ -713,13 +694,15 @@ def benchmark_ranking_quality(
     payload["summary"] = ranking_quality_summary(runs, started)
     manifest = base / f"{prefix}.json"
     report = base / f"{prefix}.md"
-    manifest.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    report.write_text(render_ranking_quality_markdown(payload), encoding="utf-8")
+    write_private(manifest, json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    write_private(report, render_ranking_quality_markdown(payload), encoding="utf-8")
     return InstagramRankingQualityBenchmarkResult(manifest=manifest, report=report, payload=payload)
 
 
 class StepBudget:
     def __init__(self, max_steps: int, *, deadline_seconds: float | None = None) -> None:
+        if max_steps < 0 or (deadline_seconds is not None and (not math.isfinite(deadline_seconds) or deadline_seconds <= 0)):
+            raise ValueError("Step budget must be non-negative and deadline finite and positive.")
         self.max_steps = max_steps
         self.deadline = None if deadline_seconds is None else time.monotonic() + deadline_seconds
         self.used = 0
@@ -732,14 +715,21 @@ class StepBudget:
         self.used += 1
         result["steps"].append({"index": self.used, "name": name})
 
+    def sleep(self, seconds: float) -> None:
+        if not math.isfinite(seconds) or seconds < 0:
+            raise ValueError("Wait duration must be finite and non-negative.")
+        if self.deadline is not None:
+            seconds = min(seconds, max(0, self.deadline - time.monotonic()))
+        time.sleep(seconds)
 
-def output_base(output_dir: str | None) -> Path:
+
+def output_base(output_dir: str | None, *, prefix: str) -> Path:
+    validate_prefix(prefix)
     if output_dir:
         base = Path(output_dir).expanduser()
     else:
         base = Path.home() / ".openclaw" / "tmp" / "openclaw-iphone-ops"
-    base.mkdir(parents=True, exist_ok=True)
-    return base
+    return evidence_dir(str(base))
 
 
 def query_to_hashtags(query: str) -> list[str]:
@@ -777,21 +767,28 @@ def query_to_hashtags(query: str) -> list[str]:
 
 
 def harvest_handles_from_capture(capture: Any, *, query: str, tag: str) -> dict[str, dict[str, Any]]:
+    if capture.payload.get("warning"):
+        return {}
     source_text = Path(capture.source).read_text(encoding="utf-8")
     labels: set[tuple[str, str, Any, Any]] = set()
     for video in capture.payload.get("visible_videos", []) or []:
         creator = str(video.get("creator") or "").strip()
         label = str(video.get("label") or "")
-        if creator:
+        if creator and video.get("visible") is True:
             labels.add((creator, label, video.get("plays"), json.dumps(video.get("rect"), sort_keys=True)))
-    for match in re.finditer(
-        r"(?:Video|Photo) by ([A-Za-z0-9._]{3,30})(?:\b[^\"<]*)?|(?:\d+\s+)?photos? or videos from ([A-Za-z0-9._]{3,30})(?:\b[^\"<]*)?",
-        source_text,
-    ):
-        labels.add((match.group(1) or match.group(2), match.group(0), None, None))
+    for node in visible_elements(ET.fromstring(source_text)):
+        if node.get("visible") != "true":
+            continue
+        label = node.get("label") or node.get("name") or ""
+        match = re.fullmatch(
+            r"(?:Video|Photo) by ([A-Za-z0-9._]{1,30})(?:\b.*)?|(?:\d+\s+)?photos? or videos from ([A-Za-z0-9._]{1,30})(?:\b.*)?",
+            label,
+        )
+        if match:
+            labels.add((match.group(1) or match.group(2), label, None, None))
 
     handles: dict[str, dict[str, Any]] = {}
-    for raw_handle, label, plays, rect_json in labels:
+    for raw_handle, label, plays, rect_json in sorted(labels, key=lambda item: (item[0], item[1])):
         handle = normalize_handle(raw_handle)
         if not handle:
             continue
@@ -829,7 +826,8 @@ def collect_source_triage_pool(
     max_source_scrolls: int,
     source_open_wait_seconds: float,
 ) -> dict[str, Any]:
-    base = output_base(output_dir)
+    client = client.with_deadline(deadline_seconds)
+    base = output_base(output_dir, prefix=prefix)
     controller = UIController(client, evidence_base=str(base))
     started = time.monotonic()
     steps = StepBudget(max(20, target_candidates * 4), deadline_seconds=deadline_seconds)
@@ -868,7 +866,7 @@ def collect_source_triage_pool(
                 url = f"instagram://tag?name={tag}"
                 state["actions_taken"].append({"action": "open_url", "url": url})
                 client.open_url(url)
-                time.sleep(source_open_wait_seconds)
+                steps.sleep(source_open_wait_seconds)
                 for scroll_index in range(max_source_scrolls + 1):
                     if len(source_candidates) >= target_candidates:
                         break
@@ -908,7 +906,7 @@ def collect_source_triage_pool(
                     steps.take(state, f"scroll-source:{tag}:{scroll_index}")
                     state["actions_taken"].append({"action": "drag", "purpose": "scroll_source_results"})
                     controller.drag(200, 735, 200, 260, duration=0.2)
-                    time.sleep(0.8)
+                    steps.sleep(0.8)
             except Exception as exc:
                 state["errors"].append({"stage": "source", "tag": tag, "error": str(exc)})
         if len(source_candidates) >= target_candidates:
@@ -969,7 +967,11 @@ def verify_discovery_handle(
     deadline_seconds: float,
     max_steps: int,
 ) -> dict[str, Any]:
-    base = output_base(output_dir)
+    client = client.with_deadline(deadline_seconds)
+    handle = normalize_handle(handle)
+    if handle is None:
+        raise ValueError("Invalid Instagram handle.")
+    base = output_base(output_dir, prefix=prefix)
     controller = UIController(client, evidence_base=str(base))
     steps = StepBudget(max_steps, deadline_seconds=deadline_seconds)
     result: dict[str, Any] = {
@@ -982,14 +984,11 @@ def verify_discovery_handle(
     try:
         steps.take(result, "open-profile-deep-link")
         client.open_url(result["deep_link"])
-        time.sleep(2.0)
+        steps.sleep(2.0)
         steps.take(result, "capture-profile")
         capture = capture_instagram_context(client, output_dir=str(base), prefix=f"{prefix}-{handle}-profile")
         result["artifacts"]["profile_manifest"] = str(capture.manifest)
-        result["profile"] = capture.payload.get("current_profile")
-        result["current_reel"] = capture.payload.get("current_reel")
-        result["visible_videos"] = capture.payload.get("visible_videos", [])
-        result["status"] = "captured_deep_link" if capture.payload.get("current_profile") else "captured_without_profile_parse"
+        record_profile_verification(result, capture.payload, handle)
     except Exception as exc:
         result["status"] = "failed"
         result["error"] = str(exc)
@@ -1009,6 +1008,11 @@ def build_discovery_candidate(query: str, source_candidate: dict[str, Any], veri
     visible_videos = verification.get("visible_videos") if isinstance(verification.get("visible_videos"), list) else []
     artifacts = list(dict.fromkeys(source_candidate.get("artifact_paths", []) + flatten_artifacts(verification.get("artifacts", {}))))
     handle = source_candidate["handle"]
+    profile_username = normalize_handle(str(profile.get("username") or ""))
+    deep_link_verified = verification.get("status") == "captured_deep_link" and profile_username == normalize_handle(handle)
+    if not deep_link_verified:
+        # Never attribute an unrelated/uncertain profile's fields to a candidate.
+        profile, current_reel, visible_videos = {}, {}, []
     follower_count = profile.get("followers")
     follower_number = parse_follower_count(follower_count)
     evidence = pregnancy_evidence(query, source_candidate, profile, current_reel)
@@ -1020,10 +1024,8 @@ def build_discovery_candidate(query: str, source_candidate: dict[str, Any], veri
     if not visible_videos and not current_reel:
         caveats.append("No recent-content signal was visible during profile verification.")
 
-    profile_username = normalize_handle(str(profile.get("username") or ""))
-    deep_link_verified = profile_username == handle
-    if verification.get("status") == "captured_deep_link" and not deep_link_verified:
-        caveats.append("Deep link opened a profile, but the parsed username did not confirm the requested handle.")
+    if not deep_link_verified:
+        caveats.append(f"Profile identity not verified ({verification.get('status')}); observed handle: {verification.get('observed_handle') or profile_username or 'unknown'}.")
 
     recency_signal = None
     if current_reel:
@@ -1096,9 +1098,11 @@ def build_source_only_candidate(query: str, source_candidate: dict[str, Any]) ->
 
 def pregnancy_evidence(query: str, source_candidate: dict[str, Any], profile: dict[str, Any], current_reel: dict[str, Any]) -> list[dict[str, Any]]:
     evidence: list[dict[str, Any]] = []
-    source_terms = " ".join([query, str(source_candidate.get("source_tag") or "")])
-    if has_pregnancy_motherhood_signal(source_terms):
-        evidence.extend(source_candidate.get("source_evidence", []))
+    # A topical search query/tag is sourcing context, not evidence about a person.
+    evidence.extend(
+        item for item in source_candidate.get("source_evidence", [])
+        if has_pregnancy_motherhood_signal(str(item.get("label") or ""))
+    )
     for field_name, value in (("bio", profile.get("bio")), ("current_reel_caption", current_reel.get("caption"))):
         if isinstance(value, str) and has_pregnancy_motherhood_signal(value):
             evidence.append(
@@ -1327,7 +1331,7 @@ def verify_ranked_candidates(
             str(handle),
             output_dir=output_dir,
             prefix=f"{prefix}-{handle}",
-            deadline_seconds=min(per_candidate_deadline_seconds, max(1.0, deadline_seconds - elapsed)),
+            deadline_seconds=min(per_candidate_deadline_seconds, deadline_seconds - elapsed),
             max_steps=4,
         )
         verified_candidate = build_discovery_candidate(
@@ -1527,7 +1531,7 @@ def flatten_artifacts(artifacts: Any) -> list[str]:
 
 def normalize_handle(value: str) -> str | None:
     handle = value.strip().lstrip("@").casefold()
-    if re.fullmatch(r"[a-z0-9._]{3,30}", handle):
+    if re.fullmatch(r"[a-z0-9._]{1,30}", handle):
         return handle
     return None
 
@@ -1814,13 +1818,22 @@ def context_matches_handle(payload: dict[str, Any], handle: str) -> bool:
     profile = payload.get("current_profile")
     if isinstance(profile, dict) and str(profile.get("username", "")).casefold().lstrip("@") == normalized:
         return True
-    reel = payload.get("current_reel")
-    if isinstance(reel, dict) and str(reel.get("creator", "")).casefold().lstrip("@") == normalized:
-        return True
-    for video in payload.get("visible_videos", []) or []:
-        if isinstance(video, dict) and str(video.get("creator", "")).casefold().lstrip("@") == normalized:
-            return True
     return False
+
+
+def record_profile_verification(result: dict[str, Any], payload: dict[str, Any], handle: str) -> None:
+    profile = payload.get("current_profile")
+    observed = normalize_handle(str(profile.get("username") or "")) if isinstance(profile, dict) else None
+    result["observed_handle"] = observed
+    result["identity_verified"] = context_matches_handle(payload, handle)
+    if result["identity_verified"]:
+        result["profile"] = profile
+        result["current_reel"] = payload.get("current_reel")
+        result["visible_videos"] = payload.get("visible_videos", [])
+        result["status"] = "captured_deep_link"
+    else:
+        result["status"] = "identity_mismatch" if observed else "identity_uncertain"
+        result["warning"] = "Requested profile identity was not confirmed. No search-field typing or result taps attempted."
 
 
 def focus_query_field(controller: UIController) -> UIElement:

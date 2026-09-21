@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..devicectl import Device, DeviceCtl
+from ..wda import WDAClient
 
 
 INSTAGRAM_BUNDLE_ID = "com.burbn.instagram"
@@ -26,6 +27,8 @@ def smoke(
 ) -> InstagramSmokeResult:
     device = client.select_device(device_selector)
     lock_state_artifact = client.require_unlocked(device.identifier)
+    url, _ = client.coredevice_wda_url(device.identifier)
+    WDAClient(url=url).require_unlocked()
 
     app = client.find_app(device.identifier, app_query)
     if app.bundle_identifier != INSTAGRAM_BUNDLE_ID:

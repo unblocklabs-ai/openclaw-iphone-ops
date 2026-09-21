@@ -1,5 +1,6 @@
 #!/usr/bin/env sh
 set -eu
+umask 077
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 SCRIPT_REPO_DIR="$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd)"
@@ -56,6 +57,16 @@ def replace(value):
     return value
 
 rendered = replace(data)
+if config.path:
+    rendered["EnvironmentVariables"] = {"OPENCLAW_IPHONE_CONFIG": str(config.path.resolve())}
+for key in ("StandardOutPath", "StandardErrorPath"):
+    fd = os.open(rendered[key], os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        if os.fstat(fd).st_nlink != 1:
+            raise SystemExit("Refusing a hardlinked service log.")
+        os.fchmod(fd, 0o600)
+    finally:
+        os.close(fd)
 rendered["StartInterval"] = interval
 if "__HOME__" in str(rendered) or "__REPO_DIR__" in str(rendered):
     raise SystemExit("Rendered plist still contains unresolved placeholders.")

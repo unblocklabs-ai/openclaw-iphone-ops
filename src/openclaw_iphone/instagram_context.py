@@ -7,7 +7,7 @@ import re
 from typing import Any
 from xml.etree import ElementTree as ET
 
-from .evidence import artifact_path
+from .evidence import evidence_dir, validate_prefix, write_private
 from .wda import WDAClient
 
 
@@ -25,15 +25,15 @@ def capture_instagram_context(
     output_dir: str | None = None,
     prefix: str = "instagram-context",
 ) -> InstagramContextCapture:
-    base = Path(output_dir).expanduser() if output_dir else artifact_path(prefix).parent
-    base.mkdir(parents=True, exist_ok=True)
+    validate_prefix(prefix)
+    base = evidence_dir(output_dir)
     screenshot = base / f"{prefix}.png"
     source = base / f"{prefix}.xml"
     manifest = base / f"{prefix}.json"
 
-    screenshot.write_bytes(client.screenshot())
+    write_private(screenshot, client.screenshot())
     source_text = client.source()
-    source.write_text(source_text, encoding="utf-8")
+    write_private(source, source_text)
 
     payload = parse_instagram_source(source_text)
     payload["artifacts"] = {
@@ -47,13 +47,18 @@ def capture_instagram_context(
             "this manifest for creator/profile context."
         )
     }
-    manifest.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    write_private(manifest, json.dumps(payload, indent=2, sort_keys=True) + "\n")
     return InstagramContextCapture(screenshot=screenshot, source=source, manifest=manifest, payload=payload)
 
 
 def parse_instagram_source(source_text: str) -> dict[str, Any]:
     root = ET.fromstring(source_text)
-    elements = list(root.iter())
+    # Standard WDA XML may wrap the application in AppiumAUT.
+    if root.tag != "XCUIElementTypeApplication":
+        applications = list(root.iter("XCUIElementTypeApplication"))
+        if len(applications) == 1:
+            root = applications[0]
+    elements = visible_elements(root)
     app = {
         "bundle_id": attr(root, "bundleId"),
         "name": attr(root, "name"),
@@ -120,6 +125,7 @@ def parse_current_reel(elements: list[ET.Element]) -> dict[str, Any] | None:
 
 def parse_current_profile(elements: list[ET.Element]) -> dict[str, Any] | None:
     profile: dict[str, Any] = {}
+    usernames: set[str] = set()
     for element in elements:
         name = attr(element, "name")
         label = attr(element, "label")
@@ -146,14 +152,28 @@ def parse_current_profile(elements: list[ET.Element]) -> dict[str, Any] | None:
             element.tag == "XCUIElementTypeStaticText"
             and name
             and is_probable_instagram_handle(name)
-            and "username" not in profile
+            and name == label
+            and attr(element, "visible") == "true"
+            and (parse_int(attr(element, "y")) is not None)
+            and 0 <= parse_int(attr(element, "y")) < 110
         ):
-            profile["username"] = name
+            # Only an unambiguous visible header, never arbitrary body/reel text.
+            usernames.add(name.casefold())
+
+    if len(usernames) == 1:
+        profile["username"] = next(iter(usernames))
 
     profile_signals = {"followers", "following", "posts", "bio"}
     if profile_signals.intersection(profile):
         return profile
     return None
+
+
+def visible_elements(root: ET.Element) -> list[ET.Element]:
+    """Exclude hidden subtrees, not just individual nodes."""
+    if attr(root, "visible") == "false":
+        return []
+    return [root] + [node for child in root for node in visible_elements(child)]
 
 
 def first_descendant_value(element: ET.Element, tag: str) -> str | None:
@@ -185,4 +205,4 @@ def attr(element: ET.Element, name: str) -> str | None:
 
 
 def is_probable_instagram_handle(value: str) -> bool:
-    return bool(re.fullmatch(r"[A-Za-z0-9._]{3,30}", value)) and not value.startswith("user-detail")
+    return bool(re.fullmatch(r"[A-Za-z0-9._]{1,30}", value)) and not value.startswith("user-detail")

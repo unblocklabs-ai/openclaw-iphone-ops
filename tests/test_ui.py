@@ -4,7 +4,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from openclaw_iphone.errors import WDAUnavailable
+from openclaw_iphone.errors import WDAUnavailable, WDAUnsupportedCommand
 from openclaw_iphone.ui import UIController, parse_elements
 
 
@@ -15,6 +15,9 @@ class FakeClient:
     def __init__(self, source: str = "<App />") -> None:
         self.calls: list[tuple[str, tuple, dict]] = []
         self.source_text = source
+
+    def with_deadline(self, seconds):
+        return self
 
     def source(self) -> str:
         return self.source_text
@@ -44,7 +47,7 @@ class FakeClient:
 class FailingBackClient(FakeClient):
     def back(self) -> None:
         self.calls.append(("back", (), {}))
-        raise WDAUnavailable("WDA back routes are missing")
+        raise WDAUnsupportedCommand("WDA back routes are missing")
 
 
 class UITests(unittest.TestCase):
@@ -71,7 +74,7 @@ class UITests(unittest.TestCase):
             result = UIController(FakeClient(), evidence_base=tmp).capture_source()  # type: ignore[arg-type]
 
             self.assertTrue(result.name.endswith("-wda-source.xml"))
-            self.assertEqual(result.parent.name, "openclaw-iphone-ops")
+            self.assertTrue(result.parent.name.startswith("openclaw-iphone-ops-"))
             self.assertEqual(result.read_text(encoding="utf-8"), "<App />")
 
     def test_tap_delegates_to_client(self) -> None:
@@ -96,7 +99,7 @@ class UITests(unittest.TestCase):
         self.assertIsNone(result)
         self.assertEqual(client.calls, [("clear_text", (), {})])
 
-    def test_clear_field_prefers_visible_clear_button(self) -> None:
+    def test_clear_field_does_not_tap_unrelated_clear_button(self) -> None:
         source = """<XCUIElementTypeApplication>
           <XCUIElementTypeButton name="Clear" label="Clear" visible="true" x="10" y="20" width="100" height="40" />
         </XCUIElementTypeApplication>"""
@@ -104,10 +107,10 @@ class UITests(unittest.TestCase):
 
         element = UIController(client).clear_field()  # type: ignore[arg-type]
 
-        self.assertEqual(element.name, "Clear")
-        self.assertEqual(client.calls, [("tap", (60.0, 40.0), {})])
+        self.assertIsNone(element)
+        self.assertEqual(client.calls, [("clear_text", (), {})])
 
-    def test_clear_field_taps_target_then_visible_clear_button(self) -> None:
+    def test_clear_field_taps_target_then_clears_active_field(self) -> None:
         source = """<XCUIElementTypeApplication>
           <XCUIElementTypeTextView name="Search field" label="Search field" visible="true" x="10" y="20" width="100" height="40" />
           <XCUIElementTypeButton name="Clear" label="Clear" visible="true" x="120" y="20" width="80" height="40" />
@@ -116,8 +119,8 @@ class UITests(unittest.TestCase):
 
         element = UIController(client).clear_field("Search field", exact=True)  # type: ignore[arg-type]
 
-        self.assertEqual(element.name, "Clear")
-        self.assertEqual(client.calls, [("tap", (60.0, 40.0), {}), ("tap", (160.0, 40.0), {})])
+        self.assertEqual(element.name, "Search field")
+        self.assertEqual(client.calls, [("tap", (60.0, 40.0), {}), ("clear_text", (), {})])
 
     def test_press_button_delegates_to_client(self) -> None:
         client = FakeClient()
@@ -150,20 +153,20 @@ class UITests(unittest.TestCase):
 
         self.assertEqual(client.calls, [("back", (), {}), ("tap", (28.0, 83.5), {})])
 
-    def test_back_falls_back_to_top_left_button_without_label(self) -> None:
+    def test_back_refuses_top_left_button_without_back_label(self) -> None:
         source = """<XCUIElementTypeApplication>
           <XCUIElementTypeButton name="profile-header-left-button" visible="true" x="18" y="75" width="24" height="24" />
         </XCUIElementTypeApplication>"""
         client = FailingBackClient(source)
 
-        UIController(client).back()  # type: ignore[arg-type]
-
-        self.assertEqual(client.calls, [("back", (), {}), ("tap", (30.0, 87.0), {})])
+        with self.assertRaises(WDAUnavailable):
+            UIController(client).back()  # type: ignore[arg-type]
+        self.assertEqual(client.calls, [("back", (), {})])
 
     def test_back_reports_clean_error_when_no_route_or_visible_control_exists(self) -> None:
         client = FailingBackClient("<XCUIElementTypeApplication />")
 
-        with self.assertRaisesRegex(WDAUnavailable, "No WDA back route or visible back/close control"):
+        with self.assertRaisesRegex(WDAUnavailable, "No WDA back route or unambiguous visible Back button"):
             UIController(client).back()  # type: ignore[arg-type]
 
     def test_parse_elements_extracts_visible_text_and_center(self) -> None:

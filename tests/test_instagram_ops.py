@@ -27,6 +27,9 @@ class FakeWDA:
         self.source_text = source
         self.calls: list[tuple[str, tuple, dict]] = []
 
+    def with_deadline(self, seconds):
+        return self
+
     def source(self) -> str:
         return self.source_text
 
@@ -66,7 +69,7 @@ class InstagramOpsTests(unittest.TestCase):
             self.assertIn("video-understand", payload["command"][0])
             self.assertTrue(Path(payload["context_manifest"]).exists())
 
-    def test_verify_handles_writes_failure_artifacts_when_search_not_visible(self) -> None:
+    def test_verify_handles_reports_uncertain_identity_with_evidence(self) -> None:
         source = """<XCUIElementTypeApplication bundleId="com.burbn.instagram" name="Instagram" label="Instagram">
           <XCUIElementTypeStaticText name="Home" label="Home" visible="true" x="1" y="2" width="30" height="10" />
         </XCUIElementTypeApplication>"""
@@ -81,11 +84,10 @@ class InstagramOpsTests(unittest.TestCase):
             payload = json.loads(result.manifest.read_text(encoding="utf-8"))
             item = payload["handles"][0]
             self.assertEqual(item["handle"], "prenatal.creator")
-            self.assertEqual(item["status"], "failed")
-            self.assertTrue(Path(item["artifacts"]["failure_screenshot"]).exists())
-            self.assertTrue(Path(item["artifacts"]["failure_elements"]).exists())
+            self.assertEqual(item["status"], "identity_uncertain")
+            self.assertTrue(Path(item["artifacts"]["deep_link_manifest"]).exists())
 
-    def test_verify_handles_can_use_follow_up_field_when_search_not_visible(self) -> None:
+    def test_verify_handles_does_not_type_into_ai_follow_up_field(self) -> None:
         source = """<XCUIElementTypeApplication bundleId="com.burbn.instagram" name="Instagram" label="Instagram">
           <XCUIElementTypeStaticText name="Ask a follow up..." label="Ask a follow up..." value="Ask a follow up..." visible="true" x="32" y="849" width="309" height="31" />
           <XCUIElementTypeButton name="Clear" label="Clear" visible="true" x="350" y="849" width="40" height="31" />
@@ -102,10 +104,8 @@ class InstagramOpsTests(unittest.TestCase):
 
             payload = json.loads(result.manifest.read_text(encoding="utf-8"))
             item = payload["handles"][0]
-            self.assertEqual(item["query_field"]["label"], "Ask a follow up...")
-            self.assertIn(("open_url", ("instagram://user?username=prenatal.creator",), {}), client.calls)
-            self.assertIn(("type_text", ("prenatal.creator",), {"frequency": 12}), client.calls)
-            self.assertEqual(item["status"], "captured_without_profile_parse")
+            self.assertEqual(client.calls, [("open_url", ("instagram://user?username=prenatal.creator",), {})])
+            self.assertEqual(item["status"], "identity_uncertain")
 
     def test_verify_handles_accepts_deep_link_profile_context(self) -> None:
         class DeepLinkWDA(FakeWDA):
@@ -119,7 +119,7 @@ class InstagramOpsTests(unittest.TestCase):
             def open_url(self, url: str) -> None:
                 super().open_url(url)
                 self.source_text = """<XCUIElementTypeApplication bundleId="com.burbn.instagram" name="Instagram" label="Instagram">
-                  <XCUIElementTypeStaticText name="prenatal.creator" label="prenatal.creator" />
+                  <XCUIElementTypeStaticText name="prenatal.creator" label="prenatal.creator" visible="true" y="29" />
                   <XCUIElementTypeButton name="user-detail-header-followers" value="9,812 followers" />
                 </XCUIElementTypeApplication>"""
 
@@ -149,7 +149,7 @@ class InstagramOpsTests(unittest.TestCase):
         self.assertEqual(candidates[0].type, "XCUIElementTypeTextView")
         self.assertEqual(candidates[0].name, "search-bar-text-view")
 
-    def test_verify_handles_accepts_current_matching_reel_without_search(self) -> None:
+    def test_verify_handles_does_not_treat_reel_as_profile_verification(self) -> None:
         source = """<XCUIElementTypeApplication bundleId="com.burbn.instagram" name="Instagram" label="Instagram">
           <XCUIElementTypeOther label="Reel by prenatal.creator." />
         </XCUIElementTypeApplication>"""
@@ -165,9 +165,9 @@ class InstagramOpsTests(unittest.TestCase):
             payload = json.loads(result.manifest.read_text(encoding="utf-8"))
             self.assertEqual(payload["deadline_seconds"], 30)
             item = payload["handles"][0]
-            self.assertEqual(item["status"], "captured_current_context_match")
-            self.assertEqual(item["current_reel"]["creator"], "prenatal.creator")
-            self.assertEqual(client.calls, [])
+            self.assertEqual(item["status"], "identity_uncertain")
+            self.assertFalse(item["identity_verified"])
+            self.assertEqual(client.calls, [("open_url", ("instagram://user?username=prenatal.creator",), {})])
 
     def test_discover_creators_harvests_source_and_deep_link_verifies_profiles(self) -> None:
         class DiscoveryWDA(FakeWDA):

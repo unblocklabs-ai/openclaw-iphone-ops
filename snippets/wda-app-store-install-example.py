@@ -1,169 +1,109 @@
 #!/usr/bin/env python3
-"""Example App Store install flow through WebDriverAgent.
-
-This is intentionally a template. It uses only environment variables and
-placeholders so the repo can be shared without local device IDs, credentials, or
-machine paths.
-"""
-
+"""Supervised App Store template; never an unattended purchase/credential handler."""
 from __future__ import annotations
 
 import json
 import os
 from pathlib import Path
-import subprocess
 import sys
 import time
-import urllib.error
-import urllib.request
 
-
-WDA_URL = os.environ.get("WDA_URL", "").rstrip("/")
 REPO_DIR = Path(os.environ.get("OPENCLAW_IPHONE_REPO_DIR", Path(__file__).resolve().parents[1]))
-SRC_DIR = REPO_DIR / "src"
-if SRC_DIR.exists():
-    sys.path.insert(0, str(SRC_DIR))
+sys.path.insert(0, str(REPO_DIR / "src"))
 
 from openclaw_iphone.config import load_config
+from openclaw_iphone.control_lock import control_lock
 from openclaw_iphone.devicectl import DeviceCtl
-
-APP_NAME = os.environ.get("APP_NAME")
-EXPECTED_PUBLISHER = os.environ.get("EXPECTED_PUBLISHER", "")
-EXPECTED_BUNDLE_ID = os.environ.get("EXPECTED_BUNDLE_ID", "")
-DEVICE_ID = os.environ.get("DEVICE_ID", "")
-
-APP_STORE_BUNDLE_ID = "com.apple.AppStore"
+from openclaw_iphone.errors import OpenClawIPhoneError, WDAUnavailable
+from openclaw_iphone.ui import UIController
+from openclaw_iphone.wda import WDAClient
 
 
-def require(value: str | None, name: str) -> str:
+def require(name: str) -> str:
+    value = os.environ.get(name, "").strip()
     if not value:
-        print(f"Set {name}.", file=sys.stderr)
-        sys.exit(2)
+        raise ValueError(f"Set {name}.")
     return value
 
 
-def wda(method: str, path: str, payload: dict | None = None) -> dict:
-    body = None if payload is None else json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        f"{WDA_URL}{path}",
-        data=body,
-        method=method,
-        headers={"Content-Type": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"WDA {method} {path} failed: {exc.code} {detail}") from exc
-
-
-def find_element(using: str, value: str, timeout: float = 15) -> str:
-    deadline = time.time() + timeout
-    last_error: Exception | None = None
-    while time.time() < deadline:
-        try:
-            result = wda("POST", "/element", {"using": using, "value": value})
-            element_id = result.get("value", {}).get("ELEMENT")
-            if element_id:
+def find_element(client: WDAClient, session: str, predicate: str, *, timeout: float = 15) -> str:
+    deadline = time.monotonic() + timeout
+    bounded = client.with_deadline(timeout)
+    while time.monotonic() < deadline:
+        response = bounded._json_post(f"/session/{session}/elements", {"using": "predicate string", "value": predicate})
+        elements = response.get("value")
+        if not isinstance(elements, list):
+            raise WDAUnavailable("Element lookup did not return a list.")
+        if len(elements) > 1:
+            raise WDAUnavailable("Ambiguous App Store controls; inspect the screen manually.")
+        if elements:
+            element_id = elements[0].get("element-6066-11e4-a52e-4f735466cecf") or elements[0].get("ELEMENT")
+            if isinstance(element_id, str) and element_id:
                 return element_id
-        except Exception as exc:  # keep polling while UI settles
-            last_error = exc
-        time.sleep(0.5)
-    raise RuntimeError(f"Could not find element {using}={value!r}: {last_error}")
+            raise WDAUnavailable("Element response did not include an id.")
+        time.sleep(min(0.5, max(0, deadline - time.monotonic())))
+    raise WDAUnavailable("Timed out waiting for the expected App Store control.")
 
 
-def tap(element_id: str) -> None:
-    wda("POST", f"/element/{element_id}/click", {})
-
-
-def type_text(text: str) -> None:
-    wda("POST", "/wda/keys", {"value": list(text)})
-
-
-def devicectl_app_present(bundle_id: str) -> bool:
-    client = DeviceCtl()
-    selector = DEVICE_ID or load_config().device
-    device = client.select_device(selector)
-    apps, _ = client.list_apps(device.identifier, include_all=True)
-    return any(app.bundle_identifier == bundle_id for app in apps)
-
-
-def resolve_wda_url() -> str:
-    env = os.environ.copy()
-    env["PYTHONPATH"] = f"{REPO_DIR / 'src'}{os.pathsep}{env['PYTHONPATH']}" if env.get("PYTHONPATH") else str(REPO_DIR / "src")
-    proc = subprocess.run(
-        [sys.executable, "-m", "openclaw_iphone", "wda", "url"],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=env,
-        check=False,
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "Could not resolve WDA URL.")
-    for line in proc.stdout.splitlines():
-        if line.startswith("url: "):
-            return line.split(": ", 1)[1].strip().rstrip("/")
-    raise RuntimeError(f"Could not parse WDA URL from resolver output: {proc.stdout.strip()}")
+def tap(client: WDAClient, session: str, element_id: str) -> None:
+    client.require_unlocked()
+    client._json_post(f"/session/{session}/element/{element_id}/click", {})
 
 
 def main() -> int:
-    global WDA_URL
-    if not WDA_URL:
-        WDA_URL = resolve_wda_url()
-    app_name = require(APP_NAME, "APP_NAME")
+    app_name = require("APP_NAME")
+    publisher = require("EXPECTED_PUBLISHER")
+    bundle_id = require("EXPECTED_BUNDLE_ID")
+    if os.environ.get("ALLOW_INSTALL") != "1":
+        raise ValueError("Supervised installation requires explicit ALLOW_INSTALL=1. No device actions performed.")
+    config = load_config(cwd=REPO_DIR)
+    device_client = DeviceCtl()
+    device = device_client.select_device(os.environ.get("DEVICE_ID") or config.device)
+    device_client.require_unlocked(device.identifier)
+    url, _ = device_client.coredevice_wda_url(device.identifier)
+    if os.environ.get("WDA_URL") or config.wda_url:
+        raise ValueError("Remove WDA URL overrides; this template uses the selected device's CoreDevice endpoint.")
+    client = WDAClient(url=url)
+    if not client.is_ready():
+        raise WDAUnavailable("WDA is not ready.")
+    client.require_unlocked()
+    device_client.launch_app(device.identifier, "com.apple.AppStore")
+    controller = UIController(client)
 
-    print("Checking WDA status...")
-    status = wda("GET", "/status")
-    if not status.get("value"):
-        raise RuntimeError("WDA responded without a value payload.")
+    with client.session() as session:
+        visible = "visible == 1 AND enabled == 1"
+        search_tab = find_element(client, session, f"{visible} AND type == 'XCUIElementTypeButton' AND name == 'Search'")
+        tap(client, session, search_tab)
+        field = find_element(client, session, f"{visible} AND type == 'XCUIElementTypeSearchField'")
+        tap(client, session, field)
+        client.require_unlocked()
+        client._json_post(f"/session/{session}/element/{field}/clear", {})
+        client.require_unlocked()
+        client._json_post(f"/session/{session}/wda/keys", {"value": list(app_name + "\n")})
+        result = find_element(client, session, f"{visible} AND name == {json.dumps(app_name)}", timeout=30)
+        tap(client, session, result)
+        find_element(client, session, f"{visible} AND name == {json.dumps(publisher)}")
+        controller.annotated_screenshot()
+        # Recommendations may still be on screen. A human confirms this one
+        # install action; never infer the intended app from a generic cloud icon.
+        if input("Verify the exact app and publisher on the phone. Type INSTALL to continue: ") != "INSTALL":
+            raise ValueError("Installation not confirmed.")
+        action = find_element(client, session, f"{visible} AND type == 'XCUIElementTypeButton' AND name IN {{'GET', 'Get', 'INSTALL', 'Install'}}")
+        tap(client, session, action)
+        find_element(client, session, f"{visible} AND name IN {{'OPEN', 'Open'}}", timeout=180)
 
-    print("Launching App Store...")
-    wda("POST", "/wda/apps/launch", {"bundleId": APP_STORE_BUNDLE_ID})
-
-    print(f"Searching for {app_name!r}...")
-    search_tab = find_element("predicate string", "name == 'Search'")
-    tap(search_tab)
-
-    search_field = find_element(
-        "predicate string",
-        "type == 'XCUIElementTypeSearchField' OR name CONTAINS[c] 'Search'",
-    )
-    tap(search_field)
-    type_text(app_name + "\n")
-
-    print("Waiting for exact result...")
-    result = find_element("predicate string", f"name CONTAINS[c] {json.dumps(app_name)}", timeout=30)
-    tap(result)
-
-    if EXPECTED_PUBLISHER:
-        print(f"Verifying publisher contains {EXPECTED_PUBLISHER!r}...")
-        find_element(
-            "predicate string",
-            f"name CONTAINS[c] {json.dumps(EXPECTED_PUBLISHER)}",
-            timeout=10,
-        )
-
-    print("Tapping install/open action for the verified app page...")
-    action = find_element(
-        "predicate string",
-        "name IN {'GET', 'Get', 'INSTALL', 'Install'} OR name CONTAINS[c] 'cloud'",
-        timeout=20,
-    )
-    tap(action)
-
-    print("Waiting for final App Store state. Handle secure prompts if they appear.")
-    find_element("predicate string", "name == 'OPEN' OR name == 'Open'", timeout=180)
-
-    if EXPECTED_BUNDLE_ID:
-        print(f"Verifying installed app bundle {EXPECTED_BUNDLE_ID!r}...")
-        if not devicectl_app_present(EXPECTED_BUNDLE_ID):
-            raise RuntimeError("App Store reached Open, but devicectl did not show the expected bundle id.")
-
-    print("Install flow reached verified success.")
+    apps, _ = device_client.list_apps(device.identifier, include_all=True)
+    if not any(app.bundle_identifier == bundle_id for app in apps):
+        raise WDAUnavailable("Open was visible, but the expected bundle is not installed. Success unverified.")
+    controller.annotated_screenshot()
+    print("Expected bundle is installed. No credential or secure-confirmation automation was attempted.")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        with control_lock():
+            raise SystemExit(main())
+    except (OpenClawIPhoneError, ValueError, OSError, EOFError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(1)

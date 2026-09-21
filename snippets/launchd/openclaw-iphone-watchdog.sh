@@ -1,5 +1,6 @@
 #!/usr/bin/env sh
 set -eu
+umask 077
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 REPO_FROM_SCRIPT="$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd)"
@@ -17,7 +18,10 @@ sys.path.insert(0, str(script_repo / "src"))
 
 from openclaw_iphone.config import load_config
 
-value = load_config(cwd=script_repo).get("OPENCLAW_IPHONE_REPO_DIR")
+config = load_config(cwd=script_repo)
+if not config.device:
+    raise SystemExit("Unattended service requires OPENCLAW_IPHONE_DEVICE; use the dedicated iPhone UDID.")
+value = config.get("OPENCLAW_IPHONE_REPO_DIR")
 if value:
     print(value)
 PY

@@ -124,7 +124,8 @@ class CLIConfigTests(unittest.TestCase):
     def test_explicit_wda_url_skips_coredevice_resolution(self) -> None:
         args = argparse.Namespace(url="http://wda.example:8100")
 
-        self.assertEqual(cli.resolve_wda_url_from_args(args), "http://wda.example:8100")
+        with mock.patch("openclaw_iphone.cli.load_config", return_value=IPhoneConfig({})):
+            self.assertEqual(cli.resolve_wda_url_from_args(args), "http://wda.example:8100")
 
     def test_wda_run_uses_host_config_for_runner_settings(self) -> None:
         fake = FakeDeviceCtl()
@@ -278,7 +279,7 @@ class CLIConfigTests(unittest.TestCase):
         self.assertIn("result: lock-check-failed", stdout.getvalue())
         self.assertIn("blocker: lock endpoint failed", stdout.getvalue())
 
-    def test_watchdog_once_accepts_coredevice_verified_unlock_when_wda_unknown(self) -> None:
+    def test_watchdog_once_rejects_unknown_screen_lock_even_without_passcode(self) -> None:
         fake_device = FakeDeviceCtl()
         fake_wda = FakeWDA(locked_values=[True, None])
         args = argparse.Namespace(
@@ -296,8 +297,8 @@ class CLIConfigTests(unittest.TestCase):
                 with contextlib.redirect_stdout(stdout):
                     result = cli.handle_watchdog_once(args)
 
-        self.assertEqual(result, 0)
-        self.assertIn("result: verified-unlocked", stdout.getvalue())
+        self.assertEqual(result, 1)
+        self.assertIn("result: lock-state-unknown", stdout.getvalue())
 
     def test_watchdog_once_reports_conflicting_lock_signals(self) -> None:
         fake_device = FakeDeviceCtl()

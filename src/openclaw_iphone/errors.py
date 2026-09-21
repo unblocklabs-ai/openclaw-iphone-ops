@@ -40,5 +40,13 @@ class WDAUnavailable(OpenClawIPhoneError):
     """Raised when WebDriverAgent cannot be reached or understood."""
 
 
+class WDAUnsupportedCommand(WDAUnavailable):
+    """The server explicitly rejected an unsupported route; fallback is safe."""
+
+
+class WDAOutcomeUnknown(WDAUnavailable):
+    """A mutating request may have executed. Observe state before any retry."""
+
+
 class WDASetupError(OpenClawIPhoneError):
     """Raised when WebDriverAgent cannot be built, run, or tunneled."""

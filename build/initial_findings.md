@@ -1,5 +1,8 @@
 # Initial Code Review Findings
 
+Historical review. The hardening changes described in
+`docs/hardening-review.md` supersede these snippet findings.
+
 Scope: read-only review of claims, docs, and snippet correctness in the local
 `openclaw-iphone-ops` repository.
 

@@ -6,14 +6,15 @@ SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 REPO_DIR="$(resolve_openclaw_repo_dir "$SCRIPT_DIR")"
 DEVICE_ID="$(resolve_openclaw_device_id "$REPO_DIR")"
 
-tmpdir="${TMPDIR:-/tmp}/openclaw-iphone-ops"
-mkdir -p "$tmpdir"
+cd "$REPO_DIR"
+export PYTHONPATH="$REPO_DIR/src${PYTHONPATH:+:$PYTHONPATH}"
+export DEVICE_ID
+exec python3 - <<'PY'
+import json
+import os
+from openclaw_iphone.devicectl import DeviceCtl
 
-lock_json="$tmpdir/lock-state.json"
-
-xcrun devicectl device info lockState \
-  --device "$DEVICE_ID" \
-  --json-output "$lock_json"
-
-echo "Device: $DEVICE_ID"
-echo "Wrote lock-state JSON: $lock_json"
+data, artifact = DeviceCtl().lock_state(os.environ["DEVICE_ID"])
+print(json.dumps(data, indent=2))
+print(f"evidence: {artifact}")
+PY
