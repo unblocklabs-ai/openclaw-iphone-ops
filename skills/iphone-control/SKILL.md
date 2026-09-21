@@ -67,6 +67,20 @@ The removed legacy service was `com.openclaw.iphone-wda-tunnel`. If it appears a
 
 ## UI Control
 
+For app-independent multi-step work, read the repo's `docs/task-runtime.md`
+before using `openclaw-iphone task run --file /private/task.json`. A single task
+owns the device, workflow lock, session, deadline and snapshot-bound grants.
+Keep app-specific labels/deep links/success criteria in the caller or app skill;
+do not add app branches to the core. Prefer a reliable deterministic path.
+
+Jev is optional (`--driver jev --allow-cloud`) and requires `TYPESAFE_API_KEY` in
+the process environment. Authorize exact effects and supplied text first. Send
+only reviewed objective/action aliases; raw UI text/input stays local. Use
+`--decision-only` for initial calibration. A model `done`, acknowledged input
+or cleanup warning is not proof of completion. Never replay an unknown action
+or a partially verified replacement. Check `docs/runtime-validation.md` for
+live limitations; do not infer unattended readiness from offline tests.
+
 Prefer source-backed or screenshot-backed commands. Capture current evidence before raw-coordinate actions.
 
 Common commands:

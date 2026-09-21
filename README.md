@@ -7,7 +7,9 @@ contain old host paths and benchmark observations; they are not current validati
 
 For app-independent Python workflows, see the experimental
 [task runtime](docs/task-runtime.md): task-scoped device/session ownership,
-bounded execution and opt-in bulk typing. Existing CLI recipes remain supported.
+snapshot-bound targeting, verified typing/waits, bounded execution and an
+optional Jev decision driver. Existing CLI recipes remain supported without a
+model key. App-specific knowledge remains in caller workflows/skills.
 
 ## What This Enables
 

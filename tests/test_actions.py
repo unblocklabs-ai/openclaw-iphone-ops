@@ -34,6 +34,7 @@ def executor(grants, *, xml=None, texts=None):
     wda.source.return_value = xml or source()
     wda.find_elements.return_value = ["ref"]
     wda.element_hittable.return_value = True
+    wda.element_value.return_value = ""
     wda.active_element.return_value = "ref"
     connection = Mock()
     connection.wda = wda
@@ -76,6 +77,16 @@ class ObservationTests(unittest.TestCase):
 
 
 class ExecutorTests(unittest.TestCase):
+    def test_wait_reobserves_transient_app_change_without_repeating_input(self):
+        ex, wda = executor([])
+        ex.verification_seconds = 1
+        wda.active_app.side_effect = [{"bundleId": "old", "pid": 2}, {"bundleId": APP, "pid": 1},
+                                     {"bundleId": APP, "pid": 1}, {"bundleId": APP, "pid": 1}]
+        state, _ = ex.wait((Condition("app", APP),))
+        self.assertEqual(state, "satisfied")
+        wda.element_action.assert_not_called()
+        self.assertIsNone(wda.deadline)
+
     def test_offer_consumed_and_fresh_target_used_with_postcondition(self):
         ex, wda = executor([tap_grant()])
         observed = ex.observe()
@@ -147,6 +158,20 @@ class ExecutorTests(unittest.TestCase):
         ex, wda = executor([grant], texts={"query": "hi"})
         offer, = ex.offers(ex.observe())
         wda.active_element.return_value = "different"
+        self.assertEqual(ex.execute(offer.id).dispatch, "not_sent")
+        wda.element_action.assert_not_called()
+
+    def test_missing_xml_value_requires_explicit_empty_read_before_append(self):
+        grant = Grant("append", APP, "Enter supplied text", FIELD, text_id="query")
+        missing = source().replace('value=""', '')
+        ex, wda = executor([grant], xml=missing, texts={"query": "hello"})
+        offer, = ex.offers(ex.observe())
+        wda.source.side_effect = [missing, source(value="hello")]
+        self.assertEqual(ex.execute(offer.id).verification, "satisfied")
+        wda.element_value.assert_called_once_with("ref")
+        ex, wda = executor([grant], xml=missing, texts={"query": "hello"})
+        offer, = ex.offers(ex.observe())
+        wda.element_value.side_effect = WDAUnavailable("unknown")
         self.assertEqual(ex.execute(offer.id).dispatch, "not_sent")
         wda.element_action.assert_not_called()
 

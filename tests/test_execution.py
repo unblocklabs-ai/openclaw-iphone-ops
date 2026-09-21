@@ -1,18 +1,43 @@
 from pathlib import Path
+import io
+import json
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
+from urllib.parse import urlsplit
 
 from openclaw_iphone.connection import TaskConnection
 from openclaw_iphone.control_lock import control_lock
 from openclaw_iphone.devicectl import Device
-from openclaw_iphone.errors import DeviceLocked, DeviceSelectionError, OpenClawIPhoneError, WDAOutcomeUnknown
+from openclaw_iphone.errors import DeviceLocked, DeviceSelectionError, OpenClawIPhoneError, WDAOutcomeUnknown, WDAUnavailable
 from openclaw_iphone.execution import Budget, TaskStopped
 from openclaw_iphone.runner import Runner
 from openclaw_iphone.wda import WDAClient
 
 
 class TransportTests(unittest.TestCase):
+    def test_bulk_has_constant_request_count_at_http_boundary(self):
+        for text in ("a", "hé🙂" * 10):
+            client = WDAClient(url="http://wda.test")
+            routes = []
+            def respond(request, timeout):
+                path = urlsplit(request.full_url).path
+                routes.append((request.method, path))
+                payload = {"sessionId": "one", "value": {}} if path == "/session" else {"value": False if path == "/wda/locked" else None}
+                return io.BytesIO(json.dumps(payload).encode())
+            with patch.object(client.opener, "open", side_effect=respond):
+                client.type_text_bulk(text)
+            self.assertEqual(routes, [("GET", "/wda/locked"), ("POST", "/session"),
+                                      ("POST", "/session/one/wda/keys"), ("DELETE", "/session/one")])
+
+    def test_explicit_null_value_is_empty_but_missing_value_is_unknown(self):
+        client = self.client()
+        client._json_request = Mock(return_value={"value": None})
+        self.assertEqual(client.element_value("ref"), "")
+        client._json_request.return_value = {}
+        with self.assertRaises(WDAUnavailable):
+            client.element_value("ref")
+
     def client(self):
         client = WDAClient(url="http://wda.test")
         client.locked = Mock(return_value=False)
@@ -42,6 +67,14 @@ class TransportTests(unittest.TestCase):
             client.type_text_bulk("private")
         client._json_post.assert_called_once_with("/session/one/wda/keys", {"value": ["private"]})
         self.assertTrue(client._session.cleanup_failed)
+
+    def test_cancel_between_characters_reports_partial_typing_and_never_replays(self):
+        client = self.client()
+        client.budget = Budget.seconds(3)
+        client._json_post.side_effect = lambda *args: client.budget.cancelled.set() or {"value": None}
+        with self.assertRaisesRegex(WDAOutcomeUnknown, "1 confirmed characters"):
+            client.type_text("ab", frequency=100)
+        client._json_post.assert_called_once()
 
     def test_typing_checks_lock_before_session_creation(self):
         for method in ("type_text", "type_text_bulk"):

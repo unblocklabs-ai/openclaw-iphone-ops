@@ -160,17 +160,23 @@ class WDAClient:
         response: dict[str, Any] = {"value": None}
         for index, char in enumerate(text):
             try:
+                if index and frequency is not None and frequency > 0:
+                    interval = 1 / frequency
+                    if self.deadline is not None:
+                        remaining = self.deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise TaskStopped("Typing deadline expired.")
+                        interval = min(interval, remaining)
+                    if self.budget:
+                        self.budget.sleep(interval)
+                    else:
+                        time.sleep(interval)
                 response = self._perform_key_press(char)
             except (WDAUnavailable, DeviceLocked, TaskStopped) as exc:
                 raise WDAOutcomeUnknown(
                     f"Typing stopped after {index} confirmed characters; the next character may have been entered. "
                     "Inspect the field before retrying; do not replay the full text."
                 ) from exc
-            if frequency is not None and frequency > 0:
-                if self.budget:
-                    self.budget.sleep(1 / frequency)
-                else:
-                    time.sleep(1 / frequency)
         return response
 
     def type_text_bulk(self, text: str, *, frequency: int | None = None) -> dict[str, Any]:
@@ -217,6 +223,19 @@ class WDAClient:
         with self.session() as session_id:
             path = f"/session/{session_id}/element/{urllib.parse.quote(element_id, safe='')}/attribute/hittable"
             return self._json_request(path).get("value") is True
+
+    def element_value(self, element_id: str) -> str:
+        """Explicit WDA value read: null means empty; a missing key is unknown.
+
+        Call only for an independently validated non-secure editable element.
+        WDA may return a placeholder instead of empty; do not erase that fact.
+        """
+        with self.session() as session_id:
+            path = f"/session/{session_id}/element/{urllib.parse.quote(element_id, safe='')}/attribute/value"
+            payload = self._json_request(path)
+        if "value" not in payload or payload["value"] is not None and not isinstance(payload["value"], str):
+            raise WDAUnavailable("Editable value is unavailable.")
+        return payload["value"] or ""
 
     def element_scroll(self, element_id: str, direction: str) -> dict[str, Any]:
         if direction not in {"up", "down"}:
@@ -375,7 +394,7 @@ class WDAClient:
 
     def _request(self, path: str, *, method: str = "GET", payload: dict[str, Any] | None = None) -> bytes:
         timeout = self._request_timeout()
-        route = re.sub(r"/(session|element)/[^/]+", r"/\1/:id", path.split("?", 1)[0])
+        route = re.sub(r"/(session|element)/(?!active(?:/|$))[^/]+", r"/\1/:id", path.split("?", 1)[0])
         with self.metrics.measure(f"wda {method} {route}"):
             return self._send(path, method=method, payload=payload, timeout=timeout)
 
