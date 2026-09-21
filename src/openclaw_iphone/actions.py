@@ -128,14 +128,15 @@ class Executor:
             if not destinations <= {a.bundle_identifier for a in installed}:
                 raise ObservationRejected("An authorized destination app is not installed.")
 
-    def observe(self) -> Observation:
+    def observe(self, *, app_only: bool = False) -> Observation:
+        """Read a full screen by default; app-only evidence cannot authorize input."""
         wda = self.connection.require_active()
         started = time.monotonic()
         stamp = datetime.now(timezone.utc).isoformat()
         try:
             wda.require_unlocked()
             before = wda.active_app()
-            source = wda.source()
+            source = None if app_only else wda.source()
             after = wda.active_app()
         except OpenClawIPhoneError:
             self.connection.invalidate()
@@ -145,9 +146,14 @@ class Executor:
                 (before.get("bundleId"), before.get("pid")) != (after.get("bundleId"), after.get("pid"))):
             self._offers.clear()
             raise ObservationRejected("Foreground app changed during observation.")
-        self.latest = parse_observation(source, generation=self.connection.generation,
-            device_udid=self.connection.device.udid, app=after["bundleId"],
-            captured_at=stamp, started=started, finished=time.monotonic(), process_id=after["pid"])
+        if source is None:
+            self.latest = Observation(uuid.uuid4().hex, self.connection.generation,
+                self.connection.device.udid, after["bundleId"], stamp, started,
+                time.monotonic(), None, None, f"app:{after['bundleId']}:{after['pid']}", after["pid"])
+        else:
+            self.latest = parse_observation(source, generation=self.connection.generation,
+                device_udid=self.connection.device.udid, app=after["bundleId"],
+                captured_at=stamp, started=started, finished=time.monotonic(), process_id=after["pid"])
         return self.latest
 
     def evaluate(self, observation: Observation, condition: Condition) -> str:
@@ -155,6 +161,8 @@ class Executor:
             return "unsatisfied"
         if condition.kind == "app":
             return "satisfied"
+        if observation.elements is None:
+            return "unknown"
         matches = observation.matches(condition.target)
         if condition.kind == "absent":
             # Unknown visibility is not proof of absence.
@@ -202,10 +210,11 @@ class Executor:
         wda = self.connection.require_active()
         previous = wda.deadline
         wda.deadline = min(previous, end) if previous is not None else end
+        app_only = bool(conditions) and all(c.kind == "app" for c in conditions)
         try:
             while True:
                 try:
-                    observation = self.observe()
+                    observation = self.observe(app_only=app_only)
                 except ObservationRejected:
                     # A transitioning app may change during a read. Retrying
                     # observation is safe; never repeat the preceding input.
@@ -223,7 +232,7 @@ class Executor:
     def offers(self, observation: Observation) -> tuple[Offer, ...]:
         self._offers.clear()
         self._check_snapshot(observation)
-        if self.stopped or observation.secure:
+        if self.stopped or observation.secure is not False or observation.elements is None:
             return ()
         for index, grant in enumerate(self.grants):
             if self._uses[index] >= grant.max_uses:
@@ -266,7 +275,8 @@ class Executor:
     def execute(self, offer_id: str) -> StepResult:
         original = self.latest
         offer = self._offers.get(offer_id)
-        if self.stopped or offer is None or original is None or offer.snapshot_id != original.id:
+        if (self.stopped or offer is None or original is None or original.elements is None
+                or offer.snapshot_id != original.id):
             return StepResult("not_sent", "unknown", "invalid_or_consumed_offer")
         # Consume the entire observation's choices before any dispatch.
         self._offers.clear()
@@ -356,5 +366,7 @@ class Executor:
 
 
 def scoped_items(observation: Observation, container: Element) -> tuple[object, ...]:
+    if observation.elements is None:
+        raise ObservationRejected("App-only observation cannot verify scroll progress.")
     return tuple((e.role, e.name, e.label, e.value, e.bounds) for e in observation.elements
                  if e.visible is True and e.path.startswith(container.path + "/"))

@@ -1,5 +1,6 @@
 import io
 import json
+from dataclasses import replace
 from pathlib import Path
 import tempfile
 import unittest
@@ -9,9 +10,10 @@ import urllib.error
 from openclaw_iphone import cli
 from openclaw_iphone.benchmark import summarize
 from openclaw_iphone.actions import Condition
+from openclaw_iphone.errors import WDAUnavailable
 from openclaw_iphone.execution import Budget, TaskStopped
 from openclaw_iphone.jev import Decision, DecisionUnavailable, JevDriver, MODEL, parse_decision
-from openclaw_iphone.tasks import TaskSpec, cloud_view, load_task, parse_task, run_task
+from openclaw_iphone.tasks import Limits, TaskSpec, cloud_view, load_task, parse_task, run_task
 from test_actions import APP, BUTTON, executor, source, tap_grant
 
 
@@ -131,6 +133,10 @@ class TaskTests(unittest.TestCase):
         ex, _ = executor([grant], xml=source(extra='<XCUIElementTypeSecureTextField value="SECRET"/>'))
         with self.assertRaises(DecisionUnavailable):
             cloud_view(spec, ex.observe(), (), step=0)
+        # App identity is insufficient to prove that a screen is cloud-safe.
+        _, app_only = ex.wait((Condition("app", APP),))
+        with self.assertRaises(DecisionUnavailable):
+            cloud_view(spec, app_only, (), step=0)
 
     def test_jev_done_cannot_override_independent_verification(self):
         ex, wda = executor([])
@@ -144,12 +150,65 @@ class TaskTests(unittest.TestCase):
 
     def test_deterministic_task_verifies_last_allowed_step(self):
         grant = tap_grant()
-        spec = TaskSpec("Navigate", (grant,), grant.after)
+        spec = TaskSpec("Navigate", (grant,), grant.after, limits=Limits(max_steps=1))
         ex, wda = executor([grant])
         wda.source.side_effect = [source(), source(), source(button_label="Finished")]
         result = run_task(ex, spec)
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["steps"], 1)
+
+    def test_app_transition_keeps_full_predispatch_checks_but_no_postdispatch_source(self):
+        grant = replace(tap_grant(), after=(Condition("app", "next.app"),))
+        spec = TaskSpec("Navigate to next app", (grant,), grant.after, limits=Limits(max_steps=1))
+        ex, wda = executor([grant])
+        wda.active_app.side_effect = lambda: {"bundleId": "next.app" if wda.element_action.called else APP, "pid": 1}
+        result = run_task(ex, spec)
+        self.assertEqual((result["status"], result["verification"], result["steps"]), ("completed", "satisfied", 1))
+        wda.element_action.assert_called_once_with("ref", "click")
+        self.assertEqual(wda.source.call_count, 2)  # Selection and fresh target validation.
+        self.assertIsNone(ex.latest.elements)
+        self.assertIsNone(ex.latest.secure)
+
+    def test_final_app_transition_reads_element_success_for_each_driver(self):
+        original = tap_grant()
+        grant = replace(original, after=(Condition("app", "next.app"),))
+        success = grant.after + (replace(original.after[0], app="next.app"),)
+        spec = TaskSpec("Navigate and verify content", (grant,), success, limits=Limits(max_steps=1))
+        for use_jev in (False, True):
+            with self.subTest(jev=use_jev):
+                ex, wda = executor([grant])
+                wda.active_app.side_effect = lambda: {"bundleId": "next.app" if wda.element_action.called else APP, "pid": 1}
+                wda.source.side_effect = lambda: source(button_label="Finished" if wda.element_action.called else "Next")
+                driver = Mock() if use_jev else None
+                if driver:
+                    driver.choose.side_effect = lambda view, options, budget: Decision(
+                        view["available_actions"][0]["id"], 1, 0, 1, 1)
+                result = run_task(ex, spec, driver=driver)
+                self.assertEqual((result["status"], result["verification"], result["steps"]),
+                                 ("completed", "satisfied", 1))
+                wda.element_action.assert_called_once_with("ref", "click")
+                self.assertEqual(wda.source.call_count, 3)
+                if driver:
+                    driver.choose.assert_called_once()
+
+    def test_final_completion_read_does_not_invent_success_or_replay_action(self):
+        original = tap_grant()
+        grant = replace(original, after=(Condition("app", "next.app"),))
+        success = grant.after + (replace(original.after[0], app="next.app"),)
+        spec = TaskSpec("Navigate and verify content", (grant,), success, limits=Limits(max_steps=1))
+        for readback, status, reason in (
+                (source(), "escalated", "step_limit"),
+                (WDAUnavailable("read failed"), "blocked", "observation_unavailable"),
+                (TaskStopped("deadline"), "blocked", "deadline_or_cancelled")):
+            with self.subTest(reason=reason):
+                ex, wda = executor([grant])
+                wda.active_app.side_effect = lambda: {"bundleId": "next.app" if wda.element_action.called else APP, "pid": 1}
+                wda.source.side_effect = [source(), source(), readback]
+                result = run_task(ex, spec)
+                self.assertEqual((result["status"], result["reason"]), (status, reason))
+                self.assertEqual(result["events"][0]["dispatch"], "acknowledged")
+                wda.element_action.assert_called_once_with("ref", "click")
+                self.assertEqual(wda.source.call_count, 3)
 
     def test_decision_only_is_non_mutating_and_step_limits_apply(self):
         grant = tap_grant()

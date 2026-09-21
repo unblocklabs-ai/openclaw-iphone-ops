@@ -75,7 +75,7 @@ ships the Python CLI, both agent skills, docs, and service snippets; there are
 no JavaScript/Python runtime dependencies or install-time scripts.
 
 ```sh
-npm install -g @unblocklabs/openclaw-iphone-ops@0.2.0
+npm install -g @unblocklabs/openclaw-iphone-ops@0.2.1
 openclaw-iphone --version
 openclaw-iphone --help
 openclaw-iphone devices list
@@ -104,7 +104,7 @@ installed package. npm installation does not establish live-device readiness.
 The [GitHub release](https://github.com/unblocklabs-ai/openclaw-iphone-ops/releases)
 also provides a Python wheel and source distribution. Install a downloaded
 wheel into a Python 3.11+ virtual environment with `python3 -m pip install
-/path/to/openclaw_iphone_ops-0.2.0-py3-none-any.whl`. The wheel contains only the
+/path/to/openclaw_iphone_ops-0.2.1-py3-none-any.whl`. The wheel contains only the
 Python CLI; the source distribution and npm package also include the skills,
 docs, and snippets. There is no automated PyPI or ClawHub publication.
 

@@ -116,6 +116,24 @@ verification. `StepResult` separates dispatch, verification and acknowledged
 compound substeps. Failed verification stops the executor; it never replays a
 successful tap or partially completed replacement. Inspect/replan explicitly.
 
+App-only waits use lock-state and two matching foreground bundle/PID reads, not
+the accessibility tree. Their returned `Observation` has `elements=None` and
+`secure=None`: screen contents and secure-field presence were **not observed**.
+It can verify app identity only; element conditions return `unknown`, direct
+element matching is rejected, and it cannot produce action offers or Jev input.
+Call `observe()` again for a full screen before targeting. Full observation and
+fresh target validation before dispatch remain unchanged. Mixed/element waits
+(including text readback) still acquire the full tree.
+
+If an action verifies only app identity but task completion needs element evidence,
+the task loop takes a full read-only observation under the remaining task budget,
+even after the final allowed action. It never repeats that action. App-only task
+completion does not incur this extra read.
+
+An `app` condition proves only which application is foreground, not that its UI
+has loaded or a deep link reached the intended page. Include an element or value
+condition when readiness, destination content or field state is required.
+
 Routine operations use accessibility only. No screenshot or raw source is
 automatically saved on failures, including private or secure screens. Explicit
 local CLI evidence capture remains available under the existing private-file
