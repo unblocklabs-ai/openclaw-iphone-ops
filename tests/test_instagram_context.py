@@ -45,7 +45,7 @@ class InstagramContextTests(unittest.TestCase):
           <XCUIElementTypeButton label="1380 likes" />
           <XCUIElementTypeStaticText label="18 comments" />
           <XCUIElementTypeStaticText label="#reel #teenpregnancy #microinfluencer" />
-          <XCUIElementTypeStaticText name="lifewithsavannahh" label="lifewithsavannahh" />
+          <XCUIElementTypeStaticText name="lifewithsavannahh" label="lifewithsavannahh" visible="true" y="29" />
           <XCUIElementTypeButton name="user-detail-header-followers" value="2.1 thousand followers" />
           <XCUIElementTypeButton name="user-detail-header-media-button" value="35 posts" />
           <XCUIElementTypeLink name="user-detail-header-info-label" label="TikTok:@.savspregnancydiary&#10;|| teen mama ||" />

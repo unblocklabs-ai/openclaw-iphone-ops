@@ -7,3 +7,5 @@ __pycache__/
 *.plist
 *.mobileprovision
 .env
+*.egg-info/
+dist/

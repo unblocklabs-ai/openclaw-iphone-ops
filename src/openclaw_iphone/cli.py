@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import json
+import math
 from pathlib import Path
 import sys
 
 from .config import IPhoneConfig, load_config
-from .devicectl import DeviceCtl
-from .evidence import artifact_path
+from .control_lock import control_lock
+from .devicectl import Device, DeviceCtl
+from .evidence import artifact_path, write_private
 from .errors import DeviceLocked, OpenClawIPhoneError, WDAUnavailable
 from .instagram_context import capture_instagram_context
 from .instagram_ops import DEFAULT_ANALYSIS_PROMPT, analyze_video, benchmark_discovery, benchmark_ranking_quality, discover_creators, triage_shortlist, verify_handles
@@ -25,13 +28,39 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     try:
-        return args.handler(args)
+        validate_numeric_args(args)
+        # Read-only observers and the long-lived runner do not hold this lock.
+        mutating = (
+            args.command == "watchdog"
+            or args.command == "instagram" and args.instagram_command not in {"capture-context", "analyze-video"}
+            or args.command == "apps" and args.apps_command in {"launch", "terminate"}
+            or args.command == "wda" and args.wda_command in {"unlock", "lock"}
+            or args.command == "ui" and args.ui_command in {"tap", "tap-text", "type", "clear-field", "drag", "press-button", "back", "scroll-until-text"}
+        )
+        with control_lock() if mutating else nullcontext():
+            return args.handler(args)
     except OpenClawIPhoneError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
-    except ValueError as exc:
+    except (ValueError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+
+
+def validate_numeric_args(args: argparse.Namespace) -> None:
+    for name, value in vars(args).items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"{name.replace('_', '-')} must be finite and non-negative.")
+        if ("timeout" in name or "deadline" in name or name in {"interval", "frequency"}) and value <= 0:
+            raise ValueError(f"{name.replace('_', '-')} must be positive.")
+
+
+def selected_device(args: argparse.Namespace, client: DeviceCtl, *, config: IPhoneConfig | None = None) -> Device:
+    if not hasattr(args, "_selected_device"):
+        args._selected_device = client.select_device(device_selector_from_args(args, config=config))
+    return args._selected_device
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -403,16 +432,16 @@ def wda_client_from_args(args: argparse.Namespace) -> WDAClient:
 
 def resolve_wda_url_from_args(args: argparse.Namespace) -> str:
     explicit = getattr(args, "url", None)
-    if explicit:
-        return explicit
     config = load_config()
     config_url = config.wda_url
-    if config_url:
-        return config_url
+    if (explicit or config_url) and not device_selector_from_args(args, config=config) and not hasattr(args, "_selected_device"):
+        return explicit or config_url
 
     client = client_from_args(args)
-    device = client.select_device(device_selector_from_args(args, config=config))
+    device = selected_device(args, client, config=config)
     url, _ = client.coredevice_wda_url(device.identifier, port=DEFAULT_WDA_PORT)
+    if (explicit or config_url) and (explicit or config_url).rstrip("/") != url:
+        raise ValueError("WDA URL override does not match the selected device's CoreDevice endpoint; remove the override.")
     return url
 
 
@@ -436,7 +465,7 @@ def handle_devices_list(args: argparse.Namespace) -> int:
 def handle_doctor(args: argparse.Namespace) -> int:
     try:
         client = client_from_args(args)
-        device = client.select_device(device_selector_from_args(args))
+        device = selected_device(args, client)
     except (OpenClawIPhoneError, ValueError) as exc:
         print("result: device-selection-failed")
         print(f"blocker: {exc}")
@@ -490,7 +519,7 @@ def handle_doctor(args: argparse.Namespace) -> int:
 
 def handle_apps_list(args: argparse.Namespace) -> int:
     client = client_from_args(args)
-    device = client.select_device(device_selector_from_args(args))
+    device = selected_device(args, client)
     apps, artifact = client.list_apps(device.identifier, include_all=not args.no_all)
     for app in apps:
         print(f"{app.name}\t{app.bundle_identifier}\t{app.version}\t{app.bundle_version}")
@@ -500,7 +529,7 @@ def handle_apps_list(args: argparse.Namespace) -> int:
 
 def handle_apps_find(args: argparse.Namespace) -> int:
     client = client_from_args(args)
-    device = client.select_device(device_selector_from_args(args))
+    device = selected_device(args, client)
     app = client.find_app(device.identifier, args.query)
     print(f"{app.name}\t{app.bundle_identifier}\t{app.version}\t{app.bundle_version}")
     return 0
@@ -508,7 +537,7 @@ def handle_apps_find(args: argparse.Namespace) -> int:
 
 def handle_apps_launch(args: argparse.Namespace) -> int:
     client = client_from_args(args)
-    device = client.select_device(device_selector_from_args(args))
+    device = selected_device(args, client)
     app = client.find_app(device.identifier, args.query)
     if not args.skip_lock_check:
         ensure_unlocked_or_attempt_wda(args, client, device.identifier)
@@ -519,9 +548,9 @@ def handle_apps_launch(args: argparse.Namespace) -> int:
 
 def handle_apps_terminate(args: argparse.Namespace) -> int:
     client = client_from_args(args)
-    device = client.select_device(device_selector_from_args(args))
+    device = selected_device(args, client)
     app = client.find_app(device.identifier, args.query)
-    client.terminate_app(device.identifier, app.bundle_identifier)
+    wda_client_from_args(args).terminate_app(app.bundle_identifier)
     print(f"terminated: {app.name} ({app.bundle_identifier}) on {device.name}")
     return 0
 
@@ -562,7 +591,7 @@ def handle_instagram_capture_context(args: argparse.Namespace) -> int:
 def handle_instagram_verify_handles(args: argparse.Namespace) -> int:
     if not args.no_launch:
         client = client_from_args(args)
-        device = client.select_device(device_selector_from_args(args))
+        device = selected_device(args, client)
         ensure_unlocked_or_attempt_wda(args, client, device.identifier)
         app = client.find_app(device.identifier, "Instagram")
         client.launch_app(device.identifier, app.bundle_identifier)
@@ -577,7 +606,7 @@ def handle_instagram_verify_handles(args: argparse.Namespace) -> int:
     print(f"manifest: {result.manifest}")
     for item in result.payload.get("handles", []):
         print(f"{item.get('handle')}: {item.get('status')}")
-    return 0
+    return 0 if result.payload.get("handles") and all(item.get("identity_verified") is True for item in result.payload["handles"]) else 1
 
 
 def handle_instagram_analyze_video(args: argparse.Namespace) -> int:
@@ -717,7 +746,7 @@ def handle_instagram_benchmark_ranking_quality(args: argparse.Namespace) -> int:
 
 def launch_instagram_for_foreground_work(args: argparse.Namespace) -> None:
     client = client_from_args(args)
-    device = client.select_device(device_selector_from_args(args))
+    device = selected_device(args, client)
     ensure_unlocked_or_attempt_wda(args, client, device.identifier)
     app = client.find_app(device.identifier, "Instagram")
     client.launch_app(device.identifier, app.bundle_identifier)
@@ -725,21 +754,20 @@ def launch_instagram_for_foreground_work(args: argparse.Namespace) -> None:
 
 def handle_wda_status(args: argparse.Namespace) -> int:
     status = wda_client_from_args(args).status()
-    artifact = Path(args.output) if args.output else artifact_path("wda-status", base=args.evidence_dir)
-    artifact.parent.mkdir(parents=True, exist_ok=True)
-    artifact.write_text(json.dumps(status.payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    artifact = Path(args.output).expanduser().absolute() if args.output else artifact_path("wda-status", base=args.evidence_dir)
+    write_private(artifact, json.dumps(status.payload, indent=2, sort_keys=True) + "\n")
 
     ready = "unknown" if status.ready is None else str(status.ready).lower()
     print(f"url: {status.url}")
     print("reachable: true")
     print(f"ready: {ready}")
     print(f"evidence: {artifact}")
-    return 0
+    return 0 if status.ready is True else 1
 
 
 def handle_wda_url(args: argparse.Namespace) -> int:
     client = client_from_args(args)
-    device = client.select_device(device_selector_from_args(args))
+    device = selected_device(args, client)
     url, artifact = client.coredevice_wda_url(device.identifier, port=args.port)
     print(f"url: {url}")
     print(f"device: {device.name} ({device.identifier})")
@@ -751,10 +779,13 @@ def handle_wda_locked(args: argparse.Namespace) -> int:
     locked = wda_client_from_args(args).locked()
     value = "unknown" if locked is None else str(locked).lower()
     print(f"locked: {value}")
-    return 0
+    return 0 if locked is not None else 1
 
 
 def handle_wda_unlock(args: argparse.Namespace) -> int:
+    if args.verify:
+        client = client_from_args(args)
+        device = selected_device(args, client)
     wda = wda_client_from_args(args)
     wda.unlock()
     print("unlock-attempted: true")
@@ -763,7 +794,7 @@ def handle_wda_unlock(args: argparse.Namespace) -> int:
         print(f"wda-locked: {str(locked).lower()}")
     if args.verify:
         client = client_from_args(args)
-        device = client.select_device(device_selector_from_args(args))
+        device = selected_device(args, client)
         data, artifact = client.lock_state(device.identifier)
         result = data.get("result", {})
         passcode_required = result.get("passcodeRequired") if isinstance(result, dict) else None
@@ -773,6 +804,12 @@ def handle_wda_unlock(args: argparse.Namespace) -> int:
         if passcode_required is True:
             print("result: human-unlock-required")
             return 1
+        if passcode_required is not False:
+            print("result: lock-state-unknown")
+            return 1
+    if locked is not False:
+        print("result: still-locked" if locked is True else "result: lock-state-unknown")
+        return 1
     print("result: ok")
     return 0
 
@@ -786,7 +823,7 @@ def handle_wda_lock(args: argparse.Namespace) -> int:
 def handle_watchdog_once(args: argparse.Namespace) -> int:
     try:
         client = client_from_args(args)
-        device = client.select_device(device_selector_from_args(args))
+        device = selected_device(args, client)
     except (OpenClawIPhoneError, ValueError) as exc:
         print("result: device-selection-failed")
         print(f"blocker: {exc}")
@@ -822,11 +859,26 @@ def handle_watchdog_once(args: argparse.Namespace) -> int:
         return 1
     print(f"wda-locked: {bool_value(locked)}")
     if locked is False:
+        if not args.no_verify:
+            try:
+                client.require_unlocked(device.identifier)
+            except (OpenClawIPhoneError, ValueError) as exc:
+                print("result: lock-state-conflict-or-unknown")
+                print(f"blocker: {exc}")
+                return 1
         print("result: ok")
         return 0
     if locked is None:
         print("result: lock-state-unknown")
         return 1
+
+    if not args.no_verify:
+        try:
+            client.require_unlocked(device.identifier)
+        except (OpenClawIPhoneError, ValueError) as exc:
+            print("result: human-unlock-required-or-unknown")
+            print(f"blocker: {exc}")
+            return 1
 
     try:
         wda.unlock()
@@ -865,9 +917,9 @@ def handle_watchdog_once(args: argparse.Namespace) -> int:
     if locked_after is False:
         print("result: unlocked")
         return 0
-    if locked_after is None and passcode_required is False:
-        print("result: verified-unlocked")
-        return 0
+    if locked_after is None:
+        print("result: lock-state-unknown")
+        return 1
     if locked_after is True and passcode_required is False:
         print("result: lock-state-conflict")
         return 1
@@ -885,7 +937,7 @@ def handle_wda_run(args: argparse.Namespace) -> int:
     development_team = args.development_team or config.get("OPENCLAW_IPHONE_DEVELOPMENT_TEAM")
     runner_bundle_id = args.runner_bundle_id or config.get("OPENCLAW_IPHONE_RUNNER_BUNDLE_ID")
     client = client_from_args(args)
-    device = client.select_device(device_selector_from_args(args, config=config))
+    device = selected_device(args, client, config=config)
     client.require_unlocked(device.identifier)
     print(f"device: {device.name} ({device.identifier})")
     print(f"wda path: {wda_path}")
@@ -907,14 +959,16 @@ def handle_wda_run(args: argparse.Namespace) -> int:
 
 
 def ensure_unlocked_or_attempt_wda(args: argparse.Namespace, client: DeviceCtl, device_id: str) -> None:
-    try:
-        client.require_unlocked(device_id)
-        return
-    except DeviceLocked:
-        pass
-
-    wda_client_from_args(args).unlock()
+    # passcodeRequired=false is not proof the screen is unlocked.
     client.require_unlocked(device_id)
+    wda = wda_client_from_args(args)
+    locked = wda.locked()
+    if locked is True:
+        wda.unlock()
+        client.require_unlocked(device_id)
+        locked = wda.locked()
+    if locked is not False:
+        raise DeviceLocked("Screen lock state is locked or unknown after one recovery attempt.")
 
 
 def passcode_required_from_lock_state(data: dict[str, object]) -> bool | None:

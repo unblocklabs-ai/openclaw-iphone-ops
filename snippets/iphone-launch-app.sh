@@ -11,17 +11,6 @@ if [ -z "${BUNDLE_ID:-}" ]; then
   exit 2
 fi
 
-tmpdir="${TMPDIR:-/tmp}/openclaw-iphone-ops"
-mkdir -p "$tmpdir"
-
-lock_json="$tmpdir/lock-state-before-launch.json"
-xcrun devicectl device info lockState \
-  --device "$DEVICE_ID" \
-  --json-output "$lock_json" >/dev/null
-
-echo "Checked lock state: $lock_json"
-echo "Launching $BUNDLE_ID on $DEVICE_ID..."
-
-xcrun devicectl device process launch \
-  --device "$DEVICE_ID" \
-  "$BUNDLE_ID"
+cd "$REPO_DIR"
+export PYTHONPATH="$REPO_DIR/src${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -m openclaw_iphone apps launch --device "$DEVICE_ID" "$BUNDLE_ID"

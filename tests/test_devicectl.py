@@ -116,6 +116,7 @@ class DeviceCtlJsonTests(unittest.TestCase):
                         identifier="coredevice-id",
                         state="connected",
                         udid="physical-udid",
+                        model="iPhone 15",
                     )
                 ],
                 Path("/tmp/devices.json"),

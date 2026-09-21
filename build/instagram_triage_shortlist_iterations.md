@@ -1,5 +1,9 @@
 # Instagram Triage Shortlist Iterations
 
+Historical pre-hardening observations, not current validation. Identity checks,
+evidence paths, and topical-evidence rules have since changed. Visible media is
+not proof of a recent post date; rerun before relying on these counts/timings.
+
 Goal: turn broad Instagram discovery into a fast triage-to-shortlist workflow:
 source-only triage finds at least 30 candidates in under 30 seconds, then only
 the top 10 ranked candidates are profile-verified in under 3 minutes, producing

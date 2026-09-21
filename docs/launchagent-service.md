@@ -109,9 +109,12 @@ launchctl kickstart -k "gui/$(id -u)/com.openclaw.iphone-wda-run"
 The watchdog interval defaults to 120 seconds. Override at install time with
 `OPENCLAW_IPHONE_WATCHDOG_INTERVAL=300 snippets/launchd/install-watchdog-launchagent.sh`.
 
-If multiple iPhones are connected, set `OPENCLAW_IPHONE_DEVICE` in
+For every unattended host, set `OPENCLAW_IPHONE_DEVICE` in
 `~/.openclaw/iphone/config.env`. The value can be the device name, CoreDevice
 identifier, or physical UDID accepted by the CLI.
+Prefer the physical UDID; names can change or collide. Both wrappers refuse to
+start without a selector. Installation preserves a custom config file's absolute
+path in the plist, so launchd does not silently switch to a different config.
 
 Set `OPENCLAW_IPHONE_DEVELOPMENT_TEAM` and
 `OPENCLAW_IPHONE_RUNNER_BUNDLE_ID` in the host config. These are host settings
@@ -152,6 +155,19 @@ launchctl kickstart -k "gui/$(id -u)/com.openclaw.iphone-watchdog"
 ```
 
 Restart the runner when signing, trust, Xcode state, or phone state changes.
+
+The runner replaces its Python process with `xcodebuild`, so launchd supervises
+the actual long-lived process. KeepAlive restarts exited processes, **not hung
+ones**. The watchdog checks readiness and lock state but does not restart WDA,
+repair trust/signing, unlock a passcode, or guarantee recovery after reboot.
+These are per-user GUI LaunchAgents: the user must be logged in. Provisioning
+and signing expiry still require operator attention.
+
+The installers pre-create owner-only logs and both plists set umask `077`.
+Existing logs are preserved and restricted, not erased. Configure host-local
+rotation/retention; neither logs nor evidence are automatically pruned. The
+watchdog and foreground CLI mutations use one per-user control lock; busy
+watchdog passes exit without device actions.
 
 ## Uninstall
 

@@ -62,10 +62,16 @@ For handle or creator verification, prefer project commands when they apply:
 
 ```bash
 PYTHONPATH=src python3 -m openclaw_iphone instagram verify-handles <handle>
-PYTHONPATH=src python3 -m openclaw_iphone instagram capture-context <handle>
+PYTHONPATH=src python3 -m openclaw_iphone instagram capture-context
 ```
 
 When using the UI directly, open only source-confirmed results and report what the current screen actually shows. Do not infer profile identity from an old screenshot or partial search text.
+
+`verify-handles` requires an unambiguous matching profile header; a reel or
+result tile is not profile verification. Identity mismatch/uncertainty is a
+nonzero result with evidence, not permission to type into guessed search or AI
+follow-up fields. Use returned private evidence paths; repeated captures never
+overwrite prior runs.
 
 ## Boundaries
 

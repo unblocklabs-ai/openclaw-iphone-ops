@@ -6,14 +6,6 @@ SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 REPO_DIR="$(resolve_openclaw_repo_dir "$SCRIPT_DIR")"
 DEVICE_ID="$(resolve_openclaw_device_id "$REPO_DIR")"
 
-tmpdir="${TMPDIR:-/tmp}/openclaw-iphone-ops"
-mkdir -p "$tmpdir"
-
-apps_json="$tmpdir/installed-apps.json"
-
-xcrun devicectl device info apps \
-  --device "$DEVICE_ID" \
-  --json-output "$apps_json"
-
-echo "Device: $DEVICE_ID"
-echo "Wrote installed-apps JSON: $apps_json"
+cd "$REPO_DIR"
+export PYTHONPATH="$REPO_DIR/src${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -m openclaw_iphone apps list --device "$DEVICE_ID"

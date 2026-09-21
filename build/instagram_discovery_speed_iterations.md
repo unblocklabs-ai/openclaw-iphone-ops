@@ -1,5 +1,9 @@
 # Instagram Discovery Speed Iterations
 
+Historical pre-hardening observations, not current validation. Identity checks,
+evidence paths, and topical-evidence rules have since changed. Visible media is
+not proof of a recent post date; rerun before relying on these counts/timings.
+
 Goal: reduce physical-iPhone Instagram creator discovery from the verified
 431.86 second benchmark toward 30 seconds while keeping correctness tests green.
 

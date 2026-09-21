@@ -1,0 +1,22 @@
+name: Tests
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  unit:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        python: ['3.11', '3.14']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: PYTHONPATH=src python3 -m unittest discover -s tests -v
+      - run: |
+          for script in snippets/*.sh snippets/launchd/*.sh; do sh -n "$script" || exit; done
+          python3 -m compileall -q src snippets/wda-app-store-install-example.py

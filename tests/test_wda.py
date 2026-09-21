@@ -6,7 +6,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from openclaw_iphone.errors import WDASetupError, WDAUnavailable
+from openclaw_iphone.errors import WDASetupError, WDAUnavailable, WDAUnsupportedCommand
 from openclaw_iphone.wda import WDAClient, WDARunConfig, build_xcodebuild_command, find_xcode_container, parse_ready
 
 
@@ -28,6 +28,9 @@ class RecordingWDAClient(WDAClient):
         self.posts: list[tuple[str, dict]] = []
         self.requests: list[tuple[str, str, dict | None]] = []
 
+    def locked(self) -> bool:
+        return False
+
     def _json_post(self, path: str, payload: dict) -> dict:
         self.posts.append((path, payload))
         if path == "/session":
@@ -47,9 +50,9 @@ class SelectiveFailingBackWDAClient(RecordingWDAClient):
 
     def _json_post(self, path: str, payload: dict) -> dict:
         if path == "/wda/back" and self.fail_wda_back:
-            raise WDAUnavailable("WDA POST /wda/back failed with HTTP 404")
+            raise WDAUnsupportedCommand("WDA POST /wda/back failed with HTTP 404")
         if path == "/session/session-123/back" and self.fail_session_back:
-            raise WDAUnavailable("WDA POST /session/session-123/back failed with HTTP 404")
+            raise WDAUnsupportedCommand("WDA POST /session/session-123/back failed with HTTP 404")
         return super()._json_post(path, payload)
 
 
@@ -67,7 +70,7 @@ class WDATests(unittest.TestCase):
         import unittest.mock
 
         client = WDAClient(url="http://wda.test", timeout=1)
-        with unittest.mock.patch("urllib.request.urlopen", side_effect=ConnectionResetError("reset")):
+        with unittest.mock.patch.object(client.opener, "open", side_effect=ConnectionResetError("reset")):
             with self.assertRaises(WDAUnavailable):
                 client.status()
 
@@ -204,38 +207,21 @@ class WDATests(unittest.TestCase):
         )
         self.assertEqual(client.requests, [("DELETE", "/session/session-123", None), ("DELETE", "/session/session-123", None)])
 
-    def test_clear_text_posts_repeated_backspace_actions(self) -> None:
+    def test_clear_text_clears_only_active_element(self) -> None:
+        from unittest.mock import Mock
         client = RecordingWDAClient()
-
-        client.clear_text(max_chars=2)
-
-        self.assertEqual(client.posts[0], ("/session", {"capabilities": {"alwaysMatch": {}, "firstMatch": [{}]}}))
-        self.assertEqual(
-            client.posts[1],
-            (
-                "/session/session-123/actions",
-                {
-                    "actions": [
-                        {
-                            "type": "key",
-                            "id": "keyboard1",
-                            "actions": [
-                                {"type": "keyDown", "value": "\ue003"},
-                                {"type": "keyUp", "value": "\ue003"},
-                            ],
-                        }
-                    ]
-                },
-            ),
-        )
-        self.assertEqual(len(client.requests), 2)
+        client._json_request = Mock(return_value={"value": {"ELEMENT": "field-1"}})
+        client.clear_text()
+        client._json_request.assert_called_once_with("/session/session-123/element/active")
+        self.assertEqual(client.posts[1], ("/session/session-123/element/field-1/clear", {}))
+        self.assertEqual(client.requests, [("DELETE", "/session/session-123", None)])
 
     def test_press_button_posts_name_and_duration(self) -> None:
         client = RecordingWDAClient()
 
         client.press_button("home", duration=0.2)
 
-        self.assertEqual(client.posts, [("/wda/pressButton", {"name": "home", "duration": 0.2})])
+        self.assertEqual(client.posts[1], ("/session/session-123/wda/pressButton", {"name": "home", "duration": 0.2}))
 
     def test_back_posts_wda_back(self) -> None:
         client = RecordingWDAClient()

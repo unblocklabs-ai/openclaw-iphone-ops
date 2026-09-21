@@ -2,7 +2,8 @@
 
 This repo documents a reusable lane for controlling a USB-connected physical iPhone from an OpenClaw/Codex agent host.
 
-It is intentionally local-only for now. It contains no secrets, no machine-specific credential values, and no workstation-specific paths.
+Runtime configuration and evidence stay local. Historical notes under `build/`
+contain old host paths and benchmark observations; they are not current validation.
 
 ## What This Enables
 
@@ -119,9 +120,10 @@ PYTHONPATH=src python3 -m openclaw_iphone ui clear-field "Search"
 PYTHONPATH=src python3 -m openclaw_iphone ui back
 ```
 
-`ui back` is best-effort across WDA builds. It tries WDA back routes first, then
-visible back/close/cancel/top-left controls. If none exist, it exits with a
-clean actionable error instead of a raw WDA 404.
+`ui back` falls back only when WDA explicitly reports an unsupported route.
+The fallback requires one visible enabled button named exactly `Back` or
+`Go Back`. It never guesses top-left, Close, or Cancel controls. Ambiguous
+transport failures stop the command; inspect fresh evidence before retrying.
 
 Raw WDA interaction primitives are still available when source labels are not
 usable:
@@ -178,8 +180,8 @@ counts, handles found, follower counts found, likely-under-10k counts, evidence
 counts, recency counts, elapsed time, UI steps, ambiguous screen counts, and
 artifact paths.
 
-For a fast source-only pass that skips profile deep-links and completes the
-three-scenario benchmark in about 30 seconds on the physical phone:
+For a source-only pass that skips profile deep-links (historical runs were
+about 30 seconds; current performance has not been revalidated):
 
 ```sh
 PYTHONPATH=src python3 -m openclaw_iphone instagram benchmark-discovery \
@@ -379,11 +381,14 @@ Check WebDriverAgent if it is already running:
 Run the App Store install example after WDA is already reachable:
 
 ```sh
-APP_NAME="Example App" \
+ALLOW_INSTALL=1 APP_NAME="Example App" \
 EXPECTED_PUBLISHER="Example Publisher" \
 EXPECTED_BUNDLE_ID="com.example.app" \
 python3 ./snippets/wda-app-store-install-example.py
 ```
+
+This template requires a supervised terminal confirmation before the install
+tap. It is not an unattended App Store or credential-handling workflow.
 
 ## Human Intervention Boundaries
 
@@ -400,7 +405,17 @@ Do not call the iPhone unavailable just because a first automation path fails. R
 
 ## Evidence
 
-Keep task-specific artifacts under a local temp/evidence directory. For repeatable work, capture only the proof needed:
+Each capture/workflow allocates a fresh private `openclaw-iphone-ops-*`
+subdirectory under the selected evidence base. Directories are mode `0700`;
+Python evidence files and subprocess-created evidence are owner-only (`0600`
+or a `077` umask). Explicit `--output` paths must not already exist; files and
+symlinks are never overwritten. Use the returned manifest paths, not predictable
+filenames. Prefixes cannot contain path separators.
+
+Existing evidence is **not** migrated, chmodded, or deleted. These protections
+are not encryption and do not hide content from the same OS user, root, backups,
+or an explicitly shared output directory. Review retention and log rotation on
+the host. For repeatable work, capture only the proof needed:
 
 - Live WDA proof when WDA is used
 - Exact target screen before risky taps, such as App Store install actions
@@ -408,6 +423,49 @@ Keep task-specific artifacts under a local temp/evidence directory. For repeatab
 - Fresh `devicectl` proof when installed-app state matters
 
 Do not share screenshots or local evidence paths into user-facing chat unless explicitly asked.
+
+## Unattended Safety And Limits
+
+- Set `OPENCLAW_IPHONE_DEVICE` to the dedicated physical UDID. LaunchAgent
+  wrappers require a selector; interactive auto-selection accepts only one
+  connected, identifiable iPhone, never a disconnected cached device.
+- CLI mutating workflows take a nonblocking per-user lock. The watchdog does
+  not interfere with an active CLI workflow. Direct Python/WDA clients must
+  coordinate their own access; read-only captures can observe transitions.
+- WDA mutations require an explicitly unlocked screen. `passcodeRequired:
+  false` alone does not prove that. Normal app launch now also requires WDA;
+  `--skip-lock-check` remains an explicit unsafe diagnostic bypass.
+- Successful actions stay successful if session deletion fails, with a cleanup
+  warning on stderr. A timeout/protocol failure may mean an action executed.
+  Never blindly retry taps or replay whole text; inspect the current screen.
+- Instagram verification requires the requested handle in an unambiguous
+  visible profile header. Mismatches/unknown identity are explicit and their
+  profile fields are not attributed to the requested account. Failed deep links
+  do not trigger guessed search/AI-field typing. `verify-handles` exits nonzero
+  when any identity is unconfirmed.
+- Creator research is heuristic. A search query/tag alone is no longer counted
+  as topical evidence about a creator. Existing `recency_signal` fields mean
+  visible media, **not a verified post date**; follower parsing is English-oriented
+  and rounded counts are not exact. Historical precision/yield must be rerun.
+- WDA URL overrides are debugging escape hatches. With a device selector they
+  must match its resolved CoreDevice endpoint. Without a selector, the endpoint
+  is operator-trusted and device identity is not checked. Proxies and HTTP
+  redirects are disabled. Never expose unauthenticated WDA to untrusted networks.
+- CoreDevice connectivity does not prove USB-only routing. Keep the dedicated
+  cable connected and disable wireless device connections in Xcode when USB-only
+  operation is required.
+- Workflow deadlines bound admission, sleeps, and WDA socket timeouts by the
+  remaining budget; they are not a hard real-time cancellation guarantee for
+  iOS/XCTest or a slow-streaming response. Some cleanup/evidence may be skipped
+  when the budget expires.
+- `apps terminate` uses WDA's bundle-targeted route and requires a running WDA.
+
+See [the hardening review](docs/hardening-review.md) for findings, validation,
+and remaining live-device limitations. Run the offline suite with:
+
+```sh
+PYTHONPATH=src python3 -m unittest discover -s tests -v
+```
 
 ## Files
 

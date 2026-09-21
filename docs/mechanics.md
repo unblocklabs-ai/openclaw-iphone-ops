@@ -44,7 +44,9 @@ Before trusting WDA:
 2. Check `/status` and require `ready: true`.
 3. Make one live call such as `/source`, `/screenshot`, or session creation.
 
-If WDA was already proven in the same run, reuse the warm session unless it goes stale.
+The current primitives create short-lived sessions. Session cleanup failures
+warn separately and do not change the action outcome. Do not replay actions
+because cleanup failed; inspect state after any ambiguous action failure.
 
 ## Lock State Rule
 
@@ -56,7 +58,7 @@ allows it.
 Example:
 
 ```sh
-xcrun devicectl device info lockState --device "$DEVICE_ID" --json-output "$TMPDIR/lock-state.json"
+./snippets/iphone-lock-state.sh
 ```
 
 If the phone is locked, try `openclaw-iphone wda unlock --verify` once. WDA
