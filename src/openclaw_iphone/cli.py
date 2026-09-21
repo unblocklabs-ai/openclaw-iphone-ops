@@ -6,6 +6,7 @@ import json
 import math
 from pathlib import Path
 import sys
+import time
 
 from . import __version__
 from .config import IPhoneConfig, load_config
@@ -403,7 +404,83 @@ def build_parser() -> argparse.ArgumentParser:
     add_wda_url_arg(ui_back)
     ui_back.set_defaults(handler=handle_ui_back)
 
+    task = subcommands.add_parser("task", help="Bounded app-independent workflows; optional Jev decisions.")
+    task_subcommands = task.add_subparsers(dest="task_command")
+    task_run = task_subcommands.add_parser("run", help="Run a trusted, strictly validated task file.")
+    add_device_arg(task_run)
+    task_run.add_argument("--file", type=Path, required=True)
+    task_run.add_argument("--driver", choices=("deterministic", "jev"), default="deterministic")
+    task_run.add_argument("--allow-cloud", action="store_true", help="Approve sending caller-written objective/aliases and minimal action availability to TypeSafe.")
+    task_run.add_argument("--decision-only", action="store_true", help="Observe/select once, without UI mutation (Jev still uses the cloud).")
+    task_run.add_argument("--min-confidence", type=float, default=0.6, help="Jev escalation threshold, not authorization or completion proof.")
+    task_run.add_argument("--json", action="store_true", help="Emit the result as JSON (also the default).")
+    task_run.set_defaults(handler=handle_task_run)
+    task_summary = task_subcommands.add_parser("summarize", help="Summarize saved task results offline; does not control a device.")
+    task_summary.add_argument("files", nargs="+", type=Path)
+    task_summary.set_defaults(handler=handle_task_summary)
+
     return parser
+
+
+def handle_task_run(args: argparse.Namespace) -> int:
+    # TaskConnection owns the same workflow lock; do not take it twice in main.
+    from .actions import Executor
+    from .connection import TaskConnection
+    from .jev import JevDriver
+    from .tasks import load_task, run_task
+
+    started = time.monotonic()
+    connection = None
+    try:
+        spec = load_task(args.file)
+        if args.driver == "jev" and not args.allow_cloud:
+            raise ValueError("Cloud approval is required.")
+        driver = JevDriver(timeout=args.timeout, min_confidence=args.min_confidence) if args.driver == "jev" else None
+        config = load_config()
+        if config.wda_url:
+            raise ValueError("Task mode requires a resolved CoreDevice endpoint, not a debug override.")
+        connection = TaskConnection(client_from_args(args), device=device_selector_from_args(args, config=config),
+                                    seconds=spec.limits.seconds)
+        connection.budget.deadline = started + spec.limits.seconds
+        with connection:
+            executor = Executor(connection, spec.grants, texts=spec.texts,
+                                freshness=spec.limits.freshness, verification_seconds=spec.limits.verification_seconds)
+            result = run_task(executor, spec, driver=driver, decision_only=args.decision_only)
+    except (ValueError, OSError):
+        result = {"status": "blocked", "reason": "invalid_task_or_configuration", "verification": "unknown"}
+    except OpenClawIPhoneError:
+        result = {"status": "blocked", "reason": "task_setup_unavailable", "verification": "unknown"}
+    except KeyboardInterrupt:
+        result = {"status": "escalated", "reason": "interrupted_outcome_unknown", "verification": "unknown"}
+    result["seconds"] = time.monotonic() - started
+    result["driver"] = args.driver
+    result["cleanup"] = "warning" if connection and connection.cleanup_failed else "completed" if connection else "not_started"
+    result["transport"] = connection.metrics.summary() if connection else None
+    try:
+        path = artifact_path("task-result", base=args.evidence_dir)
+        write_private(path, json.dumps(result, indent=2) + "\n")
+        result["evidence"] = str(path)
+    except OSError:
+        result["evidence_warning"] = "result_not_persisted_action_outcome_unchanged"
+    print(json.dumps(result, indent=2))
+    return 0 if result["status"] in {"completed", "decision_only"} else 1
+
+
+def handle_task_summary(args: argparse.Namespace) -> int:
+    from .benchmark import summarize
+    from .jev import strict_json
+    runs = []
+    for path in args.files:
+        with path.open("rb") as stream:
+            raw = stream.read(2_000_001)
+        if len(raw) > 2_000_000:
+            raise ValueError("Result file too large.")
+        run = strict_json(raw)
+        if not isinstance(run, dict):
+            raise ValueError("Result must be a JSON object.")
+        runs.append(run)
+    print(json.dumps(summarize(runs), indent=2))
+    return 0
 
 
 def add_device_arg(parser: argparse.ArgumentParser) -> None:

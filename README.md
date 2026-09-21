@@ -7,7 +7,9 @@ contain old host paths and benchmark observations; they are not current validati
 
 For app-independent Python workflows, see the experimental
 [task runtime](docs/task-runtime.md): task-scoped device/session ownership,
-bounded execution and opt-in bulk typing. Existing CLI recipes remain supported.
+snapshot-bound targeting, verified typing/waits, bounded execution and an
+optional Jev decision driver. Existing CLI recipes remain supported without a
+model key. App-specific knowledge remains in caller workflows/skills.
 
 ## What This Enables
 
@@ -73,7 +75,7 @@ ships the Python CLI, both agent skills, docs, and service snippets; there are
 no JavaScript/Python runtime dependencies or install-time scripts.
 
 ```sh
-npm install -g @unblocklabs/openclaw-iphone-ops@0.1.1
+npm install -g @unblocklabs/openclaw-iphone-ops@0.2.0
 openclaw-iphone --version
 openclaw-iphone --help
 openclaw-iphone devices list
@@ -102,7 +104,7 @@ installed package. npm installation does not establish live-device readiness.
 The [GitHub release](https://github.com/unblocklabs-ai/openclaw-iphone-ops/releases)
 also provides a Python wheel and source distribution. Install a downloaded
 wheel into a Python 3.11+ virtual environment with `python3 -m pip install
-/path/to/openclaw_iphone_ops-0.1.1-py3-none-any.whl`. The wheel contains only the
+/path/to/openclaw_iphone_ops-0.2.0-py3-none-any.whl`. The wheel contains only the
 Python CLI; the source distribution and npm package also include the skills,
 docs, and snippets. There is no automated PyPI or ClawHub publication.
 

@@ -160,17 +160,23 @@ class WDAClient:
         response: dict[str, Any] = {"value": None}
         for index, char in enumerate(text):
             try:
+                if index and frequency is not None and frequency > 0:
+                    interval = 1 / frequency
+                    if self.deadline is not None:
+                        remaining = self.deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise TaskStopped("Typing deadline expired.")
+                        interval = min(interval, remaining)
+                    if self.budget:
+                        self.budget.sleep(interval)
+                    else:
+                        time.sleep(interval)
                 response = self._perform_key_press(char)
             except (WDAUnavailable, DeviceLocked, TaskStopped) as exc:
                 raise WDAOutcomeUnknown(
                     f"Typing stopped after {index} confirmed characters; the next character may have been entered. "
                     "Inspect the field before retrying; do not replay the full text."
                 ) from exc
-            if frequency is not None and frequency > 0:
-                if self.budget:
-                    self.budget.sleep(1 / frequency)
-                else:
-                    time.sleep(1 / frequency)
         return response
 
     def type_text_bulk(self, text: str, *, frequency: int | None = None) -> dict[str, Any]:
@@ -200,6 +206,53 @@ class WDAClient:
         self.require_unlocked()
         with self.session() as session_id:
             return self._json_post(f"/session/{session_id}/wda/apps/activate", {"bundleId": bundle_id})
+
+    def find_elements(self, xpath: str) -> list[str]:
+        """Read-only query (WDA uses POST); no implicit retries."""
+        with self.session() as session_id:
+            value = self._json_post(f"/session/{session_id}/elements", {"using": "xpath", "value": xpath}).get("value")
+        if not isinstance(value, list):
+            raise WDAUnavailable("Invalid WDA element query response.")
+        return [element_identifier(item) for item in value]
+
+    def active_element(self) -> str:
+        with self.session() as session_id:
+            return element_identifier(self._json_request(f"/session/{session_id}/element/active").get("value"))
+
+    def element_hittable(self, element_id: str) -> bool:
+        with self.session() as session_id:
+            path = f"/session/{session_id}/element/{urllib.parse.quote(element_id, safe='')}/attribute/hittable"
+            return self._json_request(path).get("value") is True
+
+    def element_value(self, element_id: str) -> str:
+        """Explicit WDA value read: null means empty; a missing key is unknown.
+
+        Call only for an independently validated non-secure editable element.
+        WDA may return a placeholder instead of empty; do not erase that fact.
+        """
+        with self.session() as session_id:
+            path = f"/session/{session_id}/element/{urllib.parse.quote(element_id, safe='')}/attribute/value"
+            payload = self._json_request(path)
+        if "value" not in payload or payload["value"] is not None and not isinstance(payload["value"], str):
+            raise WDAUnavailable("Editable value is unavailable.")
+        return payload["value"] or ""
+
+    def element_scroll(self, element_id: str, direction: str) -> dict[str, Any]:
+        if direction not in {"up", "down"}:
+            raise ValueError("Unsupported scroll direction.")
+        self.require_unlocked()
+        with self.session() as session_id:
+            path = f"/session/{session_id}/wda/element/{urllib.parse.quote(element_id, safe='')}/scroll"
+            return self._json_post(path, {"direction": direction, "distance": 0.5})
+
+    def element_action(self, element_id: str, action: str, *, text: str = "") -> dict[str, Any]:
+        """Targeted click, clear or native append; callers own authorization."""
+        if action not in {"click", "clear", "value"}:
+            raise ValueError("Unsupported element action.")
+        self.require_unlocked()
+        with self.session() as session_id:
+            path = f"/session/{session_id}/element/{urllib.parse.quote(element_id, safe='')}/{action}"
+            return self._json_post(path, {"value": [text]} if action == "value" else {})
 
     def clear_text(self) -> dict[str, Any]:
         self.require_unlocked()
@@ -341,7 +394,7 @@ class WDAClient:
 
     def _request(self, path: str, *, method: str = "GET", payload: dict[str, Any] | None = None) -> bytes:
         timeout = self._request_timeout()
-        route = re.sub(r"/(session|element)/[^/]+", r"/\1/:id", path.split("?", 1)[0])
+        route = re.sub(r"/(session|element)/(?!active(?:/|$))[^/]+", r"/\1/:id", path.split("?", 1)[0])
         with self.metrics.measure(f"wda {method} {route}"):
             return self._send(path, method=method, payload=payload, timeout=timeout)
 
@@ -388,6 +441,13 @@ class WDAClient:
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
+
+
+def element_identifier(value: object) -> str:
+    identifier = (value.get("element-6066-11e4-a52e-4f735466cecf") or value.get("ELEMENT")) if isinstance(value, dict) else None
+    if not isinstance(identifier, str) or not identifier:
+        raise WDAUnavailable("No valid WDA element reference returned.")
+    return identifier
 
 
 def check_response(payload: dict[str, Any], path: str, *, mutating: bool = False) -> None:
