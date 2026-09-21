@@ -6,6 +6,7 @@ import math
 import subprocess
 
 from .errors import CommandFailed
+from .execution import Budget, Metrics
 
 
 @dataclass(frozen=True)
@@ -22,8 +23,19 @@ class Runner:
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("Command timeout must be finite and positive.")
         self.timeout = timeout
+        self.budget: Budget | None = None
+        self.metrics = Metrics()
 
     def run(self, command: list[str], *, timeout: int | None = None) -> CommandResult:
+        seconds = timeout or self.timeout
+        if self.budget is not None:
+            seconds = min(seconds, self.budget.remaining())
+        # Only fixed executable/subcommand names enter telemetry, never argv values.
+        operation = "devicectl" if command[:2] == ["xcrun", "devicectl"] else "subprocess"
+        with self.metrics.measure(operation):
+            return self._run(command, timeout=seconds)
+
+    def _run(self, command: list[str], *, timeout: float) -> CommandResult:
         env = os.environ.copy()
         env.update(self.env)
         try:

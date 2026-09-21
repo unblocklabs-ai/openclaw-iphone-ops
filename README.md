@@ -5,6 +5,10 @@ This repo documents a reusable lane for controlling a USB-connected physical iPh
 Runtime configuration and evidence stay local. Historical notes under `build/`
 contain old host paths and benchmark observations; they are not current validation.
 
+For app-independent Python workflows, see the experimental
+[task runtime](docs/task-runtime.md): task-scoped device/session ownership,
+bounded execution and opt-in bulk typing. Existing CLI recipes remain supported.
+
 ## What This Enables
 
 - Discovering a connected iPhone

@@ -188,7 +188,7 @@ class WDATests(unittest.TestCase):
             ),
         )
         self.assertEqual(
-            client.posts[3],
+            client.posts[2],
             (
                 "/session/session-123/actions",
                 {
@@ -205,7 +205,8 @@ class WDATests(unittest.TestCase):
                 },
             ),
         )
-        self.assertEqual(client.requests, [("DELETE", "/session/session-123", None), ("DELETE", "/session/session-123", None)])
+        self.assertEqual(len(client.posts), 3)
+        self.assertEqual(client.requests, [("DELETE", "/session/session-123", None)])
 
     def test_clear_text_clears_only_active_element(self) -> None:
         from unittest.mock import Mock
