@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import base64
 import hashlib
+import gzip
+import io
 import os
 from pathlib import Path
 import shutil
@@ -85,15 +87,40 @@ class DistributionTests(unittest.TestCase):
             tarball = Path(directory) / "package.tgz"
             tarball.write_bytes(b"tested archive")
             integrity = "sha512-" + base64.b64encode(hashlib.sha512(tarball.read_bytes()).digest()).decode()
-            for registry_integrity in (integrity, "sha512-different"):
-                with self.subTest(integrity=registry_integrity), mock.patch("scripts.publish_npm.subprocess.run") as run:
-                    run.return_value = subprocess.CompletedProcess([], 0, json.dumps(registry_integrity))
-                    if registry_integrity == integrity:
+            with mock.patch("scripts.publish_npm.subprocess.run") as run:
+                run.return_value = subprocess.CompletedProcess([], 0, json.dumps(integrity))
+                publish(tarball)
+                self.assertEqual(run.call_count, 1)
+
+    def test_publish_reuses_registry_bytes_only_for_identical_uncompressed_archive(self) -> None:
+        for content in (b"tested tar stream", b"changed tar stream"):
+            with self.subTest(content=content), tempfile.TemporaryDirectory() as directory:
+                tarball = Path(directory) / "package.tgz"
+                original = gzip.compress(b"tested tar stream", mtime=0)
+                published = gzip.compress(content, mtime=1)
+                tarball.write_bytes(original)
+                integrity = "sha512-" + base64.b64encode(hashlib.sha512(published).digest()).decode()
+                with mock.patch("scripts.publish_npm.subprocess.run") as run, mock.patch("scripts.publish_npm.urlopen", return_value=io.BytesIO(published)):
+                    run.return_value = subprocess.CompletedProcess([], 0, json.dumps(integrity))
+                    if content == b"tested tar stream":
                         publish(tarball)
+                        self.assertEqual(tarball.read_bytes(), published)
                     else:
                         with self.assertRaisesRegex(ValueError, "different contents"):
                             publish(tarball)
+                        self.assertEqual(tarball.read_bytes(), original)
                     self.assertEqual(run.call_count, 1)
+
+    def test_publish_rejects_unverified_download(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tarball = Path(directory) / "package.tgz"
+            tarball.write_bytes(b"original")
+            with mock.patch("scripts.publish_npm.subprocess.run") as run, mock.patch("scripts.publish_npm.urlopen", return_value=io.BytesIO(b"unverified")):
+                run.return_value = subprocess.CompletedProcess([], 0, json.dumps("sha512-wrong"))
+                with self.assertRaisesRegex(ValueError, "integrity verification"):
+                    publish(tarball)
+                self.assertEqual(tarball.read_bytes(), b"original")
+                self.assertEqual(run.call_count, 1)
 
     def test_publish_does_not_treat_registry_auth_failure_as_missing_package(self) -> None:
         for code in ("E404", "E401"):

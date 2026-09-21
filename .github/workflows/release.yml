@@ -50,6 +50,10 @@ jobs:
           cd "$RUNNER_TEMP"
           "$RUNNER_TEMP/iphone-wheel/bin/openclaw-iphone" --version
           "$RUNNER_TEMP/iphone-wheel/bin/openclaw-iphone" --help
+      - name: Publish tested tarball to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: python3 scripts/publish_npm.py dist/unblocklabs-openclaw-iphone-ops-*.tgz
       - name: Attach packages and checksums
         env:
           GH_TOKEN: ${{ github.token }}
@@ -57,7 +61,3 @@ jobs:
         run: |
           (cd dist && shasum -a 256 *.tgz *.whl *.tar.gz) > dist/SHA256SUMS
           gh release upload "$RELEASE_TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
-      - name: Publish tested tarball to npm
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: python3 scripts/publish_npm.py dist/unblocklabs-openclaw-iphone-ops-*.tgz

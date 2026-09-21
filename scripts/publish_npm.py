@@ -2,11 +2,17 @@
 from __future__ import annotations
 
 import base64
+import gzip
 import hashlib
 import json
 from pathlib import Path
 import subprocess
 import sys
+from urllib.request import urlopen
+
+
+def integrity(data: bytes) -> str:
+    return "sha512-" + base64.b64encode(hashlib.sha512(data).digest()).decode()
 
 
 def publish(tarball: Path) -> None:
@@ -21,9 +27,19 @@ def publish(tarball: Path) -> None:
     )
     metadata = json.loads(result.stdout)
     if result.returncode == 0:
-        integrity = "sha512-" + base64.b64encode(hashlib.sha512(tarball.read_bytes()).digest()).decode()
-        if metadata != integrity:
-            raise ValueError(f"{spec} already exists with different contents; do not overwrite or retag it.")
+        archive = tarball.read_bytes()
+        if metadata != integrity(archive):
+            # Node/zlib versions can produce different gzip bytes for the exact
+            # same tar stream. Keep npm's immutable bytes in the GitHub assets,
+            # but only after verifying both registry integrity and full content.
+            filename = f"{package['name'].split('/')[-1]}-{package['version']}.tgz"
+            with urlopen(f"{registry}{package['name']}/-/{filename}", timeout=30) as response:
+                published = response.read()
+            if integrity(published) != metadata:
+                raise ValueError("Published archive failed registry integrity verification.")
+            if gzip.decompress(published) != gzip.decompress(archive):
+                raise ValueError(f"{spec} already exists with different contents; do not overwrite or retag it.")
+            tarball.write_bytes(published)
         print(f"{spec} is already published with the identical tarball; no duplicate publish.")
         return
     if metadata.get("error", {}).get("code") != "E404":

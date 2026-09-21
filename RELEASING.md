@@ -29,9 +29,13 @@ An npm owner must bootstrap the package before enabling trusted publishing:
    publish cannot provide GitHub Actions provenance; do not claim it does.
 4. In the npm package Settings, configure a **GitHub Actions trusted publisher**:
    organization `unblocklabs-ai`, repository `openclaw-iphone-ops`, workflow
-   `release.yml`, no environment. Subsequent releases use OIDC and provenance.
+   `release.yml`, no environment, and enable **Allow npm publish** (the default
+   stage-only permission does not allow direct publication). Subsequent releases
+   use OIDC and provenance.
 5. Publish the matching GitHub Release. Its workflow verifies the bootstrap npm
-   archive is byte-identical instead of trying to republish an immutable version.
+   archive contains the identical tar stream instead of trying to republish an
+   immutable version. If registry metadata has not propagated yet, wait for
+   `npm view` to return the version before starting or rerunning the workflow.
 
 Alternatively, bootstrap from the release workflow using a short-lived granular
 npm token with publish rights to this package/scope and bypass-2FA permission,
@@ -90,9 +94,13 @@ Validate `SHA256SUMS` for downloaded assets. Keep package versions immutable.
 
 If publishing fails, inspect the failed step and fix authentication or runner
 infrastructure, then rerun that workflow. It replaces generated GitHub assets
-and skips npm publication **only when the existing version's integrity exactly
-matches the tested tarball**. Registry failures and content mismatches stop the
-job. Do not unpublish, move a released tag, or overwrite a different package to
+and skips npm publication **only after verifying the existing version's
+integrity and matching its full archive contents**. Registry failures and content mismatches stop the
+job. Node/zlib changes can alter gzip output without changing the tar stream;
+in that case the workflow verifies the downloaded registry archive's integrity,
+requires byte-identical decompressed tar data (including file metadata), and
+uses npm's original archive for GitHub assets/checksums. Do not unpublish, move a
+released tag, or overwrite a different package to
 force success; code changes require a new patch release.
 
 Release jobs have `id-token: write` for npm OIDC and `contents: write` for GitHub
