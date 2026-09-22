@@ -7,11 +7,12 @@ import json
 import math
 from pathlib import Path
 import time
-from typing import Any
+from typing import Any, Callable
 from xml.etree import ElementTree as ET
 
 from .evidence import artifact_path, write_private
 from .errors import WDAUnavailable, WDAUnsupportedCommand
+from .observations import xpath_literal
 from .wda import WDAClient
 
 
@@ -83,9 +84,17 @@ class UIController:
             if len(matches) != 1 or matches[0].center is None:
                 raise WDAUnavailable("Clear target must identify one visible, non-disabled editable field with a tappable frame.")
             element = matches[0]
-            x, y = element.center
-            self.tap(x, y)
-            time.sleep(0.2)
+            # Address the validated field directly. A fixed focus sleep never
+            # proved that clear_text() would clear this field rather than another.
+            checks = [f"@{key}={xpath_literal(value)}" for key, value in
+                      (("name", element.name), ("label", element.label)) if value]
+            checks += [f"@{key}={value}" for key, value in element.rect.items() if value is not None]
+            with self.client.session():
+                references = self.client.find_elements(f"//{element.type}[{' and '.join(checks)}]")
+                if len(references) != 1 or not self.client.element_hittable(references[0]):
+                    raise WDAUnavailable("Clear target changed or is no longer hittable.")
+                self.client.element_action(references[0], "clear")
+            return element
         self.client.clear_text()
         return element
 
@@ -163,6 +172,24 @@ class UIController:
                 raise WDAUnavailable(f"Timed out waiting for visible text: {query!r}")
             time.sleep(min(interval, max(0, deadline - time.monotonic())))
 
+    def wait_source(self, predicate: Callable[[str], bool], *, timeout: float) -> str:
+        """Read immediately, then poll only while needed; return the last read.
+
+        Timeout bounds polling, not an in-flight read (which keeps the client's
+        read timeout and task deadline). It does NOT prove the predicate.
+        Callers classify the evidence; transport failures propagate.
+        """
+        if not math.isfinite(timeout) or timeout < 0:
+            raise ValueError("Wait timeout must be finite and non-negative.")
+        deadline = time.monotonic() + timeout
+        while True:
+            source = self.client.source()
+            if predicate(source) or time.monotonic() >= deadline:
+                return source
+            time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+            if time.monotonic() >= deadline:
+                return source
+
     def scroll_until_text(
         self,
         query: str,
@@ -175,14 +202,16 @@ class UIController:
         end_y: float = 260,
         duration: float = 0.2,
     ) -> UIElement:
+        source = self.client.source()
         for attempt in range(max_scrolls + 1):
-            element = self.find_text(query, exact=exact)
+            element = find_element(parse_elements(source), query, exact=exact)
             if element is not None:
                 return element
             if attempt == max_scrolls:
                 break
             self.drag(start_x, start_y, end_x, end_y, duration=duration)
-            time.sleep(0.4)
+            previous = parse_elements(source)
+            source = self.wait_source(lambda current: parse_elements(current) != previous, timeout=1)
         raise WDAUnavailable(f"Could not find visible text after {max_scrolls} scrolls: {query!r}")
 
     def annotated_screenshot(self, output: str | None = None, *, visible_only: bool = True) -> tuple[Path, Path, Path]:

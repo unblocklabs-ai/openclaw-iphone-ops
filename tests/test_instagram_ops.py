@@ -22,7 +22,7 @@ PNG_BYTES = b"\x89PNG\r\n\x1a\nfake-png"
 
 class FakeWDA:
     def __init__(self, source: str) -> None:
-        self.source_text = source
+        self.source_text = source or "<XCUIElementTypeApplication/>"
         self.calls: list[tuple[str, tuple, dict]] = []
 
     def with_deadline(self, seconds):

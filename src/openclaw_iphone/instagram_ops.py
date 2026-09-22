@@ -10,7 +10,7 @@ import time
 from typing import Any
 from xml.etree import ElementTree as ET
 
-from .instagram_context import capture_instagram_context, visible_elements
+from .instagram_context import capture_instagram_context, parse_instagram_source, visible_elements
 from .evidence import evidence_dir, validate_prefix, write_private
 from .errors import CommandFailed
 from .runner import Runner
@@ -161,10 +161,11 @@ def verify_handles(
             deep_link = f"instagram://user?username={handle}"
             result["deep_link"] = deep_link
             handle_client.open_url(deep_link)
-            steps.sleep(2.0)
+            source = UIController(handle_client).wait_source(
+                lambda xml: context_matches_handle(parse_instagram_source(xml), handle), timeout=2)
 
             steps.take(result, "capture-deep-link")
-            linked = capture_instagram_context(handle_client, output_dir=str(base), prefix=f"{handle_prefix}-deep-link")
+            linked = capture_instagram_context(handle_client, output_dir=str(base), prefix=f"{handle_prefix}-deep-link", source_text=source)
             result["artifacts"]["deep_link_manifest"] = str(linked.manifest)
             record_profile_verification(result, linked.payload, handle)
         except Exception as exc:
@@ -301,8 +302,9 @@ def discover_creators(
             steps.take(payload, f"open-source-tag:{tag}")
             url = f"instagram://tag?name={tag}"
             payload["actions_taken"].append({"action": "open_url", "url": url})
+            previous = parse_instagram_source(client.source())["visible_videos"]
             client.open_url(url)
-            steps.sleep(source_open_wait_seconds)
+            source = controller.wait_source(lambda xml: changed_media(xml, previous), timeout=source_open_wait_seconds)
             for scroll_index in range(max_source_scrolls + 1):
                 if len(source_candidates) >= source_pool_size:
                     break
@@ -311,7 +313,7 @@ def discover_creators(
                     break
                 capture_prefix = f"{prefix}-source-{slugify(query)}-{tag}-{scroll_index}"
                 steps.take(payload, f"capture-source:{tag}:{scroll_index}")
-                capture = capture_instagram_context(client, output_dir=str(base), prefix=capture_prefix)
+                capture = capture_instagram_context(client, output_dir=str(base), prefix=capture_prefix, source_text=source)
                 handles = harvest_handles_from_capture(capture, query=query, tag=tag)
                 source_screen = {
                     "query": query,
@@ -345,7 +347,8 @@ def discover_creators(
                 steps.take(payload, f"scroll-source:{tag}:{scroll_index}")
                 payload["actions_taken"].append({"action": "drag", "purpose": "scroll_source_results"})
                 controller.drag(200, 735, 200, 260, duration=0.2)
-                steps.sleep(0.8)
+                previous = parse_instagram_source(source)["visible_videos"]
+                source = controller.wait_source(lambda xml: changed_media(xml, previous), timeout=0.8)
         except Exception as exc:
             errors.append({"stage": "source", "tag": tag, "error": str(exc)})
             try:
@@ -715,12 +718,11 @@ class StepBudget:
         self.used += 1
         result["steps"].append({"index": self.used, "name": name})
 
-    def sleep(self, seconds: float) -> None:
-        if not math.isfinite(seconds) or seconds < 0:
-            raise ValueError("Wait duration must be finite and non-negative.")
-        if self.deadline is not None:
-            seconds = min(seconds, max(0, self.deadline - time.monotonic()))
-        time.sleep(seconds)
+
+def changed_media(source: str, previous: list) -> bool:
+    """A changed clock/spinner is not evidence that new media is ready."""
+    videos = parse_instagram_source(source)["visible_videos"]
+    return bool(videos) and videos != previous
 
 
 def output_base(output_dir: str | None, *, prefix: str) -> Path:
@@ -865,14 +867,15 @@ def collect_source_triage_pool(
                 steps.take(state, f"open-source-tag:{tag}")
                 url = f"instagram://tag?name={tag}"
                 state["actions_taken"].append({"action": "open_url", "url": url})
+                previous = parse_instagram_source(client.source())["visible_videos"]
                 client.open_url(url)
-                steps.sleep(source_open_wait_seconds)
+                source = controller.wait_source(lambda xml: changed_media(xml, previous), timeout=source_open_wait_seconds)
                 for scroll_index in range(max_source_scrolls + 1):
                     if len(source_candidates) >= target_candidates:
                         break
                     capture_prefix = f"{prefix}-{state['index']}-{slugify(scenario)}-{tag}-{scroll_index}"
                     steps.take(state, f"capture-source:{tag}:{scroll_index}")
-                    capture = capture_instagram_context(client, output_dir=str(base), prefix=capture_prefix)
+                    capture = capture_instagram_context(client, output_dir=str(base), prefix=capture_prefix, source_text=source)
                     handles = harvest_handles_from_capture(capture, query=scenario, tag=tag)
                     source_screen = {
                         "query": scenario,
@@ -906,7 +909,8 @@ def collect_source_triage_pool(
                     steps.take(state, f"scroll-source:{tag}:{scroll_index}")
                     state["actions_taken"].append({"action": "drag", "purpose": "scroll_source_results"})
                     controller.drag(200, 735, 200, 260, duration=0.2)
-                    steps.sleep(0.8)
+                    previous = parse_instagram_source(source)["visible_videos"]
+                    source = controller.wait_source(lambda xml: changed_media(xml, previous), timeout=0.8)
             except Exception as exc:
                 state["errors"].append({"stage": "source", "tag": tag, "error": str(exc)})
         if len(source_candidates) >= target_candidates:
@@ -984,9 +988,9 @@ def verify_discovery_handle(
     try:
         steps.take(result, "open-profile-deep-link")
         client.open_url(result["deep_link"])
-        steps.sleep(2.0)
+        source = controller.wait_source(lambda xml: context_matches_handle(parse_instagram_source(xml), handle), timeout=2)
         steps.take(result, "capture-profile")
-        capture = capture_instagram_context(client, output_dir=str(base), prefix=f"{prefix}-{handle}-profile")
+        capture = capture_instagram_context(client, output_dir=str(base), prefix=f"{prefix}-{handle}-profile", source_text=source)
         result["artifacts"]["profile_manifest"] = str(capture.manifest)
         record_profile_verification(result, capture.payload, handle)
     except Exception as exc:

@@ -141,7 +141,7 @@ class WDATests(unittest.TestCase):
 
         self.assertEqual(client.posts[0], ("/session", {"capabilities": {"alwaysMatch": {}, "firstMatch": [{}]}}))
         self.assertEqual(
-            client.posts[1],
+            client.posts[2],
             (
                 "/session/session-123/actions",
                 {
@@ -170,7 +170,7 @@ class WDATests(unittest.TestCase):
 
         self.assertEqual(client.posts[0], ("/session", {"capabilities": {"alwaysMatch": {}, "firstMatch": [{}]}}))
         self.assertEqual(
-            client.posts[1],
+            client.posts[2],
             (
                 "/session/session-123/actions",
                 {
@@ -187,25 +187,9 @@ class WDATests(unittest.TestCase):
                 },
             ),
         )
-        self.assertEqual(
-            client.posts[2],
-            (
-                "/session/session-123/actions",
-                {
-                    "actions": [
-                        {
-                            "type": "key",
-                            "id": "keyboard1",
-                            "actions": [
-                                {"type": "keyDown", "value": "i"},
-                                {"type": "keyUp", "value": "i"},
-                            ],
-                        }
-                    ]
-                },
-            ),
-        )
-        self.assertEqual(len(client.posts), 3)
+        self.assertEqual(client.posts[3][1]["actions"][0]["actions"], [
+            {"type": "keyDown", "value": "i"}, {"type": "keyUp", "value": "i"}])
+        self.assertEqual(len(client.posts), 4)
         self.assertEqual(client.requests, [("DELETE", "/session/session-123", None)])
 
     def test_clear_text_clears_only_active_element(self) -> None:
@@ -214,7 +198,7 @@ class WDATests(unittest.TestCase):
         client._json_request = Mock(return_value={"value": {"ELEMENT": "field-1"}})
         client.clear_text()
         client._json_request.assert_called_once_with("/session/session-123/element/active")
-        self.assertEqual(client.posts[1], ("/session/session-123/element/field-1/clear", {}))
+        self.assertEqual(client.posts[2], ("/session/session-123/element/field-1/clear", {}))
         self.assertEqual(client.requests, [("DELETE", "/session/session-123", None)])
 
     def test_press_button_posts_name_and_duration(self) -> None:
@@ -222,7 +206,7 @@ class WDATests(unittest.TestCase):
 
         client.press_button("home", duration=0.2)
 
-        self.assertEqual(client.posts[1], ("/session/session-123/wda/pressButton", {"name": "home", "duration": 0.2}))
+        self.assertEqual(client.posts[2], ("/session/session-123/wda/pressButton", {"name": "home", "duration": 0.2}))
 
     def test_back_posts_wda_back(self) -> None:
         client = RecordingWDAClient()
@@ -240,6 +224,7 @@ class WDATests(unittest.TestCase):
             client.posts,
             [
                 ("/session", {"capabilities": {"alwaysMatch": {}, "firstMatch": [{}]}}),
+                ("/session/session-123/appium/settings", {"settings": {"waitForIdleTimeout": 0, "animationCoolOffTimeout": 0}}),
                 ("/session/session-123/back", {}),
             ],
         )
@@ -259,7 +244,7 @@ class WDATests(unittest.TestCase):
         client.open_url("instagram://user?username=creator")
 
         self.assertEqual(client.posts[0], ("/session", {"capabilities": {"alwaysMatch": {}, "firstMatch": [{}]}}))
-        self.assertEqual(client.posts[1], ("/session/session-123/url", {"url": "instagram://user?username=creator"}))
+        self.assertEqual(client.posts[2], ("/session/session-123/url", {"url": "instagram://user?username=creator"}))
         self.assertEqual(client.requests, [("DELETE", "/session/session-123", None)])
 
     def test_drag_posts_w3c_touch_action_and_deletes_session(self) -> None:
@@ -269,7 +254,7 @@ class WDATests(unittest.TestCase):
 
         self.assertEqual(client.posts[0], ("/session", {"capabilities": {"alwaysMatch": {}, "firstMatch": [{}]}}))
         self.assertEqual(
-            client.posts[1],
+            client.posts[2],
             (
                 "/session/session-123/actions",
                 (

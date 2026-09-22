@@ -63,7 +63,7 @@ def strict_json(text: str | bytes) -> object:
 
 class JevDriver:
     def __init__(self, *, api_key: str | None = None, timeout: float = 10,
-                 min_confidence: float = 0.6) -> None:
+                 min_confidence: float = 0.7) -> None:
         self._key = api_key if api_key is not None else os.environ.get("TYPESAFE_API_KEY", "")
         if not self._key or any(c.isspace() for c in self._key):
             raise DecisionUnavailable("A valid TYPESAFE_API_KEY is required for the Jev driver.")

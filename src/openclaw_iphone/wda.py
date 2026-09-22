@@ -154,35 +154,69 @@ class WDAClient:
         )
 
     def type_text(self, text: str, *, frequency: int | None = None) -> dict[str, Any]:
+        """Individual key events in one session, without per-key screen reads.
+
+        iOS can drop all but the first text event in a synthesized multi-key
+        batch. Keep separate requests for this explicit compatibility strategy;
+        use type_text_bulk for normal fields or tap_sequence for native keypads.
+        """
         if not text:
             return {"value": None}
-        # Preserve the existing key semantics, but own one session for the string.
+        if frequency is not None and (type(frequency) is not int or frequency <= 0):
+            raise ValueError("Typing frequency must be a positive integer.")
         self.require_unlocked()
-        with self.session():
-            return self._type_keys(text, frequency=frequency)
+        with self.session() as session_id:
+            response: dict[str, Any] = {"value": None}
+            last_sent = 0.0
+            for index, char in enumerate(text):
+                try:
+                    if index and index % 32 == 0:
+                        self.require_unlocked()
+                    if index and frequency:
+                        delay = max(0, 1 / frequency - (time.monotonic() - last_sent))
+                        delay = min(delay, self._request_timeout())
+                        if self.budget:
+                            self.budget.sleep(delay)
+                        elif delay:
+                            time.sleep(delay)
+                    last_sent = time.monotonic()
+                    response = self._json_post(f"/session/{session_id}/actions", {"actions": [{
+                        "type": "key", "id": "keyboard1", "actions": [
+                            {"type": "keyDown", "value": char}, {"type": "keyUp", "value": char},
+                        ],
+                    }]})
+                except (WDAUnavailable, DeviceLocked, TaskStopped) as exc:
+                    raise WDAOutcomeUnknown(
+                        f"Typing stopped after {index} acknowledged characters; the next may have been entered. "
+                        "Inspect the field before retrying; do not replay the full text."
+                    ) from exc
+            return response
 
-    def _type_keys(self, text: str, *, frequency: int | None = None) -> dict[str, Any]:
-        response: dict[str, Any] = {"value": None}
-        for index, char in enumerate(text):
-            try:
-                if index and frequency is not None and frequency > 0:
-                    interval = 1 / frequency
-                    if self.deadline is not None:
-                        remaining = self.deadline - time.monotonic()
-                        if remaining <= 0:
-                            raise TaskStopped("Typing deadline expired.")
-                        interval = min(interval, remaining)
-                    if self.budget:
-                        self.budget.sleep(interval)
-                    else:
-                        time.sleep(interval)
-                response = self._perform_key_press(char)
-            except (WDAUnavailable, DeviceLocked, TaskStopped) as exc:
-                raise WDAOutcomeUnknown(
-                    f"Typing stopped after {index} confirmed characters; the next character may have been entered. "
-                    "Inspect the field before retrying; do not replay the full text."
-                ) from exc
-        return response
+    def tap_sequence(self, points: list[tuple[float, float]]) -> dict[str, Any]:
+        """One bounded keypad gesture; caller validates current layout/focus.
+
+        This is not a multi-screen macro. No observation or retry between keys;
+        the caller must verify the final value or destination.
+        """
+        if not 1 <= len(points) <= 32 or any(
+            len(point) != 2 or any(type(v) not in (int, float) or not math.isfinite(v) or v < 0 for v in point)
+            for point in points
+        ):
+            raise ValueError("Tap sequence requires 1–32 finite nonnegative point pairs.")
+        sources = []
+        for index, (x, y) in enumerate(points):
+            # One touch path per press. Reusing a lifted path makes some WDA
+            # versions synthesize an extra implicit touch at the next move.
+            actions = [{"type": "pause", "duration": index * 125}] if index else []
+            actions.extend([
+                {"type": "pointerMove", "duration": 0, "x": x, "y": y},
+                {"type": "pointerDown", "button": 0},
+                {"type": "pause", "duration": 50},
+                {"type": "pointerUp", "button": 0},
+            ])
+            sources.append({"type": "pointer", "id": f"key{index}",
+                            "parameters": {"pointerType": "touch"}, "actions": actions})
+        return self._perform_session_actions(sources)
 
     def type_text_bulk(self, text: str, *, frequency: int | None = None) -> dict[str, Any]:
         """Append to the focused field. No automatic fallback or replay on failure.
@@ -229,6 +263,14 @@ class WDAClient:
             path = f"/session/{session_id}/element/{urllib.parse.quote(element_id, safe='')}/attribute/hittable"
             return self._json_request(path).get("value") is True
 
+    def window_size(self) -> tuple[float, float]:
+        with self.session() as session_id:
+            value = self._json_request(f"/session/{session_id}/window/size").get("value")
+        if (not isinstance(value, dict) or any(type(value.get(k)) not in (int, float)
+                or not math.isfinite(value[k]) or value[k] <= 0 for k in ("width", "height"))):
+            raise WDAUnavailable("Device window geometry is unavailable.")
+        return value["width"], value["height"]
+
     def element_value(self, element_id: str, *, allow_null_empty: bool = True) -> str:
         """Explicit WDA value read: null means empty; a missing key is unknown.
 
@@ -245,6 +287,13 @@ class WDAClient:
         if payload["value"] is None and not allow_null_empty:
             raise WDAUnavailable("Custom field must expose an explicit string value.")
         return payload["value"] or ""
+
+    def element_placeholder(self, element_id: str) -> str | None:
+        """WDA's value may be placeholder text after a successful native clear."""
+        with self.session() as session_id:
+            path = f"/session/{session_id}/element/{urllib.parse.quote(element_id, safe='')}/attribute/placeholderValue"
+            value = self._json_request(path).get("value")
+        return value if isinstance(value, str) and value else None
 
     def element_scroll(self, element_id: str, direction: str) -> dict[str, Any]:
         if direction not in {"up", "down"}:
@@ -273,23 +322,12 @@ class WDAClient:
                 raise WDAUnavailable("No active editable element was identified; focus the intended field first.")
             return self._json_post(f"/session/{session_id}/element/{element_id}/clear", {})
 
-    def _perform_key_press(self, value: str) -> dict[str, Any]:
-        return self._perform_session_actions(
-            [
-                {
-                    "type": "key",
-                    "id": "keyboard1",
-                    "actions": [
-                        {"type": "keyDown", "value": value},
-                        {"type": "keyUp", "value": value},
-                    ],
-                }
-            ]
-        )
-
     def _perform_session_actions(self, actions: list[dict[str, Any]]) -> dict[str, Any]:
         self.require_unlocked()
         with self.session() as session_id:
+            duration = max(sum(item.get("duration", 0) for item in source["actions"]) for source in actions) / 1000
+            if duration >= self._request_timeout():
+                raise TaskStopped("Input sequence cannot fit the remaining request deadline; not dispatched.")
             return self._json_post(f"/session/{session_id}/actions", {"actions": actions})
 
     @contextmanager
@@ -301,6 +339,12 @@ class WDAClient:
         self._session.identifier = session_id
         self._session.cleanup_failed = False
         try:
+            # XCTest's global idle heuristics can wait 10s before AND after
+            # each click in animated apps. Callers own explicit readiness and
+            # postconditions; do not also wait for the entire app to be idle.
+            self._json_post(f"/session/{session_id}/appium/settings", {"settings": {
+                "waitForIdleTimeout": 0, "animationCoolOffTimeout": 0,
+            }})
             yield session_id
         finally:
             self._session.identifier = None
@@ -340,6 +384,7 @@ class WDAClient:
             return self._json_post(f"/session/{session_id}/url", {"url": url})
 
     def terminate_app(self, bundle_id: str) -> dict[str, Any]:
+        self.require_unlocked()
         with self.session() as session_id:
             return self._json_post(f"/session/{session_id}/wda/apps/terminate", {"bundleId": bundle_id})
 

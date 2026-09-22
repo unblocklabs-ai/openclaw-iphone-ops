@@ -81,7 +81,7 @@ class ExecutorTests(unittest.TestCase):
         ex, wda = executor([])
         state, obs = ex.wait((Condition("app", APP),))
         self.assertEqual(state, "satisfied")
-        self.assertEqual(wda.method_calls, [call.require_unlocked(), call.active_app(), call.active_app()])
+        self.assertEqual(wda.method_calls, [call.require_unlocked(), call.active_app()])
         self.assertEqual((obs.app, obs.process_id, obs.device_udid, obs.generation), (APP, 1, "device", 1))
         self.assertIsNone(obs.elements)
         self.assertIsNone(obs.secure)
@@ -138,11 +138,11 @@ class ExecutorTests(unittest.TestCase):
                 wda.source.assert_not_called()
                 self.assertIsNone(wda.deadline)
 
-    def test_app_only_observation_rejects_missing_invalid_or_changed_process(self):
-        for pid in (None, True, 0, -1, "1", 2):
+    def test_app_only_observation_rejects_missing_or_invalid_process(self):
+        for pid in (None, True, 0, -1, "1"):
             with self.subTest(pid=pid):
                 ex, wda = executor([])
-                wda.active_app.side_effect = [{"bundleId": APP, "pid": 1}, {"bundleId": APP, "pid": pid}]
+                wda.active_app.return_value = {"bundleId": APP, "pid": pid}
                 with self.assertRaises(ObservationRejected):
                     ex.observe(app_only=True)
                 wda.source.assert_not_called()

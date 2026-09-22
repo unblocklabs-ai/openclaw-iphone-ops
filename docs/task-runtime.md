@@ -137,20 +137,24 @@ treated as empty. Chunking and automatic unsupported-route fallback are not enab
 deliberately selected input strategy, **not** a retry on bulk failure. Target a
 named non-secure editable field, or a custom `XCUIElementTypeOther` field that
 actually exposes focus and a readable string value. Before the first key, a
-fresh value-endpoint read must explicitly equal `""`; `null`, placeholders,
-missing attributes and empty OCR output are insufficient. It does not clear.
+fresh value-endpoint read must equal `""` (native editable fields also accept
+WDA's explicit `null`; custom fields do not). Placeholders, missing attributes
+and empty OCR output are insufficient. It does not clear.
 If existing content must be reset, do so only in a separately authorized,
 verified workflow; generic custom-field clearing is not implemented.
 
-Every key requires fresh app/PID, field identity, focus, exact prefix and one
-visible/hittable `XCUIElementTypeKey` with the exact digit name or label under
-an accessibility Keyboard. No coordinate/digit inference is used. Each click
-gets bounded prefix verification before the next digit. A missing/duplicate
-key, focus/app change, dropped key, failed read or uncertain write stops input;
-no continuation, fallback, automatic submit or replay occurs. Partial results
-report only acknowledgement counts, never the digits. Completion still needs
-the caller's independent success conditions. Fields that auto-submit before
-final readback may remain unverified even if the app progressed.
+The whole input uses one fresh app/PID, field/focus check and native keyboard
+layout. Every requested digit must resolve to one visible enabled key in that
+same keyboard. The observed key centers become separately timed touches in
+**one WDA request**, not six screen reads and native clicks. Coordinates are
+derived locally from accessibility, never guessed by the model.
+
+Verify the full value afterward, or an explicit `after` destination for fields
+that auto-submit. Acknowledgement counts describe requests, not confirmed
+characters. A failed/partial batch is never replayed. The batch cannot be
+interrupted between digits; use it only for a stable keypad, not a multi-screen
+macro. Session setup disables XCTest global-idle/animation waits; readiness
+and completion belong to explicit predicates. See [input benchmarks](input-performance.md).
 
 Value predicates on custom `Other` fields always use a separate strict-string
 value read, never treat WDA `null` as empty. These are assertions about the
@@ -165,7 +169,7 @@ verification. `StepResult` separates dispatch, verification and acknowledged
 compound substeps. Failed verification stops the executor; it never replays a
 successful tap or partially completed replacement. Inspect/replan explicitly.
 
-App-only waits use lock-state and two matching foreground bundle/PID reads, not
+App-only waits use lock-state and one foreground bundle/PID read, not
 the accessibility tree. Their returned `Observation` has `elements=None` and
 `secure=None`: screen contents and secure-field presence were **not observed**.
 It can verify app identity only; element conditions return `unknown`, direct
@@ -252,7 +256,8 @@ openclaw-iphone task run --file /private/task.json --driver jev --allow-cloud --
 openclaw-iphone task run --file /private/task.json --driver jev --allow-cloud
 ```
 
-`--min-confidence` defaults to 0.6 (uncalibrated conservative escalation policy).
+`--min-confidence` defaults to 0.7 (an exploratory starting point, not calibrated
+probability of safe execution or task completion).
 Changing it does not relax target validation, grants or verification. Evaluate
 held-out decision cases before changing it for autonomous use. The `done`
 choice runs the independent verifier; it cannot declare success. `wait` polls

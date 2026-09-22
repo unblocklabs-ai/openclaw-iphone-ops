@@ -420,13 +420,16 @@ def build_parser() -> argparse.ArgumentParser:
     task_run.add_argument("--driver", choices=("deterministic", "jev"), default="deterministic")
     task_run.add_argument("--allow-cloud", action="store_true", help="Approve sending caller-written objective/aliases and minimal action availability to TypeSafe.")
     task_run.add_argument("--decision-only", action="store_true", help="Observe/select once, without UI mutation (Jev still uses the cloud).")
-    task_run.add_argument("--min-confidence", type=float, default=0.6, help="Jev escalation threshold, not authorization or completion proof.")
+    task_run.add_argument("--min-confidence", type=float, default=0.7, help="Jev escalation threshold, not authorization or completion proof.")
     task_run.add_argument("--json", action="store_true", help="Emit the result as JSON (also the default).")
     task_run.set_defaults(handler=handle_task_run)
     task_session = task_subcommands.add_parser("session", help="Keep one bounded task/session open for a planner over stdin/stdout JSON lines.")
     add_device_arg(task_session)
     task_session.add_argument("--file", type=Path, required=True, help="Trusted grants/text/success conditions; same schema as task run.")
-    task_session.add_argument("--include-labels", action="store_true", help="Opt into local private UI labels; no cloud calls are made by this interface.")
+    task_session.add_argument("--include-labels", action="store_true", help="Opt into local private UI labels, not cloud disclosure.")
+    task_session.add_argument("--driver", choices=("deterministic", "jev"), default="deterministic")
+    task_session.add_argument("--allow-cloud", action="store_true", help="Approve adaptive instructions and explicit cloud_labels to TypeSafe.")
+    task_session.add_argument("--min-confidence", type=float, default=0.7)
     task_session.set_defaults(handler=handle_task_session)
     task_summary = task_subcommands.add_parser("summarize", help="Summarize saved task results offline; does not control a device.")
     task_summary.add_argument("files", nargs="+", type=Path)
@@ -482,27 +485,34 @@ def handle_task_run(args: argparse.Namespace) -> int:
 def handle_task_session(args: argparse.Namespace) -> int:
     from .actions import Executor
     from .connection import TaskConnection
-    from .execution import TaskStopped
+    from .execution import Budget, TaskStopped
+    from .jev import JevDriver
     from .planner import PlannerSession, json_line_emitter, read_requests, serve
     from .tasks import load_task
 
     started = time.monotonic()
     connection = None
     output_failed = False
-    emit = None
+    # Setup failures must be visible even before TaskConnection is entered.
+    emit = json_line_emitter(sys.stdout, Budget.seconds(5))
+    driver = None
     try:
         spec = load_task(args.file)
+        if args.driver == "jev" and (not args.allow_cloud or spec.adaptive is None):
+            raise ValueError("Adaptive task and cloud approval are required for session Jev.")
+        driver = JevDriver(timeout=args.timeout, min_confidence=args.min_confidence) if args.driver == "jev" else None
         config = load_config()
         if config.wda_url:
             raise ValueError("Planner sessions require a resolved CoreDevice endpoint.")
         connection = TaskConnection(client_from_args(args), device=device_selector_from_args(args, config=config),
                                     seconds=spec.limits.seconds, read_timeout=args.read_timeout)
         connection.budget.deadline = started + spec.limits.seconds
+        emit = json_line_emitter(sys.stdout, connection.budget)
         with connection:
-            emit = json_line_emitter(sys.stdout, connection.budget)
             executor = Executor(connection, spec.grants, texts=spec.texts, freshness=spec.limits.freshness,
                                 verification_seconds=spec.limits.verification_seconds)
-            session = PlannerSession(executor, spec, include_labels=args.include_labels)
+            session = PlannerSession(executor, spec, include_labels=args.include_labels,
+                                     driver=driver, evidence_base=args.evidence_dir)
             emit({"status": "ready", "protocol": 1, "seconds_remaining": connection.budget.remaining()})
             code = serve(session, read_requests(sys.stdin.fileno(), connection.budget), emit)
     except SessionOutputUnavailable:
@@ -533,7 +543,8 @@ def handle_task_session(args: argparse.Namespace) -> int:
         try:
             emit({"status": "session_end", "seconds": time.monotonic() - started,
                   "cleanup": "warning" if connection and connection.cleanup_failed else "completed" if connection else "not_started",
-                  "transport": connection.metrics.summary() if connection else None})
+                  "transport": connection.metrics.summary() if connection else None,
+                  "model": driver.summary() if driver else None})
         except SessionOutputUnavailable:
             pass
     return code

@@ -160,21 +160,21 @@ class KeypadTests(unittest.TestCase):
         wda.find_elements.side_effect = lambda xpath: ["key1" if "@name='1'" in xpath else "key2" if "@name='2'" in xpath else "field"]
         wda.active_element.return_value = "field"
         wda.element_value.side_effect = lambda *args, **kwargs: state["value"]
-        wda.element_action.side_effect = lambda ref, action: state.update(value=state["value"] + ref[-1])
+        wda.tap_sequence.side_effect = lambda points: state.update(value="12")
         return ex, wda, state
 
-    def test_verifies_each_prefix_and_custom_values_locally(self):
+    def test_batches_keys_and_verifies_final_value_locally(self):
         for custom in (False, True):
             ex, wda, state = self.make(custom=custom)
             offer, = ex.offers(ex.observe())
             result = ex.execute(offer.id)
-            self.assertEqual((result.dispatch, result.verification, result.acknowledged_substeps), ("acknowledged", "satisfied", 2))
+            self.assertEqual((result.dispatch, result.verification, result.acknowledged_substeps), ("acknowledged", "satisfied", 1))
             self.assertEqual(state["value"], "12")
-            self.assertEqual(wda.element_action.call_count, 2)
-            # Initial observation, pre-dispatch validation, then one prefix
-            # observation per key. No duplicate between-key/final read.
-            self.assertEqual(wda.source.call_count, 4)
-            wda.element_value.assert_any_call("field", allow_null_empty=False)
+            wda.tap_sequence.assert_called_once_with([(15.0, 615.0), (55.0, 615.0)])
+            wda.element_action.assert_not_called()
+            # Initial observation, pre-dispatch validation, final readback.
+            self.assertEqual(wda.source.call_count, 3)
+            wda.element_value.assert_any_call("field", allow_null_empty=not custom)
             self.assertEqual(ex.execute(offer.id).dispatch, "not_sent")
 
     def test_unreadable_nonempty_wrong_focus_or_missing_key_never_types(self):
@@ -191,24 +191,25 @@ class KeypadTests(unittest.TestCase):
                 wda.source.side_effect = lambda: source().replace("XCUIElementTypeTextField", "XCUIElementTypeOther")
             self.assertEqual(ex.execute(offer.id).dispatch, "not_sent")
             wda.element_action.assert_not_called()
+            wda.tap_sequence.assert_not_called()
 
     def test_dropped_key_or_unknown_outcome_stops_without_fallback_or_replay(self):
         for kind in ("dropped", "unknown", "readback"):
             ex, wda, state = self.make(custom=True)
             offer, = ex.offers(ex.observe())
             if kind == "dropped":
-                wda.element_action.side_effect = None
+                wda.tap_sequence.side_effect = None
             elif kind == "unknown":
-                wda.element_action.side_effect = WDAOutcomeUnknown("PRIVATE")
+                wda.tap_sequence.side_effect = WDAOutcomeUnknown("PRIVATE")
             else:
                 def click(*args):
                     wda.source.side_effect = WDAUnavailable("PRIVATE")
-                wda.element_action.side_effect = click
+                wda.tap_sequence.side_effect = click
             result = ex.execute(offer.id)
             self.assertNotEqual(result.verification, "satisfied")
             self.assertTrue(ex.stopped)
             self.assertEqual(ex.execute(offer.id).dispatch, "not_sent")
-            self.assertEqual(wda.element_action.call_count, 1)
+            self.assertEqual(wda.tap_sequence.call_count, 1)
             wda.type_text_bulk.assert_not_called()
             self.assertNotIn("PRIVATE", repr(result))
 
@@ -222,28 +223,39 @@ class KeypadTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 executor([Grant("keypad", APP, "Digits", FIELD, text_id="x")], texts={"x": text})
 
-    def test_focus_change_and_duplicate_keys_stop_before_another_key(self):
+    def test_auto_submit_verifies_destination_without_requiring_disappeared_field(self):
+        ex, wda, state = self.make()
+        ex.grants = (replace(ex.grants[0], after=(Condition("exists", APP, BUTTON),)),)
+        wda.source.side_effect = lambda: source(button_label="Waiting", extra=(
+            '<XCUIElementTypeKeyboard visible="true">' + ''.join(
+                f'<XCUIElementTypeKey name="{d}" visible="true" enabled="true" x="{i * 40}" y="600" width="30" height="30"/>'
+                for i, d in enumerate("12")) + '</XCUIElementTypeKeyboard>'))
+        def submit(points):
+            wda.source.side_effect = None
+            wda.source.return_value = source().replace('XCUIElementTypeTextField', 'XCUIElementTypeOther')
+        wda.tap_sequence.side_effect = submit
+        offer, = ex.offers(ex.observe())
+        result = ex.execute(offer.id)
+        self.assertEqual(result.verification, "satisfied")
+        wda.tap_sequence.assert_called_once()
+
+    def test_focus_change_duplicate_keys_secure_or_foreign_app_stop_before_batch(self):
         for kind in ("focus", "duplicate", "secure", "app"):
             ex, wda, state = self.make(custom=True)
             offer, = ex.offers(ex.observe())
-            original_click = wda.element_action.side_effect
             original_source = wda.source.side_effect
-            def click(ref, action):
-                original_click(ref, action)
-                if kind == "focus":
-                    wda.active_element.return_value = "different"
-                elif kind in {"duplicate", "secure"}:
-                    extra = ('<XCUIElementTypeKeyboard><XCUIElementTypeKey name="2" visible="true" enabled="true" x="5" y="600" width="30" height="30"/></XCUIElementTypeKeyboard>'
-                             if kind == "duplicate" else '<XCUIElementTypeSecureTextField/>')
-                    wda.source.side_effect = lambda: original_source().replace('</XCUIElementTypeApplication>', extra + '</XCUIElementTypeApplication>')
-                else:
-                    wda.active_app.return_value = {"bundleId": "different.app", "pid": 2}
-            wda.element_action.side_effect = click
+            if kind == "focus":
+                wda.active_element.return_value = "different"
+            elif kind in {"duplicate", "secure"}:
+                extra = ('<XCUIElementTypeKeyboard><XCUIElementTypeKey name="2" visible="true" enabled="true" x="5" y="600" width="30" height="30"/></XCUIElementTypeKeyboard>'
+                         if kind == "duplicate" else '<XCUIElementTypeSecureTextField/>')
+                wda.source.side_effect = lambda: original_source().replace('</XCUIElementTypeApplication>', extra + '</XCUIElementTypeApplication>')
+            else:
+                wda.active_app.return_value = {"bundleId": "different.app", "pid": 2}
             result = ex.execute(offer.id)
-            self.assertEqual(result.dispatch, "acknowledged")
+            self.assertEqual(result.dispatch, "not_sent")
             self.assertNotEqual(result.verification, "satisfied")
-            self.assertEqual(result.acknowledged_substeps, 1)
-            self.assertEqual(wda.element_action.call_count, 1)
+            wda.tap_sequence.assert_not_called()
 
 
 class PlannerTests(unittest.TestCase):
@@ -419,6 +431,7 @@ class SessionIntegrationTests(unittest.TestCase):
         wda = WDAClient(url="http://wda.test")
         wda._create_session = Mock(return_value="one")
         wda._delete_session = Mock(side_effect=WDAOutcomeUnknown("cleanup transport failed"))
+        wda._json_post = Mock(return_value={"value": None})
         with self.assertRaises(WDAOutcomeUnknown) as action:
             with wda.session():
                 raise WDAOutcomeUnknown("action transport failed")
@@ -443,7 +456,7 @@ class SessionIntegrationTests(unittest.TestCase):
                         pass
             sessions = sum(c.args[0] == "/session" for c in wda._send.call_args_list)
             counts.append((ctl.select_device.call_count, sessions, wda._send.call_count))
-        self.assertEqual(counts, [(3, 3, 24), (1, 1, 16)])
+        self.assertEqual(counts, [(3, 3, 27), (1, 1, 17)])
 
     def test_cli_protocol_exit_and_cleanup_warning_preserve_completion(self):
         ctl, wda = self.transport()

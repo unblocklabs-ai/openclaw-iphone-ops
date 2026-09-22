@@ -30,6 +30,7 @@ class TaskSpec:
     success: tuple[Condition, ...] = field(repr=False)
     texts: dict[str, str] = field(default_factory=dict, repr=False)
     limits: Limits = field(default_factory=Limits)
+    adaptive: dict | None = field(default=None, repr=False)
 
 
 def object_fields(value: object, allowed: set[str], required: set[str]) -> dict:
@@ -66,7 +67,7 @@ def conditions(value: object) -> tuple[Condition, ...]:
 
 
 def parse_task(data: object) -> TaskSpec:
-    data = object_fields(data, {"version", "objective", "grants", "success", "texts", "limits"},
+    data = object_fields(data, {"version", "objective", "grants", "success", "texts", "limits", "adaptive"},
                          {"version", "objective", "grants", "success"})
     if type(data["version"]) is not int or data["version"] != 1:
         raise ValueError("Only task schema version 1 is supported.")
@@ -103,7 +104,11 @@ def parse_task(data: object) -> TaskSpec:
         valid_type = type(value) is int if key.startswith("max_") else type(value) in (float, int)
         if not valid_type or not 0 < value <= maximum or not math.isfinite(value):
             raise ValueError("Invalid task limit.")
-    return TaskSpec(text(data["objective"], maximum=1024), tuple(grants), success, texts, Limits(**limits))
+    adaptive = None
+    if "adaptive" in data:
+        from .adaptive import parse_scope
+        adaptive = parse_scope(data["adaptive"])
+    return TaskSpec(text(data["objective"], maximum=1024), tuple(grants), success, texts, Limits(**limits), adaptive)
 
 
 def load_task(path: Path) -> TaskSpec:

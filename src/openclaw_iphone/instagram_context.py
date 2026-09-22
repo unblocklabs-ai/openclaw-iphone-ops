@@ -24,6 +24,7 @@ def capture_instagram_context(
     *,
     output_dir: str | None = None,
     prefix: str = "instagram-context",
+    source_text: str | None = None,
 ) -> InstagramContextCapture:
     validate_prefix(prefix)
     base = evidence_dir(output_dir)
@@ -32,7 +33,8 @@ def capture_instagram_context(
     manifest = base / f"{prefix}.json"
 
     write_private(screenshot, client.screenshot())
-    source_text = client.source()
+    if source_text is None:
+        source_text = client.source()
     write_private(source, source_text)
 
     payload = parse_instagram_source(source_text)

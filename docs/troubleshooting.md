@@ -117,13 +117,17 @@ Do not infer that input failed just because its screenshot/source failed.
 `ui type` and low-level bulk typing have no exact final-value guarantee. Use
 runtime `replace` for authorized whole-field entry, or `append` on a verified
 empty field. `keypad` is an explicit digits-only strategy with fresh focus,
-field identity, accessible-key and per-prefix checks; see
+field identity and accessible-key checks, followed by one bounded input batch
+and final-value or destination verification; see
 [task-runtime.md](task-runtime.md#explicit-keypad-input).
 
 The runtime does not automatically reset or retry a partially entered custom
 code. A fixed number of Delete taps plus empty OCR output is not reliable
 empty-field verification. If the field cannot expose a trustworthy value/focus,
-or secure fields are present, stop for a separately authorized local workflow.
+use the explicitly authorized adaptive screenshot-confirmation workflow in
+[planner-session.md](planner-session.md#same-session-vision-and-custom-keypad),
+or stop when the empty/focused state cannot be established. Fixed-grant sessions
+still reject secure screens.
 Never send authentication screenshots/codes to Jev or place them in CLI args.
 
 ## WDA Build Succeeds But Test Does Not Stay Running
