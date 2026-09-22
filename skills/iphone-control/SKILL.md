@@ -17,6 +17,7 @@ Do not edit an npm-managed installation; upgrades replace its files.
 | Known reliable workflow | Existing deterministic recipe/deep link with destination verification |
 | Bounded multi-step task with one eligible action at each step | `task run --file TASK.json --driver deterministic` |
 | Planner needs to choose each step | **One** `task session --file TASK.json` process; retain its process handle across JSON-line requests |
+| Unfamiliar controls/auth forms (experimental, v0.4.0+) | Opt-in `adaptive` task scope; session `act`, local input references and same-session `screenshot`/`vision_tap`; read planner-session docs first |
 | Inspect an unfamiliar screen | `ui observe`; add `--include-labels` only when local private labels are appropriate |
 | Wait for a known condition | Runtime `wait()`/session `wait`; one-shot `ui wait-text` for manual work |
 | Diagnose the control lane | `doctor --check-ui`, not repeated status/source/screenshot commands |
@@ -39,9 +40,16 @@ caller workflows/app skills. Core control remains app-independent.
   Snapshot action IDs expire; element list positions are not durable targets.
 - Prefer `replace` for explicitly authorized whole-field entry: it verifies
   clear, then input. `append` requires a freshly verified **empty** field.
-- `keypad` is an explicitly chosen digits-only strategy, not an automatic bulk
-  retry. It requires accessible keys, readable empty/prefix values and verified
-  focus. Secure/unreadable custom fields remain unsupported. See runtime docs.
+- Fixed-grant `keypad` requires accessible keys, a readable empty value
+  and verified focus. Adaptive Act also supports a trusted caller's fresh
+  screenshot confirmation for an empty/focused custom code field, with a
+  destination postcondition. Neither is an automatic retry of failed bulk input.
+  Keypad input is one batch from the current keyboard layout, then one final
+  verification—not an observe/click/wait cycle per digit. No mid-batch decisions.
+- Adaptive `input` reads approved local private-file references, not inline
+  credentials. Prefer native input; explicitly choose `strategy: sequential`
+  for forms that drop bulk characters. Acknowledged mismatch permits explicit
+  same-readable-field clear-and-replace; unknown input still stops the session.
 - `ui type`/low-level bulk input insert at the current caret; they do not verify
   the final text. Never put credentials/codes into command arguments, logs or
   cloud prompts. Do not equate “OCR found no digits” with an empty field.
@@ -58,10 +66,14 @@ contain private data; keep them local unless disclosure is separately approved.
 Save visual evidence only at meaningful checkpoints/failures. Missing or
 unlabeled controls require explicit planner/vision fallback, not Jev guessing.
 
-Jev is optional: `task run --driver jev --allow-cloud`, with `TYPESAFE_API_KEY`
-securely available in the process. It receives reviewed objective/action aliases,
-not raw labels, supplied input or screenshots. Use `--decision-only` for initial
-calibration. Low confidence is an escalation, not an API outage.
+Jev is optional, with `TYPESAFE_API_KEY` securely available in the process.
+`task run --driver jev --allow-cloud` sends reviewed objective/action aliases;
+use `--decision-only` for an initial read-only decision. Adaptive `task session`
+can additionally send explicitly approved `cloud_labels` and their observed
+role/ancestor/bounds context. It never sends supplied input or screenshots.
+The default threshold is 0.7, not proof of correctness. Low confidence routes
+to planner/vision fallback; it is not an API outage or a reason to rebuild the
+session. Routine observations remain accessibility-only.
 
 For disconnected/locked devices, stalled reads or service failures, read
 [troubleshooting.md](../../docs/troubleshooting.md). Exact UDID/CoreDevice pins

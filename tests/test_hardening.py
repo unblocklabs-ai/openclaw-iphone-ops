@@ -79,7 +79,11 @@ class ActionSafetyTests(unittest.TestCase):
         client.locked = Mock(return_value=False)
         client._create_session = Mock(return_value="one")
         client._delete_session = Mock(side_effect=WDAUnavailable("cleanup") if cleanup_error else None)
-        client._json_post = Mock(return_value={"value": None}, side_effect=action_error)
+        def post(path, payload):
+            if action_error and not path.endswith("/appium/settings"):
+                raise action_error
+            return {"value": None}
+        client._json_post = Mock(side_effect=post)
         return client
 
     def test_cleanup_cannot_mask_success_or_primary_error(self):
@@ -94,10 +98,10 @@ class ActionSafetyTests(unittest.TestCase):
 
     def test_session_back_cleanup_does_not_trigger_ui_fallback(self):
         client = self.client()
-        client._json_post.side_effect = [WDAUnsupportedCommand("unsupported"), {"value": None}]
+        client._json_post.side_effect = [WDAUnsupportedCommand("unsupported"), {"value": None}, {"value": None}]
         with self.assertLogs("openclaw_iphone.wda", level="WARNING"):
             UIController(client).back()
-        self.assertEqual(client._json_post.call_count, 2)
+        self.assertEqual(client._json_post.call_count, 3)
 
     def test_ambiguous_back_failure_never_retries_or_taps(self):
         client = self.client(action_error=WDAOutcomeUnknown("timeout"))
@@ -340,7 +344,8 @@ class ProtocolAndSnippetTests(unittest.TestCase):
                             release_cleanup.set()
                             server.shutdown()
                             thread.join()
-                    self.assertEqual(requests, [("GET", "/wda/locked"), ("POST", "/session"), ("POST", "/session/one/actions"), ("DELETE", "/session/one")])
+                    self.assertEqual(requests, [("GET", "/wda/locked"), ("POST", "/session"),
+                        ("POST", "/session/one/appium/settings"), ("POST", "/session/one/actions"), ("DELETE", "/session/one")])
 
     def test_app_store_requires_authorization_before_device_access(self):
         path = Path(__file__).resolve().parents[1] / "snippets/wda-app-store-install-example.py"

@@ -11,7 +11,7 @@ from urllib.parse import urlsplit
 from .connection import TaskConnection
 from .errors import OpenClawIPhoneError, WDAOutcomeUnknown, WDAUnavailable
 from .observations import (EDITABLE, SCROLLABLE, TAPPABLE, Element, Observation,
-                           ObservationRejected, Selector, parse_observation)
+                           ObservationRejected, Selector, keypad_points, parse_observation)
 
 
 @dataclass(frozen=True)
@@ -145,7 +145,7 @@ class Executor:
             wda.require_unlocked()
             before = wda.active_app()
             source = None if app_only else wda.source()
-            after = wda.active_app()
+            after = before if app_only else wda.active_app()
         except OpenClawIPhoneError:
             self.connection.invalidate()
             self._offers.clear()
@@ -209,13 +209,21 @@ class Executor:
     def verify(self, observation: Observation, conditions: tuple[Condition, ...]) -> str:
         if not conditions:
             return "unknown"
-        states = [self.evaluate(observation, c) for c in conditions]
-        return "unsatisfied" if "unsatisfied" in states else "unknown" if "unknown" in states else "satisfied"
+        state = "satisfied"
+        for condition in conditions:
+            current = self.evaluate(observation, condition)
+            if current == "unsatisfied":
+                return current
+            if current == "unknown":
+                state = current
+        return state
 
     def wait(self, conditions: tuple[Condition, ...], *, seconds: float | None = None) -> tuple[str, Observation]:
         duration = self.verification_seconds if seconds is None else seconds
         if not math.isfinite(duration) or duration <= 0:
             raise ValueError("Wait timeout must be finite and positive.")
+        if not conditions:
+            return "unknown", self.observe()
         end = min(time.monotonic() + duration, self.connection.budget.deadline)
         wda = self.connection.require_active()
         previous = wda.deadline
@@ -302,7 +310,8 @@ class Executor:
 
     def _guard_app(self, app: str, process_id: int | None) -> None:
         wda = self.connection.require_active()
-        wda.require_unlocked()
+        # Observations and each transport mutation check lock state. This guard
+        # only closes the foreground-identity gap immediately before dispatch.
         active = wda.active_app()
         if active["bundleId"] != app or active.get("pid") != process_id:
             raise ObservationRejected("Foreground app changed before dispatch.")
@@ -345,46 +354,20 @@ class Executor:
             conditions = grant.after
             self._uses[offer.grant_index] += 1
             if operation == "keypad":
-                # Deliberate input strategy, never an automatic retry after bulk
-                # typing. Re-read field and key identity for every digit.
                 supplied = self.texts[grant.text_id]
-                initial_target = target
-                for index, digit in enumerate(supplied):
-                    # The preceding prefix wait already returned a fresh full
-                    # snapshot; reuse it rather than taking a duplicate read.
-                    self._check_snapshot(current)
-                    target = current.unique(grant.target)
-                    if (current.secure is not False or current.app != grant.app
-                            or current.process_id != original.process_id or target is None
-                            or not target.actionable or (target.name, target.label) != (initial_target.name, initial_target.label)
-                            or target.path != initial_target.path
-                            or target.bounds != initial_target.bounds or target.ancestors != initial_target.ancestors):
-                        raise ObservationRejected("Keypad field identity changed; input stopped.")
-                    reference = self._reference(target)
-                    self._guard_app(grant.app, current.process_id)
-                    if (wda.active_element() != reference
-                            or wda.element_value(reference, allow_null_empty=False) != supplied[:index]):
-                        raise ObservationRejected("Keypad requires verified focus and exact prefix (empty before first key).")
-                    keys = [e for e in current.elements if e.role == "XCUIElementTypeKey"
-                            and (e.name == digit or e.label == digit) and e.visible is True
-                            and any(role == "XCUIElementTypeKeyboard" for role, _, _ in e.ancestors)]
-                    if len(keys) != 1 or not keys[0].actionable:
-                        raise ObservationRejected("No unique accessible keyboard key; no coordinate fallback.")
-                    key_ref = self._reference(keys[0])
-                    self._guard_app(grant.app, current.process_id)
-                    if time.monotonic() - current.started > self.freshness:
-                        raise ObservationRejected("Keypad observation expired before dispatch.")
-                    dispatching = True
-                    wda.element_action(key_ref, "click")
-                    acknowledged += 1
-                    dispatching = False
-                    state, current = self.wait((Condition("value", grant.app, grant.target, supplied[:index + 1]),))
-                    if state != "satisfied":
-                        self.stopped = True
-                        return StepResult("acknowledged", state, "keypad_prefix_not_verified", current, acknowledged)
-                if not conditions:
-                    return StepResult("acknowledged", "satisfied", "verified", current, acknowledged)
-                conditions = (Condition("value", grant.app, grant.target, supplied),) + conditions
+                if (wda.active_element() != reference
+                        or wda.element_value(reference, allow_null_empty=target.role in EDITABLE) != ""):
+                    raise ObservationRejected("Keypad requires verified focus and an empty field.")
+                points = keypad_points(current, supplied)
+                self._check_snapshot(current)
+                self._guard_app(grant.app, current.process_id)
+                dispatching = True
+                wda.tap_sequence(points)
+                acknowledged += 1
+                dispatching = False
+                # Auto-submit may replace the field. Verify an explicit
+                # destination if supplied, otherwise verify the complete value.
+                conditions = conditions or (Condition("value", grant.app, grant.target, supplied),)
             elif operation in {"append", "replace", "clear"}:
                 if wda.active_element() != reference:
                     raise ObservationRejected("Intended editable field is not focused.")

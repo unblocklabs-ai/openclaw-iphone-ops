@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from contextlib import nullcontext
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -34,6 +35,18 @@ class FakeClient:
 
     def clear_text(self) -> None:
         self.calls.append(("clear_text", (), {}))
+
+    def session(self):
+        return nullcontext("session")
+
+    def find_elements(self, xpath):
+        return ["field"]
+
+    def element_hittable(self, reference):
+        return True
+
+    def element_action(self, reference, action):
+        self.calls.append(("element_action", (reference, action), {}))
 
     def press_button(self, name: str, *, duration: float | None = None) -> None:
         self.calls.append(("press_button", (name,), {"duration": duration}))
@@ -111,7 +124,7 @@ class UITests(unittest.TestCase):
         self.assertIsNone(element)
         self.assertEqual(client.calls, [("clear_text", (), {})])
 
-    def test_clear_field_taps_target_then_clears_active_field(self) -> None:
+    def test_clear_field_addresses_the_validated_field_directly(self) -> None:
         source = """<XCUIElementTypeApplication>
           <XCUIElementTypeTextView name="Search field" label="Search field" visible="true" x="10" y="20" width="100" height="40" />
           <XCUIElementTypeButton name="Clear" label="Clear" visible="true" x="120" y="20" width="80" height="40" />
@@ -121,7 +134,7 @@ class UITests(unittest.TestCase):
         element = UIController(client).clear_field("Search field", exact=True)  # type: ignore[arg-type]
 
         self.assertEqual(element.name, "Search field")
-        self.assertEqual(client.calls, [("tap", (60.0, 40.0), {}), ("clear_text", (), {})])
+        self.assertEqual(client.calls, [("element_action", ("field", "clear"), {})])
 
     def test_clear_field_refuses_invalid_or_ambiguous_editable_targets(self) -> None:
         field = '<XCUIElementTypeTextField name="Search" visible="true" enabled="true" x="10" y="20" width="100" height="40" />'
@@ -139,7 +152,7 @@ class UITests(unittest.TestCase):
                     UIController(client).clear_field("Search", exact=True)
                 self.assertEqual(client.calls, [])
 
-    def test_clear_field_taps_the_validated_target_without_requerying(self) -> None:
+    def test_clear_field_does_not_repeat_the_full_screen_read(self) -> None:
         field = '<XCUIElementTypeTextView name="Search" visible="true" enabled="true" x="10" y="20" width="100" height="40" />'
         button = '<XCUIElementTypeButton name="Search" visible="true" enabled="true" x="200" y="400" width="100" height="40" />'
         client = FakeClient()
@@ -150,7 +163,7 @@ class UITests(unittest.TestCase):
 
         self.assertEqual(element.type, "XCUIElementTypeTextView")
         client.source.assert_called_once()
-        self.assertEqual(client.calls, [("tap", (60.0, 40.0), {}), ("clear_text", (), {})])
+        self.assertEqual(client.calls, [("element_action", ("field", "clear"), {})])
 
     def test_press_button_delegates_to_client(self) -> None:
         client = FakeClient()

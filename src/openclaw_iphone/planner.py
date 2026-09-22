@@ -16,31 +16,59 @@ from .tasks import TaskSpec, object_fields
 
 
 class PlannerSession:
-    def __init__(self, executor: Executor, spec: TaskSpec, *, include_labels: bool = False) -> None:
+    def __init__(self, executor: Executor, spec: TaskSpec, *, include_labels: bool = False,
+                 driver=None, evidence_base: str | None = None) -> None:
         self.executor, self.spec = executor, spec
         self.include_labels = include_labels
         self.requests = 0
         self.steps = 0
         self.closed = False
+        self.adaptive = None
+        if spec.adaptive is not None:
+            from .adaptive import AdaptiveAct
+            self.adaptive = AdaptiveAct(executor, spec.adaptive, driver=driver,
+                                        max_decisions=spec.limits.max_decisions, evidence_base=evidence_base)
 
     def view(self, observation: Observation) -> dict[str, object]:
         offers = self.executor.offers(observation)
-        view = observation.compact(include_labels=self.include_labels)
+        view = (self.adaptive.view(observation, labels=self.include_labels) if self.adaptive
+                else observation.compact(include_labels=self.include_labels))
         view["actions"] = [{"id": o.id, "snapshot_id": o.snapshot_id, "target_id": o.target_id,
                             "operation": self.spec.grants[o.grant_index].operation,
                             "description": self.spec.grants[o.grant_index].description} for o in offers]
         view["action_blockers"] = list(self.executor.offer_blockers)
+        if self.adaptive:
+            view["fixed_grant_blockers"] = view.pop("action_blockers")
+            view["adaptive_operations"] = [] if self.executor.stopped else list(self.adaptive.scope["operations"])
         view["input_stopped"] = self.executor.stopped
         return view
 
     def request(self, data: object) -> dict[str, object]:
-        """No raw commands, input text, selectors, or new grants on this channel."""
+        """Fixed grants by default; adaptive intent requires explicit task opt-in."""
         if self.closed:
             raise TaskStopped("Planner session is closed.")
         self.executor.connection.budget.remaining()
         self.requests += 1
         if self.requests > 4 * self.spec.limits.max_steps + 8:
             raise TaskStopped("Planner request limit reached.")
+        if isinstance(data, dict) and data.get("op") in ("act", "screenshot", "vision_tap", "reconcile"):
+            if self.adaptive is None:
+                raise ValueError("Adaptive requests require task opt-in.")
+            if data["op"] in ("act", "vision_tap"):
+                if self.steps >= self.spec.limits.max_steps:
+                    raise TaskStopped("Planner action limit reached.")
+                self.steps += 1
+            if data["op"] == "act":
+                result = self.adaptive.act(data)
+            elif data["op"] == "vision_tap":
+                result = self.adaptive.vision_tap(data)
+            else:
+                object_fields(data, {"op"}, {"op"})
+                result = self.adaptive.screenshot() if data["op"] == "screenshot" else self.adaptive.reconcile()
+            if isinstance(result.get("observation"), Observation):
+                # Do not re-enumerate fixed grants after adaptive dispatch.
+                result["observation"] = self.adaptive.view(result["observation"], labels=self.include_labels)
+            return result
         fields = object_fields(data, {"op", "id"}, {"op"})
         operation = fields["op"]
         if operation not in {"observe", "execute", "wait", "done", "recover_read", "close"}:
@@ -64,10 +92,13 @@ class PlannerSession:
             if state == "satisfied":
                 self.closed = True
             return {"status": "completed" if state == "satisfied" else "incomplete", "verification": state,
-                    "observation": observation.compact(include_labels=self.include_labels)}
+                    "observation": (self.adaptive.view(observation, labels=self.include_labels) if self.adaptive
+                                    else observation.compact(include_labels=self.include_labels))}
         if operation == "observe":
             return {"status": "observed", "observation": self.view(self.executor.observe())}
         action_id = fields["id"]
+        if self.adaptive and self.adaptive.pending_input is not None:
+            return {"status": "blocked", "dispatch": "not_sent", "reason": "input_requires_reconciliation"}
         if not isinstance(action_id, str) or not action_id or len(action_id) > 128:
             raise ValueError("Invalid offered action ID.")
         if self.steps >= self.spec.limits.max_steps:
@@ -130,6 +161,8 @@ def serve(session: PlannerSession, requests: Iterator[bytes], emit: Callable[[di
             return 1
         except ObservationRejected:
             result = {"status": "blocked", "reason": "observation_rejected"}
+        except OSError:
+            result = {"status": "blocked", "reason": "local_input_or_evidence_unavailable"}
         except OpenClawIPhoneError:
             result = {"status": "blocked", "reason": "read_or_recovery_unavailable"}
         emit(result)

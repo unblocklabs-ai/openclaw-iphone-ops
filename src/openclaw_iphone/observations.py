@@ -16,6 +16,29 @@ class ObservationRejected(OpenClawIPhoneError):
     """Observation is incomplete, ambiguous, or no longer valid for an action."""
 
 
+def keypad_points(observation: Observation, digits: str) -> list[tuple[float, float]]:
+    """Resolve the entire input against one current native keyboard layout."""
+    if not digits or len(digits) > 32 or any(c not in "0123456789" for c in digits):
+        raise ValueError("Keypad input requires 1–32 ASCII digits.")
+    points = {}
+    keyboards = set()
+    hidden = [e.path + "/" for e in observation.elements or () if e.visible is False]
+    for digit in set(digits):
+        keys = [e for e in observation.elements or () if e.actionable and e.role == "XCUIElementTypeKey"
+                and digit in (e.name, e.label) and any(r == "XCUIElementTypeKeyboard" for r, _, _ in e.ancestors)
+                and not any(e.path.startswith(path) for path in hidden)]
+        if len(keys) != 1:
+            raise ObservationRejected("No unique visible native keypad key; no guessed coordinates.")
+        key = keys[0]
+        prefix, _, tail = key.path.rpartition("/XCUIElementTypeKeyboard[")
+        keyboards.add(prefix + "/XCUIElementTypeKeyboard[" + tail.split("/", 1)[0])
+        x, y, width, height = key.bounds
+        points[digit] = (x + width / 2, y + height / 2)
+    if len(keyboards) != 1 or len(set(points.values())) != len(points):
+        raise ObservationRejected("Ambiguous keypad layout.")
+    return [points[digit] for digit in digits]
+
+
 EDITABLE = frozenset({"XCUIElementTypeTextField", "XCUIElementTypeTextView", "XCUIElementTypeSearchField"})
 SCROLLABLE = frozenset({"XCUIElementTypeScrollView", "XCUIElementTypeTable", "XCUIElementTypeCollectionView"})
 TAPPABLE = EDITABLE | {"XCUIElementTypeButton", "XCUIElementTypeCell", "XCUIElementTypeLink"}

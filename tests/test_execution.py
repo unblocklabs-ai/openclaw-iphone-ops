@@ -28,6 +28,7 @@ class TransportTests(unittest.TestCase):
             with patch.object(client.opener, "open", side_effect=respond):
                 client.type_text_bulk(text)
             self.assertEqual(routes, [("GET", "/wda/locked"), ("POST", "/session"),
+                                      ("POST", "/session/one/appium/settings"),
                                       ("POST", "/session/one/wda/keys"), ("DELETE", "/session/one")])
 
     def test_explicit_null_value_is_empty_but_missing_value_is_unknown(self):
@@ -61,20 +62,25 @@ class TransportTests(unittest.TestCase):
 
     def test_bulk_unknown_never_falls_back_and_cleanup_keeps_primary(self):
         client = self.client()
-        client._json_post.side_effect = WDAOutcomeUnknown("primary")
+        client._json_post.side_effect = [{"value": None}, WDAOutcomeUnknown("primary")]
         client._delete_session.side_effect = TaskStopped("expired")
         with self.assertLogs("openclaw_iphone.wda"), self.assertRaisesRegex(WDAOutcomeUnknown, "primary"):
             client.type_text_bulk("private")
-        client._json_post.assert_called_once_with("/session/one/wda/keys", {"value": ["private"]})
+        client._json_post.assert_called_with("/session/one/wda/keys", {"value": ["private"]})
+        self.assertEqual(client._json_post.call_count, 2)
         self.assertTrue(client._session.cleanup_failed)
 
     def test_cancel_between_characters_reports_partial_typing_and_never_replays(self):
         client = self.client()
         client.budget = Budget.seconds(3)
-        client._json_post.side_effect = lambda *args: client.budget.cancelled.set() or {"value": None}
-        with self.assertRaisesRegex(WDAOutcomeUnknown, "1 confirmed characters"):
+        def post(path, payload):
+            if path.endswith("/actions"):
+                client.budget.cancelled.set()
+            return {"value": None}
+        client._json_post.side_effect = post
+        with self.assertRaisesRegex(WDAOutcomeUnknown, "1 acknowledged characters"):
             client.type_text("ab", frequency=100)
-        client._json_post.assert_called_once()
+        self.assertEqual(client._json_post.call_count, 2)
 
     def test_typing_checks_lock_before_session_creation(self):
         for method in ("type_text", "type_text_bulk"):
