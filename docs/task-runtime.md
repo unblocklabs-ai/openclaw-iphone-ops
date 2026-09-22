@@ -169,7 +169,7 @@ verification. `StepResult` separates dispatch, verification and acknowledged
 compound substeps. Failed verification stops the executor; it never replays a
 successful tap or partially completed replacement. Inspect/replan explicitly.
 
-App-only waits use lock-state and two matching foreground bundle/PID reads, not
+App-only waits use lock-state and one foreground bundle/PID read, not
 the accessibility tree. Their returned `Observation` has `elements=None` and
 `secure=None`: screen contents and secure-field presence were **not observed**.
 It can verify app identity only; element conditions return `unknown`, direct
