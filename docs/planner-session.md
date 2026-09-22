@@ -254,14 +254,14 @@ readback afterward. The planner's `done` still runs independent verification.
 
 ## Acceptance on a physical device
 
-Current implementation checks: the v0.2.2 baseline passed 193 offline tests;
-the release validation runs the full offline suite. Release-metadata consistency,
-isolated npm pack/install (57 allowlisted files) and skill validation pass.
-No package has been released or fleet installation changed by these checks.
+The v0.4.0 implementation passes 251 offline tests and an isolated packed npm
+install (61 allowlisted files). The [input latency audit](input-performance.md)
+records staged physical-device measurements and remaining live-validation limits.
 
 A mocked WDA transport comparison of three equivalent observations measured
-24 requests/three device selections/three sessions with separate connections,
-versus 16 requests/one selection/one session with shared ownership. This is a
+27 requests/three device selections/three sessions with separate connections,
+versus 17 requests/one selection/one session with shared ownership (including
+the v0.4.0 settings request per session). This is a
 request-count result, **not** measured device latency or agent adoption evidence.
 
 Offline tests exercise protocol framing/deadlines, stale IDs, partial/unknown
