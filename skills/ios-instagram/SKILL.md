@@ -11,50 +11,31 @@ Use this skill for Instagram workflows on the real plugged-in iPhone. It depends
 
 Do not use Simulator assumptions, stale screenshots, `iproxy`, or `localhost:8100`.
 
-## Start With Evidence
+## Use one control session
 
-From the repo root, verify the phone and WDA before touching Instagram:
+Follow [iphone-control](../iphone-control/SKILL.md) and the
+[planner-session contract](../../docs/planner-session.md). Start one `task session`
+for an interactive workflow; acquisition already checks the pinned device,
+readiness and lock state. Do not prepend status/locked/doctor/screenshot/source
+chains. Use `doctor --check-ui` only to diagnose a failure.
 
-```bash
-cd "${OPENCLAW_IPHONE_REPO_DIR:-$HOME/.openclaw/repos/openclaw-iphone}"
-PYTHONPATH=src python3 -m openclaw_iphone wda status
-PYTHONPATH=src python3 -m openclaw_iphone wda locked
-PYTHONPATH=src python3 -m openclaw_iphone doctor
-PYTHONPATH=src python3 -m openclaw_iphone ui screenshot
-PYTHONPATH=src python3 -m openclaw_iphone ui source
-```
-
-If the device is locked, run `watchdog once` or `wda unlock --verify` once. WDA unlock can recover only when iOS does not require passcode, Face ID, or another secure confirmation. Prevent long workflows from locking by setting Auto-Lock to Never when policy allows. If passcode or Face ID is required, stop and ask the user to unlock it. Continue only after `wda status` is ready and screenshot/source both work.
-
-## Launch Instagram
-
-```bash
-PYTHONPATH=src python3 -m openclaw_iphone apps launch Instagram
-PYTHONPATH=src python3 -m openclaw_iphone ui elements
-PYTHONPATH=src python3 -m openclaw_iphone ui screenshot
-```
-
-Use `ui elements` and `ui source` to confirm the current tab or screen before acting.
+Launch or deep-link through an authorized task action, then use its returned
+observation. Reobserve only when evidence is missing, stale or insufficient for
+the next decision. Capture a screenshot for a genuinely visual question, not
+after every action. Passcode-required means ask for human unlock; do not switch
+phones or repeatedly restart the runner.
 
 ## Search Flow
 
-Validated flow on the current device:
+Previously observed labels include `Explore` and `Search with Meta AI`; labels
+can change. Select only controls in current evidence, enter the exact supplied
+query through verified input, and verify a relevant result tab/query before
+choosing a result. Use a bounded scroll action on the observed results container.
+Reuse returned observations instead of issuing separate capture commands.
 
-```bash
-PYTHONPATH=src python3 -m openclaw_iphone ui tap-text Explore
-PYTHONPATH=src python3 -m openclaw_iphone ui tap-text "Search with Meta AI"
-PYTHONPATH=src python3 -m openclaw_iphone ui type "<query>"
-```
-
-If `tap-text Explore` does not move the UI, inspect screenshot/source and tap the visible Explore tab by coordinates. To submit a query, tap the visible keyboard Search key or a source-confirmed suggestion, then verify that the accessibility tree or screenshot contains the query and result tabs such as `For you`, `Profiles`, `Audio`, or `Tags`.
-
-For scrolling results:
-
-```bash
-PYTHONPATH=src python3 -m openclaw_iphone ui drag --from-x 360 --from-y 780 --to-x 360 --to-y 450 --duration 0.2
-```
-
-Capture before/after evidence when scrolling or selecting a result.
+When accessibility misses a control, use the session's explicit screenshot/vision
+fallback after inspecting it. A stalled or uncertain action is not permission to
+tap again. Do not substitute guessed coordinates or an AI follow-up field.
 
 ## Profiles And Context
 

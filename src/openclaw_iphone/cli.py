@@ -75,7 +75,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--developer-dir", help="Override DEVELOPER_DIR for Xcode/devicectl.")
     parser.add_argument("--evidence-dir", help="Directory for JSON evidence artifacts.")
     parser.add_argument("--timeout", type=int, default=30, help="External command timeout in seconds.")
-    parser.add_argument("--read-timeout", type=float, default=DEFAULT_SCREEN_READ_TIMEOUT, help="Source/screenshot request timeout (default 12s), also capped by the task deadline.")
+    parser.add_argument("--read-timeout", type=float, default=DEFAULT_SCREEN_READ_TIMEOUT, help="Read-only WDA request timeout (default 12s), also capped by the task deadline.")
 
     subcommands = parser.add_subparsers(dest="command")
 

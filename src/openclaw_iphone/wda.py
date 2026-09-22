@@ -20,7 +20,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from .errors import DeviceLocked, WDAOutcomeUnknown, WDASetupError, WDAUnavailable, WDAUnsupportedCommand
+from .errors import DeviceLocked, WDAOutcomeUnknown, WDASetupError, WDAStaleElement, WDAUnavailable, WDAUnsupportedCommand
 from .execution import Budget, Metrics, TaskStopped
 from .xcode import resolve_developer_dir
 
@@ -68,6 +68,7 @@ class WDAClient:
         self.budget: Budget | None = None
         self.metrics = Metrics()
         self._session = SessionState()
+        self._input_checked = False
         # Device control must not traverse a host HTTP proxy or follow redirects.
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
 
@@ -130,8 +131,19 @@ class WDAClient:
         return self._json_post("/wda/unlock", {})
 
     def require_unlocked(self) -> None:
-        if self.locked() is not False:
+        if not self._input_checked and self.locked() is not False:
             raise DeviceLocked("WDA screen lock state is locked or unknown; verify unlock before UI actions.")
+
+    @contextmanager
+    def input_transaction(self) -> Iterator[None]:
+        """One lock check for a synchronous clear/read/type operation, not a task."""
+        self.require_unlocked()
+        previous = self._input_checked
+        self._input_checked = True
+        try:
+            yield
+        finally:
+            self._input_checked = previous
 
     def lock(self) -> dict[str, Any]:
         return self._json_post("/wda/lock", {})
@@ -241,15 +253,29 @@ class WDAClient:
             raise WDAUnavailable("Foreground app identity is unavailable.")
         return value
 
+    def app_state(self, bundle_id: str) -> int:
+        """Known-app state without activeAppInfo's accessibility identifier read."""
+        with self.session() as session_id:
+            value = self._json_post(f"/session/{session_id}/wda/apps/state", {"bundleId": bundle_id}).get("value")
+        if type(value) is not int or value not in range(5):
+            raise WDAUnavailable("Application state is unavailable.")
+        return value
+
     def activate_app(self, bundle_id: str) -> dict[str, Any]:
         self.require_unlocked()
         with self.session() as session_id:
             return self._json_post(f"/session/{session_id}/wda/apps/activate", {"bundleId": bundle_id})
 
-    def find_elements(self, xpath: str) -> list[str]:
+    def find_elements(self, query: str, *, using: str = "xpath") -> list[str]:
         """Read-only query (WDA uses POST); no implicit retries."""
+        if using not in {"xpath", "predicate string", "class chain", "accessibility id"}:
+            raise ValueError("Unsupported native locator strategy.")
         with self.session() as session_id:
-            value = self._json_post(f"/session/{session_id}/elements", {"using": "xpath", "value": xpath}).get("value")
+            try:
+                value = self._json_post(f"/session/{session_id}/elements", {"using": using, "value": query}).get("value")
+            except WDAOutcomeUnknown as exc:
+                # POST /elements is a read, unlike POST /element/.../click.
+                raise WDAUnavailable("WDA element query unavailable; no input dispatched.") from exc
         if not isinstance(value, list):
             raise WDAUnavailable("Invalid WDA element query response.")
         return [element_identifier(item) for item in value]
@@ -420,8 +446,9 @@ class WDAClient:
         body = self._request(path, method="POST", payload=payload)
         parsed = parse_json_bytes(body)
         if not isinstance(parsed, dict):
-            raise WDAOutcomeUnknown(f"WDA {path} response was not a JSON object. Outcome unknown; inspect state before retrying.")
-        check_response(parsed, path, mutating=True)
+            error = WDAUnavailable if read_only_request("POST", path) else WDAOutcomeUnknown
+            raise error(f"WDA {path} response was not a JSON object; no automatic replay.")
+        check_response(parsed, path, mutating=not read_only_request("POST", path))
         return parsed
 
     def _create_session(self) -> str:
@@ -448,7 +475,7 @@ class WDAClient:
 
     def _request(self, path: str, *, method: str = "GET", payload: dict[str, Any] | None = None) -> bytes:
         timeout = self._request_timeout()
-        if method == "GET" and path in {"/source", "/screenshot"}:
+        if read_only_request(method, path):
             timeout = min(timeout, self.read_timeout)
         route = re.sub(r"/(session|element)/(?!active(?:/|$))[^/]+", r"/\1/:id", path.split("?", 1)[0])
         with self.metrics.measure(f"wda {method} {route}"):
@@ -484,19 +511,23 @@ class WDAClient:
                     exc.close()
                 parsed = parse_json_bytes(body)
                 if isinstance(parsed, dict):
-                    check_response(parsed, path, mutating=method != "GET")
-                error = WDAOutcomeUnknown if method != "GET" else WDAUnavailable
+                    check_response(parsed, path, mutating=not read_only_request(method, path))
+                error = WDAUnavailable if read_only_request(method, path) else WDAOutcomeUnknown
                 raise error(f"WDA {method} {path} failed with HTTP {exc.code}. Inspect state before retrying.") from exc
             with resp as response:
                 return response.read()
         except (urllib.error.URLError, TimeoutError, socket.timeout, ConnectionError, http.client.HTTPException) as exc:
-            error = WDAOutcomeUnknown if method != "GET" else WDAUnavailable
+            error = WDAUnavailable if read_only_request(method, path) else WDAOutcomeUnknown
             raise error(f"WDA {method} {path} transport failed. Outcome unknown; inspect state before retrying.") from exc
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
+
+
+def read_only_request(method: str, path: str) -> bool:
+    return method == "GET" or method == "POST" and path.endswith(("/elements", "/wda/apps/state"))
 
 
 def element_identifier(value: object) -> str:
@@ -512,6 +543,8 @@ def check_response(payload: dict[str, Any], path: str, *, mutating: bool = False
     status = payload.get("status")
     if isinstance(error, str) and error in {"unknown command", "unknown method", "unsupported operation"} or status == 9:
         raise WDAUnsupportedCommand(f"WDA {path}: command unsupported by this runner.")
+    if not mutating and (error == "stale element reference" or status == 10):
+        raise WDAStaleElement("Native element reference expired; only the read may be repeated.")
     if error or status not in (None, 0):
         # Server messages can echo typed text, URLs or accessibility content.
         failure = WDAOutcomeUnknown if mutating else WDAUnavailable

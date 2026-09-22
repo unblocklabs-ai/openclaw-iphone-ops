@@ -122,6 +122,8 @@ and should not be hard-coded into the WDA checkout or committed repo files.
 
 ## Verify
 
+Run once after setup, or when diagnosing the service—not before each task.
+
 ```sh
 launchctl print "gui/$(id -u)/com.openclaw.iphone-wda-run"
 launchctl print "gui/$(id -u)/com.openclaw.iphone-watchdog"
@@ -129,19 +131,13 @@ tail -n 80 ~/Library/Logs/openclaw/iphone-wda-run.log
 tail -n 80 ~/Library/Logs/openclaw/iphone-wda-run.err.log
 tail -n 80 ~/Library/Logs/openclaw/iphone-watchdog.log
 tail -n 80 ~/Library/Logs/openclaw/iphone-watchdog.err.log
-PYTHONPATH=src python3 -m openclaw_iphone wda url
-PYTHONPATH=src python3 -m openclaw_iphone wda status
-PYTHONPATH=src python3 -m openclaw_iphone doctor
-PYTHONPATH=src python3 -m openclaw_iphone ui screenshot
-PYTHONPATH=src python3 -m openclaw_iphone ui source
+PYTHONPATH=src python3 -m openclaw_iphone doctor --check-ui
 ```
 
 Healthy state:
 
-- `wda url` prints a CoreDevice tunnel URL, usually an IPv6 URL like
-  `http://[...]:8100`.
-- `wda status` prints `reachable: true` and `ready: true`.
-- Screenshot and source capture both succeed.
+- Doctor reports the pinned device, a ready/unlocked WDA and a usable UI read.
+- Capture a screenshot separately only if diagnosing the visual path.
 - `launchctl print` shows the runner service as running or recently restarted
   without rapid repeated failures.
 - `iphone-watchdog.log` shows `result: ok` or `result: unlocked`. If it shows
@@ -185,10 +181,11 @@ Once the LaunchAgent is installed, ask OpenClaw to treat WDA as a service:
 ```text
 Use the plugged-in physical iPhone via the WDA LaunchAgent from
 the canonical openclaw-iphone checkout and host config at
-~/.openclaw/iphone/config.env. First run `PYTHONPATH=src python3 -m
-openclaw_iphone doctor`. If WDA is not ready, inspect `launchctl print` and
+~/.openclaw/iphone/config.env. Use one task session; acquisition checks readiness,
+device identity and lock state. If acquisition fails, use `doctor --check-ui`,
+then inspect `launchctl print` and
 `~/Library/Logs/openclaw/iphone-wda-run*.log`. If lock recovery is failing,
 inspect `~/Library/Logs/openclaw/iphone-watchdog*.log`. Restart the relevant
-LaunchAgent as needed, then verify with status, screenshot, and source before
-interacting with apps.
+LaunchAgent only when diagnosis warrants it, then reacquire the task session.
+Reuse action results; do not add a status/screenshot/source preflight chain.
 ```

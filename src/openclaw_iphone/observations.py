@@ -56,6 +56,11 @@ def xpath_literal(value: str) -> str:
     return "concat(" + ', "\'", '.join(f"'{part}'" for part in value.split("'")) + ")"
 
 
+def predicate_literal(value: str) -> str:
+    # NSPredicate quoted strings, never caller-provided predicate expressions.
+    return json.dumps(value, ensure_ascii=False)
+
+
 @dataclass(frozen=True)
 class Selector:
     role: str
@@ -69,6 +74,23 @@ class Selector:
         if any(value is not None and (not isinstance(value, str) or not value or len(value) > 256)
                for value in (self.name, self.label, self.ancestor_label)):
             raise ValueError("Selector labels must be short non-empty strings.")
+
+    def xpath(self) -> str:
+        """Live predicate lookup, not a durable action reference."""
+        checks = ["@visible='true'"]
+        checks += [f"@{key}={xpath_literal(value)}" for key, value in
+                   (("name", self.name), ("label", self.label)) if value is not None]
+        if self.ancestor_label is not None:
+            checks.append(f"ancestor::*[@label={xpath_literal(self.ancestor_label)}]")
+        return f"//{self.role}[{' and '.join(checks)}]"
+
+    def locator(self) -> tuple[str, str]:
+        if self.ancestor_label is not None:
+            return "xpath", self.xpath()
+        checks = [f"type == {predicate_literal(self.role)}", "visible == 1"]
+        checks += [f"{key} == {predicate_literal(value)}" for key, value in
+                   (("name", self.name), ("label", self.label)) if value is not None]
+        return "predicate string", " AND ".join(checks)
 
 
 @dataclass(frozen=True)
@@ -101,6 +123,19 @@ class Element:
         # to another list item must not silently remap an old action.
         return (self.role, self.name, self.label, self.value, self.visible,
                 self.enabled, self.bounds, self.ancestors, self.path)
+
+    def locator(self) -> tuple[str, str]:
+        # Named ancestors distinguish rows/forms. Preserve their exact hierarchy
+        # with XPath instead of silently weakening to a global label match.
+        if (any(role != "XCUIElementTypeApplication" and (name or label)
+                for role, name, label in self.ancestors)
+                or any(len(value or "") > 256 for value in (self.name, self.label))):
+            return "xpath", self.xpath
+        _, query = Selector(self.role, self.name or None, self.label or None).locator()
+        checks = [query, f"enabled == {int(self.enabled is True)}"]
+        if self.bounds is not None:
+            checks += [f"rect.{key} == {value}" for key, value in zip(("x", "y", "width", "height"), self.bounds)]
+        return "predicate string", " AND ".join(checks)
 
 
 @dataclass(frozen=True)
@@ -170,7 +205,7 @@ def parse_observation(source: str, *, generation: int, device_udid: str,
     elements: list[Element] = []
     secure = False
 
-    def walk(node: ET.Element, path: str, ancestors: tuple, depth: int) -> None:
+    def walk(node: ET.Element, path: str, ancestors: tuple, depth: int, locator: str | None = None) -> None:
         nonlocal secure
         if depth > 60 or len(elements) >= 2000:
             raise ObservationRejected("Accessibility tree exceeds limits; nothing was truncated into an actionable snapshot.")
@@ -193,15 +228,19 @@ def parse_observation(source: str, *, generation: int, device_udid: str,
         checks = [f"@{key}={xpath_literal(attrs[key])}" for key in
                   ("name", "label", "value", "visible", "enabled", "x", "y", "width", "height")
                   if key in attrs and not (is_secure and key == "value")]
-        xpath = path + ("[" + " and ".join(checks) + "]" if checks else "")
+        locator = path if locator is None else locator
+        xpath = locator + ("[" + " and ".join(checks) + "]" if checks else "")
         elements.append(Element(f"{snapshot_id}:{len(elements)}", role, name, label, value,
                                 boolean(attrs.get("visible")), boolean(attrs.get("enabled")),
                                 boolean(attrs.get("focused")), bounds, ancestors, path, xpath))
         siblings: dict[str, int] = {}
+        identity = [f"@{key}={xpath_literal(attrs[key])}" for key in ("name", "label") if key in attrs]
+        parent = locator + ("[" + " and ".join(identity) + "]" if identity else "")
         for child in node:
             siblings[child.tag] = siblings.get(child.tag, 0) + 1
             walk(child, f"{path}/{child.tag}[{siblings[child.tag]}]",
-                 ancestors + ((role, name, label),), depth + 1)
+                 ancestors + ((role, name, label),), depth + 1,
+                 f"{parent}/{child.tag}[{siblings[child.tag]}]")
 
     if root.tag == "AppiumAUT":
         for index, child in enumerate(root, 1):

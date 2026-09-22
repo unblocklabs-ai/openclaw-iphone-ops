@@ -5,10 +5,11 @@ import os
 import select
 import io
 import json
+import time
 from typing import Callable, Iterator
 
 from .actions import Executor
-from .errors import OpenClawIPhoneError, SessionOutputUnavailable
+from .errors import OpenClawIPhoneError, SessionOutputUnavailable, VerificationExpired
 from .execution import Budget, TaskStopped
 from .jev import strict_json
 from .observations import Observation, ObservationRejected
@@ -51,7 +52,8 @@ class PlannerSession:
         self.requests += 1
         if self.requests > 4 * self.spec.limits.max_steps + 8:
             raise TaskStopped("Planner request limit reached.")
-        if isinstance(data, dict) and data.get("op") in ("act", "screenshot", "vision_tap", "reconcile"):
+        if isinstance(data, dict) and (data.get("op") in ("act", "screenshot", "vision_tap")
+                                      or data.get("op") == "reconcile" and self.adaptive is not None):
             if self.adaptive is None:
                 raise ValueError("Adaptive requests require task opt-in.")
             if data["op"] in ("act", "vision_tap"):
@@ -62,16 +64,19 @@ class PlannerSession:
                 result = self.adaptive.act(data)
             elif data["op"] == "vision_tap":
                 result = self.adaptive.vision_tap(data)
+            elif data["op"] == "screenshot":
+                object_fields(data, {"op", "redact"}, {"op"})
+                result = self.adaptive.screenshot(redact=data.get("redact"))
             else:
                 object_fields(data, {"op"}, {"op"})
-                result = self.adaptive.screenshot() if data["op"] == "screenshot" else self.adaptive.reconcile()
+                result = self.adaptive.reconcile()
             if isinstance(result.get("observation"), Observation):
                 # Do not re-enumerate fixed grants after adaptive dispatch.
                 result["observation"] = self.adaptive.view(result["observation"], labels=self.include_labels)
             return result
         fields = object_fields(data, {"op", "id"}, {"op"})
         operation = fields["op"]
-        if operation not in {"observe", "execute", "wait", "done", "recover_read", "close"}:
+        if operation not in {"observe", "execute", "wait", "done", "reconcile", "recover_read", "close"}:
             raise ValueError("Unknown planner operation.")
         if (operation == "execute") != ("id" in fields):
             raise ValueError("Only execute requires an offered action ID.")
@@ -82,13 +87,22 @@ class PlannerSession:
             # The connection allows one same-UDID read recovery. A stopped
             # executor stays stopped, even if reads become available again.
             self.executor.connection.recover_read()
-            return {"status": "recovered", "observation": self.view(self.executor.observe())}
+            return {"status": "recovered", "observation": self.view(self.executor.observe(app_only=True))}
+        if operation == "reconcile":
+            state, observation = self.executor.wait(self.executor.pending or (), once=True)
+            return {"status": "observed", "verification": state, "observation": self.view(observation)}
         if operation in {"wait", "done"}:
             if operation == "wait":
                 state, observation = self.executor.wait(self.spec.success)
             else:
-                observation = self.executor.observe()
-                state = self.executor.verify(observation, self.spec.success)
+                observation = self.executor.latest
+                if observation is None or time.monotonic() - observation.started > self.executor.freshness:
+                    state, observation = self.executor.wait(self.spec.success, once=True)
+                else:
+                    self.executor._check_snapshot(observation)
+                    state = self.executor.verify(observation, self.spec.success)
+                    if state == "unknown" and observation.elements is None:
+                        state, observation = self.executor.wait(self.spec.success, once=True)
             if state == "satisfied":
                 self.closed = True
             return {"status": "completed" if state == "satisfied" else "incomplete", "verification": state,
@@ -161,6 +175,8 @@ def serve(session: PlannerSession, requests: Iterator[bytes], emit: Callable[[di
             return 1
         except ObservationRejected:
             result = {"status": "blocked", "reason": "observation_rejected"}
+        except VerificationExpired:
+            result = {"status": "incomplete", "verification": "unknown", "reason": "verification_expired"}
         except OSError:
             result = {"status": "blocked", "reason": "local_input_or_evidence_unavailable"}
         except OpenClawIPhoneError:

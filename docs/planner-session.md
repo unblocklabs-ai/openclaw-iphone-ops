@@ -37,15 +37,23 @@ previous choices.
 Check `dispatch`, `verification`, `acknowledged_substeps` and `input_stopped`.
 After a verified step, select from its returned observation's fresh actions.
 Request `observe` if choices are unavailable or the observation has expired.
-Failed verification stops input for this executor. `recover_read` may restore
-read access but **never** clears that stop or replenishes grant uses.
+Unknown writes stop input for this executor. An acknowledged action whose
+verification window expires instead reports `verification_expired` and blocks
+new mutations until read-only `reconcile` proves its original result. No action
+is replayed. `recover_read` may restore a failed read connection but never clears
+unknown-write stops or replenishes grant uses.
 
 Other requests (no extra fields):
 
 - `{"op":"wait"}`: bounded polling of the task's success conditions.
-- `{"op":"done"}`: fresh independent success check; cannot force completion.
+- `{"op":"done"}`: independently evaluate task success using current evidence;
+  capture only if stale/missing/insufficient. Cannot force completion. Use `wait`
+  or `observe` if a previously incomplete screen has since changed.
+- `{"op":"reconcile"}`: read-only check of an acknowledged action's pending
+  postcondition; does not resend the action or revive an unknown write.
 - `{"op":"recover_read"}`: one explicit reacquisition after a failed read on
-  the original UDID; forbidden after an unknown mutation. No service restart.
+  the original UDID; forbidden after an unknown mutation. Returns app-only
+  evidence so AX failure cannot prevent screenshot fallback. No service restart.
 - `{"op":"close"}`: release ownership without claiming task completion.
 
 Only verified completion exits 0. Close, EOF, invalid input, limits and
@@ -101,7 +109,7 @@ captures. Source/screenshot are separate reads, not an atomic pair. Preserve
 their paths/timing, confirm the app and screen are still current, and reobserve
 before any later action. Fixed-grant sessions do not accept coordinate actions.
 The adaptive extension can capture and act on a screenshot within the same
-ownership/session.
+ownership/session without reading XML. See masking requirements below.
 No screenshot or raw XML is automatically saved by a session, even on failure.
 
 ## Experimental adaptive Act (v0.4.0+)
@@ -151,9 +159,9 @@ and wall deadline remain enforced. Jev is text-only.
 These are sequential examples, not a blindly replayable script. `target_id`
 plus `snapshot_id` from the latest observation is another targeting option.
 Hittable `StaticText` and custom `Other` controls are supported. Selection is
-revalidated against fresh app/process/target identity before dispatch. An
-unrelated secure node does not block local actions. The fixed-grant executor's
-older secure-screen behavior is unchanged and reported as `fixed_grant_blockers`.
+revalidated against the foreground app and a live native target before dispatch. An
+unrelated secure node does not block local actions. The fixed-grant executor
+withholds offers on an observed secure screen, reported as `fixed_grant_blockers`.
 
 Input references are owner-only regular files owned by the current user;
 symlinks and control characters are rejected. They are read at dispatch, so
@@ -162,7 +170,9 @@ Do not put passwords/codes in instructions, task JSON, CLI arguments or logs.
 `mode: empty` requires native emptiness; `replace` explicitly clears first.
 WDA sometimes returns a placeholder instead of empty: after acknowledged clear,
 a matching native `placeholderValue` is accepted. `strategy: native` (default)
-uses one targeted bulk request; `sequential` checks app/focus at the input
+uses one targeted bulk request and lets WDA prepare target focus. Clear/type
+shares one foreground/lock boundary and reads back the same field reference.
+`sequential` checks app/focus at the input
 boundary and sends separate key events in the same session, at most eight per
 second. It does not reread the screen between characters. This compatibility
 path remains separate requests because iOS dropped scheduled text events in
@@ -178,7 +188,8 @@ field disappears. A task `done` request still verifies overall success separatel
 Unverified input sets `input_pending` and blocks unrelated mutations. `reconcile`
 only reads and checks its original conditions. An acknowledged, readable-field
 mismatch can be corrected by an explicit `input`/`replace` on that same field.
-Unknown writes set `input_stopped`; no retry, replacement or reconnect bypasses
+If verification times out, use read-only reconciliation, not replacement based
+on missing readback. Unknown writes set `input_stopped`; no retry, replacement or reconnect bypasses
 that state. An acknowledged navigation mismatch instead returns `inspect_result`
 and its post-action observation, allowing the caller to choose a corrective step.
 
@@ -189,15 +200,36 @@ and its post-action observation, allowing the caller to choose a corrective step
 {"op":"vision_tap","snapshot_id":"FROM_SCREENSHOT","x":100,"y":300}
 ```
 
+The default screenshot reuses a fresh full observation to mask visible input
+fields and labels containing supplied input; it never captures XML itself.
+When AX is unavailable or a new screen needs different masks, supply explicit
+rectangles in **device points**. `[]` explicitly attests that the current screen
+needs no masking; do not use it on a credential, code or private-content screen.
+
+```json
+{"op":"screenshot","redact":[[0,80,400,100]]}
+```
+
+Explicit masks replace cached AX-based masks, so stale input rectangles do not
+hide unrelated controls after navigation. They are caller-reviewed privacy
+instructions, not model-generated coordinates. Without full AX evidence or an
+explicit mask list, capture refuses to save an unreviewed image.
+
 Coordinates are **image pixels**, not device points. The runtime derives scale
-from PNG and WDA window dimensions, consumes the screenshot once, and rejects
-stale/superseded snapshots or changed app/process/tree/geometry. This does not
-detect purely visual changes absent from AX; the caller must inspect current
+from PNG and WDA window dimensions. Each capture has its own one-use ID, even
+when it reuses the same AX observation. The runtime consumes that ID and rejects
+stale/superseded snapshots or changed app/process/geometry. It does not recapture
+or compare the accessibility tree, and cannot detect arbitrary visual changes
+between capture and dispatch; the caller must inspect current
 evidence and avoid dynamic, unlabeled moving targets. Read errors do not authorize
 coordinate guesses. Screenshots stay in owner-only unique files, never Jev.
-Known input bounds and labels containing supplied input are masked locally.
+Masks are applied locally before the image is saved.
 This is **not general image anonymization**: unknown personal content may remain.
 Do not upload the image without appropriate approval.
+
+A vision tap returns acknowledgement with unknown verification, not another
+automatic AX capture or a success claim. Choose `observe`, `screenshot` or a
+relevant task `wait` next; this keeps the fallback usable on AX-broken screens.
 
 For a custom `Other` code control without native empty/focus evidence, a trusted
 caller may inspect a just-captured screenshot and explicitly attest to an empty,
@@ -231,15 +263,13 @@ installed app. Store task files owner-only (`umask 077` before creation).
 ```json
 {
   "version": 1,
-  "objective": "Replace the focused synthetic input and verify its exact value.",
+  "objective": "Replace the authorized synthetic input and verify its exact value.",
   "texts": {"query": "synthetic example"},
   "grants": [{
     "operation": "replace", "app": "example.test",
     "description": "Replace the authorized test field with supplied text.",
     "target": {"role": "XCUIElementTypeTextField", "label": "Input"},
-    "text_id": "query",
-    "before": [{"kind": "focused", "app": "example.test",
-      "target": {"role": "XCUIElementTypeTextField", "label": "Input"}}]
+    "text_id": "query"
   }],
   "success": [{"kind": "value", "app": "example.test",
     "target": {"role": "XCUIElementTypeTextField", "label": "Input"},
@@ -248,8 +278,9 @@ installed app. Store task files owner-only (`umask 077` before creation).
 }
 ```
 
-The field must already be focused or have a separately authorized tap grant
-with a focus postcondition. `replace` verifies empty before typing and exact
+Native replacement prepares focus; no preliminary tap or focus predicate is
+required. Add an explicit `focused` precondition only when the workflow truly
+requires pre-existing focus. `replace` verifies empty before typing and exact
 readback afterward. The planner's `done` still runs independent verification.
 
 ## Acceptance on a physical device
