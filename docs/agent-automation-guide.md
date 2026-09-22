@@ -30,16 +30,14 @@ host's global `xcode-select` setting.
 
 ## App Automation Pattern
 
-1. Select the connected physical iPhone.
-2. Check lock state before foreground actions.
-3. Resolve the target app by exact bundle id or exact display name.
-4. Launch the app through `devicectl`.
-5. Use a UI backend such as WebDriverAgent or XCUITest for taps, typing,
-   scrolling, screenshots, and source inspection.
-6. Prefer accessibility selectors and visible text over coordinates.
-7. Use coordinates only after capturing screenshot evidence for the current
-   screen.
-8. Keep reusable app flows in optional recipe modules.
+1. Acquire one task connection/session; it pins the physical device and checks
+   readiness/lock. Reuse it for the workflow.
+2. Resolve the exact installed app and authorize its activation/deep link.
+3. Observe, select a control, dispatch once, and verify the relevant result.
+   Reuse the returned evidence; capture a new screen only when needed.
+4. Prefer named accessibility controls. Use explicit screenshot-backed fallback
+   for controls AX cannot expose, not guessed coordinates.
+5. Keep app-specific flows and success criteria in skills/recipes.
 
 ## When Writing A New App Recipe
 
@@ -47,7 +45,7 @@ Recipes should be thin wrappers over primitives. A good recipe can hardcode a
 known public bundle id, but it should still verify the installed app before
 acting.
 
-Good:
+Manual command reference (alternatives, **not** a sequence to run before a task):
 
 ```sh
 openclaw-iphone apps launch Instagram
@@ -75,11 +73,13 @@ Avoid:
 - Committed credentials
 - Local-only paths
 - Screen coordinates without screenshot-backed context
-- Claims of success without a second verification signal
+- Claims of success without evidence of the relevant result (reuse the runtime's
+  verified postcondition; a second identical capture is not stronger proof)
 
 ## UI Control
 
-The reusable UI layer is backed by WebDriverAgent:
+The reusable UI layer is backed by WebDriverAgent. These are individual setup,
+diagnostic and raw-control examples, not a recommended multi-command loop:
 
 ```sh
 openclaw-iphone wda run

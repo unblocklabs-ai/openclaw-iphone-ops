@@ -88,9 +88,9 @@ class AdaptiveTests(unittest.TestCase):
             observation = actor.ex.observe()
             request = {"op": "act", "action": "tap", "instruction": "Next"}
             if mode == "moved":
-                wda.source.return_value = source(button_x=20)
+                wda.find_elements.return_value = []
             elif mode == "app":
-                wda.active_app.return_value = {"bundleId": "other", "pid": 2}
+                wda.app_state.return_value = 3
             elif mode == "obscured":
                 wda.element_hittable.return_value = False
             else:
@@ -111,6 +111,7 @@ class AdaptiveTests(unittest.TestCase):
 
     def test_mismatched_navigation_is_not_a_permanent_stop(self):
         actor, wda = make()
+        wda.find_elements.side_effect = lambda query, **kwargs: [] if '"Finished"' in query else ["ref"]
         result = actor.act({"op": "act", "action": "tap", "instruction": "Next", "after": [
             {"kind": "exists", "app": APP, "target": {"role": "XCUIElementTypeButton", "label": "Finished"}}]})
         self.assertEqual(result["verification"], "unsatisfied")
@@ -179,7 +180,8 @@ class AdaptiveTests(unittest.TestCase):
         wda.element_value.side_effect = ["", "wrong"]
         with patch("openclaw_iphone.adaptive.read_input", return_value="exact"):
             actor.act({"op": "act", "action": "input", "instruction": "Input", "text_ref": "text"})
-        wda.source.return_value = source(value="exact")
+        wda.element_value.side_effect = None
+        wda.element_value.return_value = "exact"
         result = actor.reconcile()
         self.assertEqual(result["verification"], "satisfied")
         self.assertIsNone(actor.pending_input)
@@ -196,41 +198,42 @@ class AdaptiveTests(unittest.TestCase):
 
     def test_sequential_focus_change_stops_before_batch(self):
         actor, wda = make(inputs={"text": "/unused"})
-        wda.active_element.side_effect = ["ref", "other"]
+        wda.active_element.return_value = "other"
         with patch("openclaw_iphone.adaptive.read_input", return_value="ab"):
             result = actor.act({"op": "act", "action": "input", "instruction": "Input", "text_ref": "text", "strategy": "sequential"})
         self.assertEqual((result["dispatch"], result["acknowledged_substeps"]), ("not_sent", 0))
         wda.type_text.assert_not_called()
 
-    def test_fresh_xml_value_verifies_without_second_native_lookup(self):
+    def test_input_verifies_native_value_without_recapturing_xml(self):
         actor, wda = make(inputs={"text": "/unused"})
-        wda.source.side_effect = [source(), source(), source(value="exact")]
+        wda.element_value.side_effect = ["", "exact"]
         with patch("openclaw_iphone.adaptive.read_input", return_value="exact"):
             result = actor.act({"op": "act", "action": "input", "instruction": "Input", "text_ref": "text"})
         self.assertEqual(result["verification"], "satisfied")
-        self.assertEqual(wda.find_elements.call_count, 1)
-        # Only the initial emptiness check needs native value access.
-        self.assertEqual(wda.element_value.call_count, 1)
+        self.assertEqual(wda.find_elements.call_count, 1)  # Readback reuses the selected field.
+        self.assertEqual(wda.element_value.call_count, 2)  # Empty and exact final value.
+        wda.source.assert_called_once()  # Initial selection only.
 
     def test_custom_keypad_uses_fresh_visual_confirmation_and_destination(self):
+        from openclaw_iphone.adaptive import VisualEvidence
         extra = '<XCUIElementTypeOther name="code" visible="true" enabled="true" x="1" y="120" width="200" height="40"/>'
         extra += '<XCUIElementTypeKeyboard><XCUIElementTypeKey name="1" visible="true" enabled="true" x="1" y="700" width="50" height="40"/></XCUIElementTypeKeyboard>'
         actor, wda = make(extra=extra, inputs={"code": "/unused"})
         observation = actor.ex.observe()
-        actor.visual = (observation, (400, 800), (800, 1600))
+        actor.visual = VisualEvidence(observation, (400, 800), (800, 1600))
         # An unrelated countdown/label can change without changing the input.
-        wda.source.side_effect = [source(extra=extra, button_label="Countdown"), source(extra=extra), source(button_label="Finished")]
+        wda.source.return_value = source(button_label="Finished")
         wda.active_element.return_value = "not-a-readable-input"
         with patch("openclaw_iphone.adaptive.read_input", return_value="1"):
             result = actor.act({"op": "act", "action": "keypad", "instruction": "code", "text_ref": "code",
-                "empty_focus_confirmed": observation.id, "after": [{"kind": "exists", "app": APP,
+                "empty_focus_confirmed": actor.visual.id, "after": [{"kind": "exists", "app": APP,
                     "target": {"role": "XCUIElementTypeButton", "label": "Finished"}}]})
         self.assertEqual(result["verification"], "satisfied")
         self.assertIsNone(actor.pending_input)
         wda.element_value.assert_not_called()
         wda.tap_sequence.assert_called_once_with([(26.0, 720.0)])
         wda.element_action.assert_not_called()
-        wda.find_elements.assert_not_called()
+        self.assertEqual(wda.find_elements.call_count, 3)  # Container, keypad geometry, destination.
 
     def test_secure_input_never_uses_value_readback_for_completion(self):
         extra = '<XCUIElementTypeSecureTextField name="password" visible="true" enabled="true" x="1" y="120" width="200" height="40"/>'
@@ -247,7 +250,7 @@ class AdaptiveTests(unittest.TestCase):
         wda.screenshot.return_value = png()
         with tempfile.TemporaryDirectory() as directory:
             actor.evidence_base = directory
-            shot = actor.screenshot()
+            shot = actor.screenshot(redact=[])
             self.assertEqual(os.stat(shot["path"]).st_mode & 0o777, 0o600)
             result = actor.vision_tap({"op": "vision_tap", "snapshot_id": shot["snapshot_id"], "x": 2, "y": 4})
             self.assertEqual(result["dispatch"], "acknowledged")

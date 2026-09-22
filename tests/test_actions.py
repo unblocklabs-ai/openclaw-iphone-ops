@@ -1,4 +1,6 @@
 from dataclasses import replace
+from contextlib import nullcontext
+import json
 import time
 import unittest
 from unittest.mock import Mock, call
@@ -7,7 +9,7 @@ from openclaw_iphone.actions import Condition, Executor, Grant
 from openclaw_iphone.devicectl import Device
 from openclaw_iphone.errors import DeviceLocked, WDAOutcomeUnknown, WDAUnavailable
 from openclaw_iphone.execution import Budget, TaskStopped
-from openclaw_iphone.observations import ObservationRejected, Selector, parse_observation, xpath_literal
+from openclaw_iphone.observations import ObservationRejected, Selector, parse_observation, predicate_literal, xpath_literal
 
 
 APP = "test.app"
@@ -31,6 +33,8 @@ def executor(grants, *, xml=None, texts=None):
     wda = Mock()
     wda.deadline = None
     wda.active_app.return_value = {"bundleId": APP, "pid": 1}
+    wda.app_state.return_value = 4
+    wda.input_transaction.side_effect = nullcontext
     wda.source.return_value = xml or source()
     wda.find_elements.return_value = ["ref"]
     wda.element_hittable.return_value = True
@@ -68,20 +72,25 @@ class ObservationTests(unittest.TestCase):
         duplicate = '<XCUIElementTypeButton label="Next" visible="true" />'
         self.assertIsNone(snapshot(source(extra=duplicate)).unique(BUTTON))
 
-    def test_rejects_incomplete_trees_and_escapes_xpath_text(self):
+    def test_rejects_incomplete_trees_and_escapes_locator_text(self):
         for xml in ("<App />", '<!DOCTYPE a [<!ENTITY b "x">]><App/>',
                     "<XCUIElementTypeApplication>" + "<XCUIElementTypeOther/>" * 2001 + "</XCUIElementTypeApplication>"):
             with self.assertRaises(ObservationRejected):
                 snapshot(xml)
         self.assertEqual(xpath_literal("a'b\"c"), 'concat(\'a\', "\'", \'b"c\')')
+        label = '" OR TRUEPREDICATE OR label == "é🙂\\\n'
+        self.assertEqual(json.loads(predicate_literal(label)), label)
+        using, query = Selector("XCUIElementTypeButton", label=label).locator()
+        self.assertEqual(using, "predicate string")
+        self.assertTrue(query.endswith("label == " + predicate_literal(label)))
 
 
 class ExecutorTests(unittest.TestCase):
-    def test_app_wait_checks_lock_and_stable_identity_without_source(self):
+    def test_app_wait_reads_identity_without_source_or_lock_preflight(self):
         ex, wda = executor([])
         state, obs = ex.wait((Condition("app", APP),))
         self.assertEqual(state, "satisfied")
-        self.assertEqual(wda.method_calls, [call.require_unlocked(), call.active_app()])
+        self.assertEqual(wda.method_calls, [call.active_app()])
         self.assertEqual((obs.app, obs.process_id, obs.device_udid, obs.generation), (APP, 1, "device", 1))
         self.assertIsNone(obs.elements)
         self.assertIsNone(obs.secure)
@@ -112,31 +121,32 @@ class ExecutorTests(unittest.TestCase):
         self.assertEqual(ex.offers(obs), ())
         wda.open_url.assert_not_called()
 
-    def test_mixed_or_element_wait_still_reads_source(self):
+    def test_existence_wait_reads_only_the_target_unless_controls_requested(self):
         for conditions in ((Condition("exists", APP, BUTTON),),
                            (Condition("app", APP), Condition("exists", APP, BUTTON))):
             with self.subTest(conditions=conditions):
                 ex, wda = executor([])
                 state, obs = ex.wait(conditions)
                 self.assertEqual(state, "satisfied")
+                self.assertIsNone(obs.elements)
+                wda.source.assert_not_called()
+                state, obs = ex.wait(conditions, full=True)
+                self.assertEqual(state, "satisfied")
                 self.assertIsNotNone(obs.elements)
-                self.assertIs(obs.secure, False)
                 wda.source.assert_called_once()
 
-    def test_app_wait_refuses_lock_unknown_lock_and_read_failure(self):
-        for error in (DeviceLocked("locked or unknown"), WDAUnavailable("read failed")):
-            with self.subTest(error=type(error).__name__):
-                ex, wda = executor([tap_grant()])
-                ex.offers(ex.observe())
-                wda.reset_mock()
-                wda.require_unlocked.side_effect = error
-                with self.assertRaises(type(error)):
-                    ex.wait((Condition("app", APP),))
-                ex.connection.invalidate.assert_called_once()
-                self.assertEqual(ex._offers, {})
-                wda.active_app.assert_not_called()
-                wda.source.assert_not_called()
-                self.assertIsNone(wda.deadline)
+    def test_read_only_wait_does_not_need_unlock_but_invalidates_on_read_failure(self):
+        ex, wda = executor([tap_grant()])
+        wda.require_unlocked.side_effect = DeviceLocked("locked or unknown")
+        self.assertEqual(ex.wait((Condition("app", APP),))[0], "satisfied")
+        wda.require_unlocked.assert_not_called()
+        wda.active_app.side_effect = WDAUnavailable("read failed")
+        with self.assertRaises(WDAUnavailable):
+            ex.wait((Condition("app", APP),))
+        ex.connection.invalidate.assert_called_once()
+        self.assertEqual(ex._offers, {})
+        wda.source.assert_not_called()
+        self.assertIsNone(wda.deadline)
 
     def test_app_only_observation_rejects_missing_or_invalid_process(self):
         for pid in (None, True, 0, -1, "1"):
@@ -181,14 +191,14 @@ class ExecutorTests(unittest.TestCase):
         ex, wda = executor([tap_grant()])
         observed = ex.observe()
         offer, = ex.offers(observed)
-        wda.source.side_effect = [source(), source(button_label="Finished")]
+        wda.source.return_value = source(button_label="Finished")
         result = ex.execute(offer.id)
         self.assertEqual((result.dispatch, result.verification), ("acknowledged", "satisfied"))
         wda.element_action.assert_called_once_with("ref", "click")
         self.assertEqual(ex.execute(offer.id).dispatch, "not_sent")
 
     def test_stale_moved_changed_app_and_duplicate_never_mutate(self):
-        for kind in ("old", "moved", "app", "duplicate", "generation", "foreign", "superseded", "restart", "obscured"):
+        for kind in ("old", "moved", "app", "duplicate", "generation", "foreign", "superseded", "obscured"):
             with self.subTest(kind=kind):
                 ex, wda = executor([tap_grant()])
                 observed = ex.observe()
@@ -196,17 +206,15 @@ class ExecutorTests(unittest.TestCase):
                 if kind == "old":
                     ex.freshness = 0.000001
                 elif kind == "moved":
-                    wda.source.return_value = source(button_x=10)
+                    wda.find_elements.return_value = []  # Exact old geometry no longer matches.
                 elif kind == "app":
-                    wda.active_app.return_value = {"bundleId": "other"}
+                    wda.app_state.return_value = 3
                 elif kind == "duplicate":
                     wda.find_elements.return_value = ["one", "two"]
                 elif kind == "generation":
                     ex.connection.generation = 2
                 elif kind == "superseded":
                     ex.observe()
-                elif kind == "restart":
-                    wda.active_app.return_value = {"bundleId": APP, "pid": 2}
                 elif kind == "obscured":
                     wda.element_hittable.return_value = False
                 else:
@@ -228,7 +236,7 @@ class ExecutorTests(unittest.TestCase):
     def test_acknowledged_action_readback_failure_is_not_action_failure(self):
         ex, wda = executor([tap_grant()])
         offer, = ex.offers(ex.observe())
-        wda.source.side_effect = [source(), WDAUnavailable("private")]
+        wda.source.side_effect = WDAUnavailable("private")
         result = ex.execute(offer.id)
         self.assertEqual((result.dispatch, result.verification, result.reason),
                          ("acknowledged", "unknown", "verification_unavailable"))
@@ -250,13 +258,13 @@ class ExecutorTests(unittest.TestCase):
         self.assertTrue(ex.stopped)
         self.assertEqual(ex.execute(offer.id).dispatch, "not_sent")
         wda.element_action.assert_called_once_with("ref", "click")
-        self.assertEqual(wda.source.call_count, 2)
+        self.assertEqual(wda.source.call_count, 1)
 
-    def test_append_requires_focus_and_verifies_exact_unicode(self):
+    def test_native_append_prepares_focus_and_verifies_exact_unicode(self):
         grant = Grant("append", APP, "Enter supplied text", FIELD, text_id="query")
         ex, wda = executor([grant], texts={"query": "hé🙂"})
         offer, = ex.offers(ex.observe())
-        wda.source.side_effect = [source(), source(value="hé🙂")]
+        wda.element_value.side_effect = ["", "hé🙂"]
         self.assertEqual(ex.execute(offer.id).verification, "satisfied")
         wda.element_action.assert_called_once_with("ref", "value", text="hé🙂")
         wda.source.side_effect = None
@@ -265,17 +273,19 @@ class ExecutorTests(unittest.TestCase):
         ex, wda = executor([grant], texts={"query": "hi"})
         offer, = ex.offers(ex.observe())
         wda.active_element.return_value = "different"
-        self.assertEqual(ex.execute(offer.id).dispatch, "not_sent")
-        wda.element_action.assert_not_called()
+        wda.element_value.side_effect = ["", "hi"]
+        self.assertEqual(ex.execute(offer.id).verification, "satisfied")
+        wda.active_element.assert_not_called()
+        wda.element_action.assert_called_once_with("ref", "value", text="hi")
 
     def test_missing_xml_value_requires_explicit_empty_read_before_append(self):
         grant = Grant("append", APP, "Enter supplied text", FIELD, text_id="query")
         missing = source().replace('value=""', '')
         ex, wda = executor([grant], xml=missing, texts={"query": "hello"})
         offer, = ex.offers(ex.observe())
-        wda.source.side_effect = [missing, source(value="hello")]
+        wda.element_value.side_effect = ["", "hello"]
         self.assertEqual(ex.execute(offer.id).verification, "satisfied")
-        wda.element_value.assert_called_once_with("ref")
+        self.assertEqual(wda.element_value.call_args_list, [call("ref", allow_null_empty=True)] * 2)
         ex, wda = executor([grant], xml=missing, texts={"query": "hello"})
         offer, = ex.offers(ex.observe())
         wda.element_value.side_effect = WDAUnavailable("unknown")
@@ -318,6 +328,7 @@ class ExecutorTests(unittest.TestCase):
     def test_replace_stops_after_clear_if_empty_cannot_be_verified(self):
         grant = Grant("replace", APP, "Replace supplied text", FIELD, text_id="query")
         ex, wda = executor([grant], xml=source(value="placeholder"), texts={"query": "hello"})
+        wda.element_value.return_value = "placeholder"
         offer, = ex.offers(ex.observe())
         result = ex.execute(offer.id)
         self.assertEqual(result.dispatch, "acknowledged")
@@ -329,7 +340,7 @@ class ExecutorTests(unittest.TestCase):
         grant = Grant("replace", APP, "Replace supplied text", FIELD, text_id="query")
         ex, wda = executor([grant], xml=source(value="old"), texts={"query": "new"})
         offer, = ex.offers(ex.observe())
-        wda.source.side_effect = [source(value="old"), source(), source(value="new")]
+        wda.element_value.side_effect = ["", "new"]
         result = ex.execute(offer.id)
         self.assertEqual((result.verification, result.acknowledged_substeps), ("satisfied", 2))
         self.assertEqual(wda.element_action.call_count, 2)

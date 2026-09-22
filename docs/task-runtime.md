@@ -25,7 +25,8 @@ result. An expired task may leave a server session for the next owner to replace
 Task session cleanup is additionally capped at two seconds so a stalled reader
 does not add a full command timeout merely releasing ownership.
 
-Source/screenshot requests have a separate 12-second socket timeout, capped by
+Read-only WDA requests (including app identity, element queries, values, source
+and screenshots) have a separate 12-second socket timeout, capped by
 the command timeout and remaining task/operation deadline. Override with global
 `--read-timeout SECONDS` (before the subcommand), or Python `read_timeout=`.
 The default allows the previously measured ~9.6-second Settings source capture;
@@ -72,7 +73,7 @@ requires an explicit `max_uses` (1–10), including scrolling. Reobserving does
 not replenish typing or tap permissions.
 
 ```python
-from openclaw_iphone.actions import Condition, Executor, Grant
+from openclaw_iphone.actions import Executor, Grant
 from openclaw_iphone.connection import TaskConnection
 from openclaw_iphone.devicectl import DeviceCtl
 from openclaw_iphone.observations import Selector
@@ -80,10 +81,8 @@ from openclaw_iphone.observations import Selector
 field = Selector("XCUIElementTypeSearchField", label="Search")
 with TaskConnection(DeviceCtl(), device="EXACT_PHYSICAL_UDID", seconds=60) as task:
     executor = Executor(task, (
-        Grant("tap", "your.app.bundle", "Focus search", field,
-              after=(Condition("focused", "your.app.bundle", field),)),
         Grant("append", "your.app.bundle", "Enter supplied query", field,
-              text_id="query", before=(Condition("focused", "your.app.bundle", field),)),
+              text_id="query"),
     ), texts={"query": "synthetic example"})
     observation = executor.observe()
     offers = executor.offers(observation)
@@ -99,10 +98,15 @@ into a misleading actionable snapshot. Secure values are discarded; the
 presence of any secure field disables offers. Raw local observations still
 contain private non-secure text; do not serialize them into logs or model input.
 
-`execute(offer.id)` consumes the observation's choices once. It captures fresh
-source, compares app/PID, target identity, ancestor context, location and value,
-resolves a unique WDA element reference, checks hittability, lock and foreground
-identity, then dispatches. Superseded/expired offers never remap to new indices.
+`execute(offer.id)` consumes the observation's choices once. It resolves a live
+native reference using the observed identity and location. Simple controls use
+native predicates; meaningful ancestor context retains XPath targeting.
+Pointer actions check hittability; field reads and native typing do not.
+A known-app foreground-state query and local freshness/device checks guard
+dispatch. Native targets are resolved anew, so a same-bundle process restart
+alone does not reject them; pixel evidence still requires the original PID.
+The transport checks lock state once per input transaction. No unconditional
+second XML capture is needed. Superseded/expired offers never remap to new indices.
 No guessed coordinates or icon semantics are used. WDA cannot make all these
 checks atomic with input; external clients, animations or human touches can
 still race. This is a safety improvement, not an isolation guarantee.
@@ -115,8 +119,8 @@ are not eligible. Scroll targets a verified container through WDA with fixed
 half-container distance; it checks scoped visible-item change, not unrelated
 screen activity. Change is progress, not independent task completion.
 
-Text entry requires the exact field to be focused, excludes secure fields and
-control/submission characters, and uses one native targeted input request for
+Native text entry lets WDA prepare focus on the exact field, excludes secure
+fields and control/submission characters, and uses one targeted input request for
 up to 4,096 supplied characters. WDA inserts at the current caret/selection;
 the runtime cannot establish an end-of-text caret. Consequently, `append` is
 only supported for empty fields: known nonempty values (including placeholders)
@@ -143,7 +147,7 @@ and empty OCR output are insufficient. It does not clear.
 If existing content must be reset, do so only in a separately authorized,
 verified workflow; generic custom-field clearing is not implemented.
 
-The whole input uses one fresh app/PID, field/focus check and native keyboard
+The whole input uses one foreground-app check, field/focus check and native keyboard
 layout. Every requested digit must resolve to one visible enabled key in that
 same keyboard. The observed key centers become separately timed touches in
 **one WDA request**, not six screen reads and native clicks. Coordinates are
@@ -166,17 +170,36 @@ actionability, focus or exact non-secure editable value. `wait()` polls them
 within the earlier operation/task deadline. Conditions are conjoined; no code,
 expressions or scripts are evaluated. A missing attribute is not successful
 verification. `StepResult` separates dispatch, verification and acknowledged
-compound substeps. Failed verification stops the executor; it never replays a
-successful tap or partially completed replacement. Inspect/replan explicitly.
+compound substeps. An acknowledged fixed action with an unsatisfied result stops
+the executor; an expired verification window instead leaves its original
+conditions pending for read-only reconciliation. Neither replays a successful
+tap or partially completed replacement. Unknown writes remain stopped.
 
-App-only waits use lock-state and one foreground bundle/PID read, not
+App-only waits use one foreground bundle/PID read, without lock preflight or
 the accessibility tree. Their returned `Observation` has `elements=None` and
 `secure=None`: screen contents and secure-field presence were **not observed**.
-It can verify app identity only; element conditions return `unknown`, direct
-element matching is rejected, and it cannot produce action offers or Jev input.
-Call `observe()` again for a full screen before targeting. Full observation and
-fresh target validation before dispatch remain unchanged. Mixed/element waits
-(including text readback) still acquire the full tree.
+It can verify app identity only; unevaluated element conditions return `unknown`,
+direct element matching is rejected, and it cannot produce action offers or Jev
+input. Value/focus/existence waits use targeted native queries and retain
+only those exact condition results alongside app-only evidence. Those proofs
+are discarded on mutation or another observation; they never prove absence of
+other elements. A new decision that needs controls acquires its full tree once.
+Absence/actionability waits still use XML. A simple selector uses a native
+predicate, while ancestry-sensitive selectors retain XPath (which itself builds
+XML inside WDA). Field resolution, focus and value reads are shared within one
+predicate pass, never across subsequent enumerations. Same-field readback reuses
+the selected native reference; only an explicit stale read permits read-only
+re-resolution. Transport failures never cause input replay.
+
+The task loop reuses a fresh full post-action observation for its next decision.
+Task completion is an independent predicate evaluation, not necessarily another
+device capture. Full observations take XML plus one app identity read, without
+lock preflight or a second app bracket. They do not prove an atomic screen/app
+capture. Final task existence proofs use a targeted query when the final grant
+already supplies the task's success conditions. Intermediate navigation still
+captures the next screen for reuse. Coordinate actions retain PID and geometry
+checks because their target is not a native reference. None of these separate
+requests makes capture and input atomic.
 
 If an action verifies only app identity but task completion needs element evidence,
 the task loop takes a full read-only observation under the remaining task budget,

@@ -44,8 +44,16 @@ class WDAUnsupportedCommand(WDAUnavailable):
     """The server explicitly rejected an unsupported route; fallback is safe."""
 
 
+class WDAStaleElement(WDAUnavailable):
+    """A read used an expired native reference; re-resolving for a read is safe."""
+
+
 class WDAOutcomeUnknown(WDAUnavailable):
     """A mutating request may have executed. Observe state before any retry."""
+
+
+class VerificationExpired(OpenClawIPhoneError):
+    """The read-only verification window ended; dispatch outcome is unchanged."""
 
 
 class SessionOutputUnavailable(OpenClawIPhoneError):

@@ -7,7 +7,7 @@ from pathlib import Path
 import time
 
 from .actions import Condition, Executor, Grant, Offer
-from .errors import OpenClawIPhoneError
+from .errors import OpenClawIPhoneError, VerificationExpired
 from .execution import TaskStopped
 from .jev import DecisionUnavailable, JevDriver, LowConfidenceDecision, strict_json
 from .observations import Observation, Selector
@@ -185,7 +185,7 @@ def run_task(executor: Executor, spec: TaskSpec, *, driver: JevDriver | None = N
 
     try:
         for step in range(spec.limits.max_steps):
-            observation = executor.observe()
+            observation = executor.current()
             state = executor.verify(observation, spec.success)
             if state == "satisfied":
                 return finish("completed", "conditions_verified", state)
@@ -223,8 +223,12 @@ def run_task(executor: Executor, spec: TaskSpec, *, driver: JevDriver | None = N
                 if choice == "done":
                     return finish("escalated", "completion_not_verified", state)
                 continue
-            result = executor.execute(choice)
             index = next((offer.grant_index for offer in offers if offer.id == choice), None)
+            # A final known postcondition needs only its predicate, not another
+            # tree of controls. Intermediate navigation still returns the next
+            # screen once, reused by the following iteration.
+            final = index is not None and set(spec.success) <= set(spec.grants[index].after)
+            result = executor.execute(choice, observe_next=not final)
             events.append({"grant_index": index, "dispatch": result.dispatch, "verification": result.verification,
                            "reason": result.reason, "acknowledged_substeps": result.acknowledged_substeps,
                            "error_type": result.error_type})
@@ -248,6 +252,8 @@ def run_task(executor: Executor, spec: TaskSpec, *, driver: JevDriver | None = N
         return finish("escalated", "low_confidence")
     except DecisionUnavailable:
         return finish("escalated", "model_unavailable")
+    except VerificationExpired:
+        return finish("escalated", "verification_expired")
     except OpenClawIPhoneError:
         return finish("blocked", "observation_unavailable")
     except KeyboardInterrupt:

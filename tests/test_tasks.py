@@ -233,7 +233,7 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["steps"], 1)
 
-    def test_app_transition_keeps_full_predispatch_checks_but_no_postdispatch_source(self):
+    def test_app_transition_uses_targeted_predispatch_check_and_no_postdispatch_source(self):
         grant = replace(tap_grant(), after=(Condition("app", "next.app"),))
         spec = TaskSpec("Navigate to next app", (grant,), grant.after, limits=Limits(max_steps=1))
         ex, wda = executor([grant])
@@ -241,7 +241,7 @@ class TaskTests(unittest.TestCase):
         result = run_task(ex, spec)
         self.assertEqual((result["status"], result["verification"], result["steps"]), ("completed", "satisfied", 1))
         wda.element_action.assert_called_once_with("ref", "click")
-        self.assertEqual(wda.source.call_count, 2)  # Selection and fresh target validation.
+        self.assertEqual(wda.source.call_count, 1)  # Selection; validation queries the exact target.
         self.assertIsNone(ex.latest.elements)
         self.assertIsNone(ex.latest.secure)
 
@@ -263,7 +263,7 @@ class TaskTests(unittest.TestCase):
                 self.assertEqual((result["status"], result["verification"], result["steps"]),
                                  ("completed", "satisfied", 1))
                 wda.element_action.assert_called_once_with("ref", "click")
-                self.assertEqual(wda.source.call_count, 3)
+                self.assertEqual(wda.source.call_count, 2)
                 if driver:
                     driver.choose.assert_called_once()
 
@@ -279,12 +279,12 @@ class TaskTests(unittest.TestCase):
             with self.subTest(reason=reason):
                 ex, wda = executor([grant])
                 wda.active_app.side_effect = lambda: {"bundleId": "next.app" if wda.element_action.called else APP, "pid": 1}
-                wda.source.side_effect = [source(), source(), readback]
+                wda.source.side_effect = [source(), readback]
                 result = run_task(ex, spec)
                 self.assertEqual((result["status"], result["reason"]), (status, reason))
                 self.assertEqual(result["events"][0]["dispatch"], "acknowledged")
                 wda.element_action.assert_called_once_with("ref", "click")
-                self.assertEqual(wda.source.call_count, 3)
+                self.assertEqual(wda.source.call_count, 2)
 
     def test_decision_only_is_non_mutating_and_step_limits_apply(self):
         grant = tap_grant()

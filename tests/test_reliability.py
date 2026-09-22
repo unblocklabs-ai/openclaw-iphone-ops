@@ -157,7 +157,8 @@ class KeypadTests(unittest.TestCase):
             text = source(value=state["value"], extra=keys)
             return text.replace("XCUIElementTypeTextField", "XCUIElementTypeOther") if custom else text
         wda.source.side_effect = xml
-        wda.find_elements.side_effect = lambda xpath: ["key1" if "@name='1'" in xpath else "key2" if "@name='2'" in xpath else "field"]
+        wda.find_elements.side_effect = lambda xpath, **kwargs: ([f"key{digit}" for digit in "12" if f"@name='{digit}'" in xpath]
+                                                      if "XCUIElementTypeKey[" in xpath else ["field"])
         wda.active_element.return_value = "field"
         wda.element_value.side_effect = lambda *args, **kwargs: state["value"]
         wda.tap_sequence.side_effect = lambda points: state.update(value="12")
@@ -172,8 +173,8 @@ class KeypadTests(unittest.TestCase):
             self.assertEqual(state["value"], "12")
             wda.tap_sequence.assert_called_once_with([(15.0, 615.0), (55.0, 615.0)])
             wda.element_action.assert_not_called()
-            # Initial observation, pre-dispatch validation, final readback.
-            self.assertEqual(wda.source.call_count, 3)
+            # One initial tree; key validation and final value use native queries.
+            self.assertEqual(wda.source.call_count, 1)
             wda.element_value.assert_any_call("field", allow_null_empty=not custom)
             self.assertEqual(ex.execute(offer.id).dispatch, "not_sent")
 
@@ -188,7 +189,7 @@ class KeypadTests(unittest.TestCase):
             elif kind == "focus":
                 wda.active_element.return_value = "other"
             else:
-                wda.source.side_effect = lambda: source().replace("XCUIElementTypeTextField", "XCUIElementTypeOther")
+                wda.find_elements.side_effect = lambda xpath, **kwargs: [] if "XCUIElementTypeKey[" in xpath else ["field"]
             self.assertEqual(ex.execute(offer.id).dispatch, "not_sent")
             wda.element_action.assert_not_called()
             wda.tap_sequence.assert_not_called()
@@ -203,7 +204,7 @@ class KeypadTests(unittest.TestCase):
                 wda.tap_sequence.side_effect = WDAOutcomeUnknown("PRIVATE")
             else:
                 def click(*args):
-                    wda.source.side_effect = WDAUnavailable("PRIVATE")
+                    wda.element_value.side_effect = WDAUnavailable("PRIVATE")
                 wda.tap_sequence.side_effect = click
             result = ex.execute(offer.id)
             self.assertNotEqual(result.verification, "satisfied")
@@ -239,19 +240,17 @@ class KeypadTests(unittest.TestCase):
         self.assertEqual(result.verification, "satisfied")
         wda.tap_sequence.assert_called_once()
 
-    def test_focus_change_duplicate_keys_secure_or_foreign_app_stop_before_batch(self):
-        for kind in ("focus", "duplicate", "secure", "app"):
+    def test_focus_change_duplicate_keys_changed_target_or_foreign_app_stop_before_batch(self):
+        for kind in ("focus", "duplicate", "target", "app"):
             ex, wda, state = self.make(custom=True)
             offer, = ex.offers(ex.observe())
-            original_source = wda.source.side_effect
             if kind == "focus":
                 wda.active_element.return_value = "different"
-            elif kind in {"duplicate", "secure"}:
-                extra = ('<XCUIElementTypeKeyboard><XCUIElementTypeKey name="2" visible="true" enabled="true" x="5" y="600" width="30" height="30"/></XCUIElementTypeKeyboard>'
-                         if kind == "duplicate" else '<XCUIElementTypeSecureTextField/>')
-                wda.source.side_effect = lambda: original_source().replace('</XCUIElementTypeApplication>', extra + '</XCUIElementTypeApplication>')
+            elif kind in {"duplicate", "target"}:
+                wda.find_elements.side_effect = lambda query, **kwargs: [] if (
+                    "count(" in query if kind == "duplicate" else '"XCUIElementTypeOther"' in query) else ["field"]
             else:
-                wda.active_app.return_value = {"bundleId": "different.app", "pid": 2}
+                wda.app_state.return_value = 3
             result = ex.execute(offer.id)
             self.assertEqual(result.dispatch, "not_sent")
             self.assertNotEqual(result.verification, "satisfied")
@@ -271,7 +270,7 @@ class PlannerTests(unittest.TestCase):
         two = session.request({"op": "observe"})
         action = two["observation"]["actions"][0]["id"]
         self.assertEqual(session.request({"op": "execute", "id": old})["dispatch"], "not_sent")
-        wda.source.side_effect = [source(), source(button_label="Finished")]
+        wda.source.return_value = source(button_label="Finished")
         result = session.request({"op": "execute", "id": action})
         self.assertEqual(result["verification"], "satisfied")
         self.assertEqual(session.request({"op": "execute", "id": action})["dispatch"], "not_sent")
@@ -281,13 +280,13 @@ class PlannerTests(unittest.TestCase):
         session, wda = self.make()
         observed = session.request({"op": "observe"})["observation"]
         action = observed["actions"][0]["id"]
-        wda.source.side_effect = [source(), source(button_label="Finished")]
+        wda.source.return_value = source(button_label="Finished")
         result = session.request({"op": "execute", "id": action})
         self.assertIn("observation", result)
         self.assertIn("actions", result["observation"])
         self.assertEqual(result["observation"]["action_blockers"],
                          [{"grant_index": 0, "operation": "tap", "reason": "grant_exhausted"}])
-        self.assertEqual(wda.source.call_count, 3)
+        self.assertEqual(wda.source.call_count, 2)
 
     def test_next_choices_failure_preserves_acknowledged_result(self):
         session, wda = self.make()
@@ -314,9 +313,11 @@ class PlannerTests(unittest.TestCase):
     def test_done_is_independent_and_close_does_not_claim_completion(self):
         session, wda = self.make()
         wda.source.return_value = source(button_label="Other")
+        wda.find_elements.return_value = []
         self.assertEqual(session.request({"op": "done"})["status"], "incomplete")
         self.assertFalse(session.closed)
         wda.source.return_value = source()
+        session.request({"op": "observe"})  # A changed screen needs new evidence, not repeated done.
         self.assertEqual(session.request({"op": "done"})["status"], "completed")
         with self.assertRaises(TaskStopped):
             session.request({"op": "observe"})
@@ -456,7 +457,7 @@ class SessionIntegrationTests(unittest.TestCase):
                         pass
             sessions = sum(c.args[0] == "/session" for c in wda._send.call_args_list)
             counts.append((ctl.select_device.call_count, sessions, wda._send.call_count))
-        self.assertEqual(counts, [(3, 3, 27), (1, 1, 17)])
+        self.assertEqual(counts, [(3, 3, 21), (1, 1, 11)])
 
     def test_cli_protocol_exit_and_cleanup_warning_preserve_completion(self):
         ctl, wda = self.transport()

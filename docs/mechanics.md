@@ -38,19 +38,19 @@ This requires a working Apple Developer signing setup. If signing or provisionin
 
 Use WebDriverAgent when repeated UI control is needed through HTTP.
 
-Before trusting WDA:
+Prefer one task-scoped session. Acquisition checks the physical device, readiness
+and lock state once; nested primitives reuse the session. One-shot CLI commands
+still create their own sessions and are better suited to manual diagnostics.
+Use `doctor --check-ui` when diagnosing a broken connection, not before each task.
 
-1. Confirm the endpoint responds.
-2. Check `/status` and require `ready: true`.
-3. Make one live call such as `/source`, `/screenshot`, or session creation.
-
-The current primitives create short-lived sessions. Session cleanup failures
+Session cleanup failures
 warn separately and do not change the action outcome. Do not replay actions
 because cleanup failed; inspect state after any ambiguous action failure.
 
 ## Lock State Rule
 
-Always check lock state before foreground launches, tests, or taps.
+The runtime checks lock state at the mutation boundary; do not add separate CLI
+lock probes before every task action.
 For unattended OpenClaw hosts, prevent lock interruptions by setting
 `Settings -> Display & Brightness -> Auto-Lock -> Never` when device policy
 allows it.

@@ -80,7 +80,7 @@ ships the Python CLI, both agent skills, docs, and service snippets; there are
 no JavaScript/Python runtime dependencies or install-time scripts.
 
 ```sh
-npm install -g @unblocklabs/openclaw-iphone-ops@0.4.0
+npm install -g @unblocklabs/openclaw-iphone-ops@0.4.1
 openclaw-iphone --version
 openclaw-iphone --help
 openclaw-iphone devices list
@@ -109,7 +109,7 @@ installed package. npm installation does not establish live-device readiness.
 The [GitHub release](https://github.com/unblocklabs-ai/openclaw-iphone-ops/releases)
 also provides a Python wheel and source distribution. Install a downloaded
 wheel into a Python 3.11+ virtual environment with `python3 -m pip install
-/path/to/openclaw_iphone_ops-0.4.0-py3-none-any.whl`. The wheel contains only the
+/path/to/openclaw_iphone_ops-0.4.1-py3-none-any.whl`. The wheel contains only the
 Python CLI; the source distribution and npm package also include the skills,
 docs, and snippets. There is no automated PyPI or ClawHub publication.
 
@@ -147,16 +147,15 @@ is foregrounded, it writes a warning instead of returning stale context. Use the
 manifest with the `video-understand` skill after extracting or spoofing the
 corresponding Instagram video asset URL.
 
-Check WebDriverAgent and capture the current UI when WDA is already running:
+For a one-off diagnosis of an already-running WDA:
 
 ```sh
-PYTHONPATH=src python3 -m openclaw_iphone wda status
-PYTHONPATH=src python3 -m openclaw_iphone wda locked
-PYTHONPATH=src python3 -m openclaw_iphone wda unlock --verify
-PYTHONPATH=src python3 -m openclaw_iphone watchdog once
-PYTHONPATH=src python3 -m openclaw_iphone ui screenshot
-PYTHONPATH=src python3 -m openclaw_iphone ui source
+PYTHONPATH=src python3 -m openclaw_iphone doctor --check-ui
 ```
+
+Normal workflows acquire one task session instead. Read its returned observation;
+capture a screenshot separately only when visual evidence is needed. Run a single
+unlock attempt only for a diagnosed passcode-free screen lock, not as a preflight.
 
 After a screenshot/source confirms the UI state, prefer semantic accessibility
 primitives over raw coordinates:
@@ -365,18 +364,17 @@ For always-on agent use, see `docs/launchagent-service.md`. It scopes the
 LaunchAgent wrapper for running the WDA runner as a restartable per-user service
 with logs.
 
-Validated local example:
+Manual setup example (run the runner in its own terminal):
 
 ```sh
 PYTHONPATH=src python3 -m openclaw_iphone wda run \
   --allow-provisioning-updates
 
-PYTHONPATH=src python3 -m openclaw_iphone wda url
-PYTHONPATH=src python3 -m openclaw_iphone wda status
-PYTHONPATH=src python3 -m openclaw_iphone ui screenshot
-PYTHONPATH=src python3 -m openclaw_iphone ui source
-PYTHONPATH=src python3 -m openclaw_iphone ui tap --x 180 --y 420
+PYTHONPATH=src python3 -m openclaw_iphone doctor --check-ui
 ```
+
+After setup, use one `task session` for multi-step control; its acquisition
+already checks readiness. Do not repeat this diagnostic before every workflow.
 
 The CLI does not change the host's global Xcode selection by itself.
 
@@ -387,17 +385,17 @@ Ask for the phone explicitly and include the repo/path context when useful:
 ```text
 Use the plugged-in physical iPhone via WebDriverAgent from
 the canonical openclaw-iphone checkout. Use the host config at
-~/.openclaw/iphone/config.env. First verify WDA with
-PYTHONPATH=src python3 -m openclaw_iphone wda status. If WDA is not running,
-start the WDA runner, then verify with status, screenshot, and source before
-interacting with apps.
+~/.openclaw/iphone/config.env. Use one task session and reuse its returned
+observations and verified results. Acquisition checks device/readiness/lock.
+If acquisition fails, diagnose with doctor --check-ui and inspect the runner;
+do not add repeated status, screenshot and source commands to the action loop.
 ```
 
 For task-specific work, name the app and desired end state:
 
 ```text
 Use the physical iPhone, not a simulator. Launch Instagram on the plugged-in
-iPhone, verify the UI through WDA screenshot/source, then perform [task].
+iPhone, observe the current UI in the task session, then perform [task].
 Stop and report the exact blocker if the phone is locked, WDA is not ready, or
 a secure confirmation requires human input.
 ```

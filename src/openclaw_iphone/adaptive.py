@@ -5,23 +5,33 @@ it cannot supply input, coordinates, operations or additional authority.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 import math
 import os
 from pathlib import Path
 import stat
 import time
 import unicodedata
+import uuid
 
 from .actions import Condition, Executor
-from .errors import OpenClawIPhoneError, WDAOutcomeUnknown, WDAUnavailable
+from .errors import OpenClawIPhoneError, VerificationExpired, WDAOutcomeUnknown, WDAUnavailable
 from .evidence import artifact_path, write_private
 from .jev import DecisionUnavailable, JevDriver, LowConfidenceDecision
-from .observations import EDITABLE, Observation, ObservationRejected, Selector, keypad_points
+from .observations import EDITABLE, Element, Observation, ObservationRejected, Selector
 
 SECURE = "XCUIElementTypeSecureTextField"
 INPUTS = EDITABLE | {SECURE, "XCUIElementTypeOther"}
 CONTROLS = INPUTS | {"XCUIElementTypeButton", "XCUIElementTypeCell", "XCUIElementTypeLink",
                      "XCUIElementTypeStaticText"}
+
+
+@dataclass(frozen=True)
+class VisualEvidence:
+    observation: Observation
+    device_size: tuple[float, float]
+    image_size: tuple[int, int]
+    id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
 
 def normalized(value: str) -> str:
@@ -66,9 +76,8 @@ class AdaptiveAct:
         self.ex, self.scope, self.driver = executor, scope, driver
         self.max_decisions, self.decisions = max_decisions, 0
         self.evidence_base = evidence_base
-        self.visual = None
+        self.visual: VisualEvidence | None = None
         self.secrets: set[str] = set()
-        self.private_bounds: list[tuple] = []
         self.pending_input = None
         self.pending_target = None
 
@@ -98,10 +107,7 @@ class AdaptiveAct:
         return result
 
     def _current(self) -> Observation:
-        observation = self.ex.latest
-        if observation is None or time.monotonic() - observation.started > self.ex.freshness:
-            observation = self.ex.observe()
-        self.ex._check_snapshot(observation)
+        observation = self.ex.current()
         if observation.app not in self.scope["apps"] or observation.elements is None:
             raise ObservationRejected("Adaptive action is outside the observed app scope.")
         return observation
@@ -154,20 +160,17 @@ class AdaptiveAct:
         target = next((e for e in candidates if e.id == decision.choice), None)
         return target, "jev" if target else "no_match", decision.summary()
 
-    def _refresh_target(self, original, target, *, visual_keypad: bool = False):
+    def _target_reference(self, original: Observation, target: Element, *, visual_keypad: bool = False,
+                          hittable: bool = True) -> str | None:
         self.ex._check_snapshot(original)
-        current = self.ex.observe()
-        matches = [e for e in current.elements or () if e.fingerprint() == target.fingerprint()]
-        if (current.app, current.process_id) != (original.app, original.process_id) or len(matches) != 1:
-            raise ObservationRejected("Target/app changed during selection; choose again.")
-        if time.monotonic() - original.started > self.ex.freshness:
-            raise ObservationRejected("Selection expired during validation.")
-        self.validation_stage = "target_hittability"
+        self.validation_stage = "target_hittability" if hittable else "target_identity"
         # A visual-confirmed code container is never clicked; an AX grouping
         # need not have a hit point. The current native keypad supplies points.
-        reference = None if visual_keypad else self.ex._reference(matches[0])
-        self.ex._guard_app(current.app, current.process_id)
-        return current, matches[0], reference
+        if visual_keypad:
+            if len(self.ex.connection.require_active().find_elements(target.xpath)) != 1:
+                raise ObservationRejected("Custom input changed since visual confirmation.")
+            return None
+        return self.ex._reference(target, hittable=hittable)
 
     def act(self, request: object) -> dict:
         from .tasks import conditions, object_fields, text
@@ -184,7 +187,7 @@ class AdaptiveAct:
             raise ValueError("Postcondition app is outside scope.")
         correcting = (self.pending_input is not None and self.pending_target is not None and
                       action == "input" and data.get("mode") == "replace")
-        if self.ex.stopped or self.pending_input is not None and not correcting:
+        if self.ex.stopped or self.ex.pending is not None or self.pending_input is not None and not correcting:
             return {"status": "blocked", "dispatch": "not_sent", "reason": "input_requires_reconciliation"}
         if action in {"input", "keypad"}:
             if data.get("text_ref") not in self.scope["inputs"] or data.get("mode", "empty") not in {"empty", "replace"}:
@@ -197,11 +200,10 @@ class AdaptiveAct:
         visual, self.visual = self.visual, None
         self.validation_stage = "snapshot"
         acknowledged = 0
-        dispatching = False
         current = None
         resolution, decision = "caller", None
         try:
-            original = self._current()
+            original = current = self._current()
             target = None
             if action != "relaunch":
                 target, resolution, decision = self._target(data, original)
@@ -209,11 +211,9 @@ class AdaptiveAct:
                     return {"status": "fallback", "dispatch": "not_sent", "reason": resolution, "decision": decision}
                 self.validation_stage = "target_identity"
                 visual_keypad = (action == "keypad" and target.role == "XCUIElementTypeOther" and
-                                 visual is not None and data.get("empty_focus_confirmed") == original.id == visual[0].id)
-                current, target, reference = self._refresh_target(original, target, visual_keypad=visual_keypad)
-            else:
-                current = original
-                self.ex._guard_app(original.app, original.process_id)
+                                 visual is not None and data.get("empty_focus_confirmed") == visual.id
+                                 and original is visual.observation)
+                reference = self._target_reference(original, target, visual_keypad=visual_keypad, hittable=action == "tap")
             wda = self.ex.connection.require_active()
             if action in {"input", "keypad"}:
                 identity = (current.app, target.role, target.name, target.label)
@@ -223,11 +223,11 @@ class AdaptiveAct:
                 self.secrets.add(supplied)
                 self.validation_stage = "visual_input_confirmation"
                 visual_input = (target.role == "XCUIElementTypeOther" and visual is not None
-                                and data.get("empty_focus_confirmed") == original.id == visual[0].id
+                                and data.get("empty_focus_confirmed") == visual.id and original is visual.observation
                                 and data.get("mode", "empty") == "empty")
-                # _refresh_target already revalidated the exact field, app,
-                # geometry and freshness. Unrelated countdown labels are not
-                # evidence that this field changed. The input is one operation,
+                # The native query revalidates the exact field and geometry.
+                # The dispatch guard checks app/freshness. Unrelated countdown
+                # labels do not prove this field changed. Input is one operation,
                 # not an observation/decision/verification cycle per character.
                 if "empty_focus_confirmed" in data and not visual_input:
                     raise ObservationRejected("Custom-input visual confirmation is stale or incompatible.")
@@ -235,9 +235,6 @@ class AdaptiveAct:
                     raise ValueError("Secure/custom input needs an independently observable destination.")
                 if after and self.ex.verify(current, after) == "satisfied":
                     raise ObservationRejected("Input destination already satisfied; no input dispatched.")
-                self.validation_stage = "input_focus"
-                if not visual_input and wda.active_element() != reference:
-                    raise ObservationRejected("Focus intended input before entering local text.")
                 if action == "keypad" and (len(supplied) > 32 or any(c not in "0123456789" for c in supplied)):
                     raise ValueError("Keypad input requires 1–32 digits.")
                 # Construct every fallible predicate before the first mutation.
@@ -249,43 +246,40 @@ class AdaptiveAct:
                 # fields use explicit replace; clear acknowledgement alone is
                 # not treated as proof of emptiness.
                 replacing = data.get("mode", "empty") == "replace"
-                if replacing:
-                    dispatching = True
-                    wda.element_action(reference, "clear")
-                    acknowledged += 1
-                    dispatching = False
-                self.validation_stage = "input_empty"
-                if not visual_input:
-                    value = wda.element_value(reference, allow_null_empty=target.role in EDITABLE)
-                    # WDA deliberately substitutes placeholderValue for empty
-                    # TextFields. Accept it only after an explicitly requested,
-                    # acknowledged clear and a matching native placeholder.
-                    if value and not (replacing and value == wda.element_placeholder(reference)):
-                        raise ObservationRejected("Input is not verified empty; authorize replacement if appropriate.")
-                    self.ex._guard_app(current.app, current.process_id)
-                    if wda.active_element() != reference:
-                        raise ObservationRejected("Focus changed after empty verification.")
-                self.private_bounds.append((current.app, target.bounds))
                 self.pending_input = input_conditions
                 self.pending_target = identity if target.role in EDITABLE and not after else None
-                if action == "keypad":
-                    points = keypad_points(current, supplied)
-                    self.ex._check_snapshot(current)
-                    self.ex._guard_app(current.app, current.process_id)
-                    dispatching = True
-                    wda.tap_sequence(points)
-                    acknowledged += 1
-                    dispatching = False
-                else:
-                    dispatching = True
-                    if data.get("strategy", "native") == "sequential":
-                        wda.type_text(supplied, frequency=8)
+                self.ex._dispatch_guard(current)
+                self.ex.discard()
+                with wda.input_transaction():
+                    if replacing:
+                        self.ex._check_binding(current)
+                        wda.element_action(reference, "clear")
+                        acknowledged += 1
+                    self.validation_stage = "input_empty"
+                    if not visual_input:
+                        value = wda.element_value(reference, allow_null_empty=target.role in EDITABLE)
+                        # Empty fields may expose their placeholder after clear.
+                        if value and not (replacing and value == wda.element_placeholder(reference)):
+                            raise ObservationRejected("Input is not verified empty; authorize replacement if appropriate.")
+                        if action == "keypad" or data.get("strategy") == "sequential":
+                            self.validation_stage = "input_focus"
+                            if wda.active_element() != reference:
+                                raise ObservationRejected("Focus changed after empty verification.")
+                    if action == "keypad":
+                        points = self.ex._keypad_points(current, supplied)
+                        self.ex._check_binding(current)
+                        wda.tap_sequence(points)
                     else:
-                        wda.element_action(reference, "value", text=supplied)
+                        self.ex._check_binding(current)
+                        if data.get("strategy", "native") == "sequential":
+                            wda.type_text(supplied, frequency=8)
+                        else:
+                            # Native element typing prepares focus on this target.
+                            wda.element_action(reference, "value", text=supplied)
                     acknowledged += 1
-                    dispatching = False
             else:
-                dispatching = True
+                self.ex._dispatch_guard(current)
+                self.ex.discard()
                 if action == "tap":
                     wda.element_action(reference, "click")
                     acknowledged += 1
@@ -294,43 +288,41 @@ class AdaptiveAct:
                     acknowledged += 1
                     wda.activate_app(current.app)
                     acknowledged += 1
-                dispatching = False
-            if after:
+            if action in {"input", "keypad"}:
+                references = {input_conditions[0].target: reference} if not after and reference and input_conditions else None
+                state, current = self.ex.wait(input_conditions, once=not after, references=references)
+            elif after:
                 state, current = self.ex.wait(after)
             else:
                 current = self.ex.observe()
                 state = "unknown"
-                if action in {"input", "keypad"} and target.role in EDITABLE:
-                    matches = [e for e in current.elements if e.path == target.path and
-                               (e.role, e.name, e.label) == (target.role, target.name, target.label)]
-                    if len(matches) == 1 and (current.app, current.process_id) == (original.app, original.process_id):
-                        # The fresh XML already contains most readable values.
-                        # If omitted, read the existing native field reference;
-                        # don't serialize/query the entire tree a second time.
-                        readback = matches[0].value
-                        if readback is None:
-                            readback = wda.element_value(reference)
-                        state = "satisfied" if readback == supplied else "unsatisfied"
             if action in {"input", "keypad"} and state == "satisfied":
                 self.pending_input = None
                 self.pending_target = None
             reason = "verified" if state == "satisfied" else "inspect_result"
             result = {"status": "step", "dispatch": "acknowledged", "verification": state, "reason": reason}
             if action == "input" and not after and state in {"satisfied", "unsatisfied"}:
+                readback = self.ex._values.get(input_conditions[0])
                 result["readback"] = {"matches": state == "satisfied", "expected_characters": len(supplied),
-                                      "observed_characters": len(readback)}
+                                      "observed_characters": len(readback) if readback is not None else None}
         except WDAOutcomeUnknown:
             self.ex.stopped = True
             self.ex.connection.invalidate(uncertain=True)
             result = {"status": "blocked", "dispatch": "unknown", "verification": "unknown", "reason": "mutation_outcome_unknown"}
             current = None
+        except VerificationExpired:
+            if acknowledged:
+                self.pending_target = None  # A missing readback is not a known mismatch to replace.
+            result = {"status": "fallback", "dispatch": "acknowledged" if acknowledged else "not_sent",
+                      "verification": "unknown", "reason": "verification_expired"}
+            current = None
         except OpenClawIPhoneError as exc:
             if isinstance(exc, WDAUnavailable):
                 self.ex.connection.invalidate()
-            if action in {"input", "keypad"} and (acknowledged or dispatching):
-                self.ex.stopped = True
-            elif not correcting:
+            if not acknowledged and not correcting:
                 self.pending_input = None
+                self.pending_target = None
+            elif acknowledged:
                 self.pending_target = None
             result = {"status": "fallback", "dispatch": "acknowledged" if acknowledged else "not_sent",
                       "verification": "unknown", "reason": "verification_unavailable" if acknowledged else "validation_failed",
@@ -345,61 +337,70 @@ class AdaptiveAct:
 
     def reconcile(self) -> dict:
         """Read only. Only the original destination may release pending input."""
-        observation = self.ex.observe()
-        state = self.ex.verify(observation, self.pending_input or ())
+        state, observation = self.ex.wait(self.pending_input or self.ex.pending or (), once=True)
         if state == "satisfied" and not self.ex.stopped:
             self.pending_input = None
             self.pending_target = None
         return {"status": "observed", "verification": state, "observation": observation}
 
-    def screenshot(self) -> dict:
+    def screenshot(self, *, redact: object = None) -> dict:
         from .image_evidence import redact_png
-        observation = self.ex.observe()
-        self._current()
+        self.visual = None
+        previous = self.ex.latest
+        observation = self.ex.current(full=False)
+        if observation.app not in self.scope["apps"]:
+            raise ObservationRejected("Screenshot is outside the authorized app scope.")
+        if redact is None:
+            if observation.elements is None:
+                raise ObservationRejected("Screenshot-only capture requires explicit redaction rectangles, or [] for a caller-confirmed non-sensitive screen.")
+            bounds = [e.bounds for e in observation.elements if e.bounds and
+                      (e.role in EDITABLE | {SECURE} or any(secret in (e.name or "") or secret in (e.label or "")
+                                              for secret in self.secrets))]
+        else:
+            if (not isinstance(redact, list) or len(redact) > 100 or
+                    any(not isinstance(b, list) or len(b) != 4 or
+                        any(type(v) not in (int, float) or not math.isfinite(v) or v < 0 for v in b)
+                        or min(b[2:]) <= 0 for b in redact)):
+                raise ValueError("Redaction requires bounded [x,y,width,height] rectangles in device points.")
+            bounds = redact
         wda = self.ex.connection.require_active()
         size = wda.window_size()
         raw = wda.screenshot()
-        self.ex._guard_app(observation.app, observation.process_id)
-        bounds = [e.bounds for e in observation.elements if e.bounds and
-                  (e.role in EDITABLE | {SECURE} or any(secret in (e.name or "") or secret in (e.label or "")
-                                          for secret in self.secrets))]
-        bounds += [b for app, b in self.private_bounds if app == observation.app]
+        if observation is previous:
+            self.ex._guard_app(observation.app, observation.process_id)
         raw, pixels = redact_png(raw, size, bounds)
         self.ex._check_snapshot(observation)
         path = artifact_path("adaptive-screen", suffix=".png", base=self.evidence_base)
         write_private(path, raw)
-        self.visual = (observation, size, pixels)
-        return {"status": "screenshot", "path": str(path), "snapshot_id": observation.id,
+        self.visual = VisualEvidence(observation, size, pixels)
+        return {"status": "screenshot", "path": str(path), "snapshot_id": self.visual.id,
                 "image_size": pixels, "device_size": size, "redacted_regions": len(bounds)}
 
     def vision_tap(self, request: object) -> dict:
         from .tasks import object_fields
         data = object_fields(request, {"op", "snapshot_id", "x", "y"}, {"op", "snapshot_id", "x", "y"})
-        if "vision_tap" not in self.scope["operations"] or self.ex.stopped or self.pending_input is not None:
+        if ("vision_tap" not in self.scope["operations"] or self.ex.stopped
+                or self.ex.pending is not None or self.pending_input is not None):
             raise ObservationRejected("Vision input is not authorized/available.")
         visual, self.visual = self.visual, None
-        if visual is None or data["snapshot_id"] != visual[0].id:
+        if visual is None or data["snapshot_id"] != visual.id:
             raise ObservationRejected("No matching unconsumed screenshot.")
-        old, size, pixels = visual
+        old, size, pixels = visual.observation, visual.device_size, visual.image_size
         if any(type(data[k]) not in (float, int) or not math.isfinite(data[k]) or not 0 <= data[k] < end
                for k, end in zip(("x", "y"), pixels)):
             raise ValueError("Coordinates must be inside the captured image.")
         self.ex._check_snapshot(old)
-        current = self.ex.observe()
         wda = self.ex.connection.require_active()
-        if (current.app, current.process_id, current.signature) != (old.app, old.process_id, old.signature) or wda.window_size() != size:
-            raise ObservationRejected("Screen changed since screenshot; capture again.")
-        if time.monotonic() - old.started > self.ex.freshness:
-            raise ObservationRejected("Screenshot expired during validation.")
-        self.ex._guard_app(current.app, current.process_id)
+        if wda.window_size() != size:
+            raise ObservationRejected("Screen geometry changed since screenshot; capture again.")
+        self.ex._dispatch_guard(old, pixels=True)
+        self.ex.discard()
         try:
             wda.tap(data["x"] * size[0] / pixels[0], data["y"] * size[1] / pixels[1])
         except WDAOutcomeUnknown:
             self.ex.stopped = True
             self.ex.connection.invalidate(uncertain=True)
             return {"status": "blocked", "dispatch": "unknown", "reason": "mutation_outcome_unknown"}
-        try:
-            observation = self.ex.observe()
-        except OpenClawIPhoneError:
-            return {"status": "step", "dispatch": "acknowledged", "verification": "unknown", "reason": "verification_unavailable"}
-        return {"status": "step", "dispatch": "acknowledged", "verification": "unknown", "observation": observation}
+        # A visual click acknowledgement is not proof of its effect. Let the
+        # next explicit observe/screenshot choose AX or vision; never force AX.
+        return {"status": "step", "dispatch": "acknowledged", "verification": "unknown", "reason": "inspect_result"}

@@ -1,7 +1,7 @@
 """App-independent, snapshot-bound execution for trusted caller-owned grants."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 import math
 import time
@@ -9,9 +9,9 @@ import uuid
 from urllib.parse import urlsplit
 
 from .connection import TaskConnection
-from .errors import OpenClawIPhoneError, WDAOutcomeUnknown, WDAUnavailable
+from .errors import OpenClawIPhoneError, VerificationExpired, WDAOutcomeUnknown, WDAStaleElement, WDAUnavailable
 from .observations import (EDITABLE, SCROLLABLE, TAPPABLE, Element, Observation,
-                           ObservationRejected, Selector, keypad_points, parse_observation)
+                           ObservationRejected, Selector, keypad_points, parse_observation, xpath_literal)
 
 
 @dataclass(frozen=True)
@@ -104,6 +104,14 @@ class StepResult:
     error_type: str | None = None
 
 
+@dataclass
+class PredicateReads:
+    """Facts shared only within one synchronous predicate evaluation pass."""
+    references: dict[Selector, list[str]] = field(default_factory=dict)
+    values: dict[Selector, str] = field(default_factory=dict)
+    focused: str | None = None
+
+
 class Executor:
     def __init__(self, connection: TaskConnection, grants: tuple[Grant, ...], *,
                  texts: dict[str, str] | None = None, freshness: float = 30,
@@ -123,10 +131,13 @@ class Executor:
                     raise ValueError("Keypad accepts 1–32 supplied ASCII digits only.")
         self.freshness, self.verification_seconds = freshness, verification_seconds
         self.latest: Observation | None = None
+        self._verified: dict[Condition, str] = {}
+        self._values: dict[Condition, str] = {}
         self._offers: dict[str, Offer] = {}
         self._offer_blockers: tuple[dict[str, object], ...] = ()
         self._uses = [0] * len(grants)
         self.stopped = False
+        self.pending: tuple[Condition, ...] | None = None
         destinations = {g.destination for g in grants if g.operation == "activate"}
         if destinations:
             connection.require_active()
@@ -134,26 +145,37 @@ class Executor:
             if not destinations <= {a.bundle_identifier for a in installed}:
                 raise ObservationRejected("An authorized destination app is not installed.")
 
-    def observe(self, *, app_only: bool = False) -> Observation:
+    def discard(self) -> None:
+        """A mutation or failed read consumes every prior choice and proof."""
+        self.latest = None
+        self._offers.clear()
+        self._verified.clear()
+        self._values.clear()
+
+    def current(self, *, full: bool = True) -> Observation:
+        observation = self.latest
+        if (observation is None or full and observation.elements is None
+                or time.monotonic() - observation.started > self.freshness):
+            return self.observe(app_only=not full)
+        self._check_snapshot(observation)
+        return observation
+
+    def observe(self, *, app_only: bool = False, invalidate_on_error: bool = True) -> Observation:
         """Read a full screen by default; app-only evidence cannot authorize input."""
         wda = self.connection.require_active()
-        self._offers.clear()
-        self.latest = None
+        self.discard()
         started = time.monotonic()
         stamp = datetime.now(timezone.utc).isoformat()
         try:
-            wda.require_unlocked()
-            before = wda.active_app()
             source = None if app_only else wda.source()
-            after = before if app_only else wda.active_app()
+            after = wda.active_app()
         except OpenClawIPhoneError:
-            self.connection.invalidate()
-            self._offers.clear()
+            if invalidate_on_error:
+                self.connection.invalidate()
             raise
-        if (type(after.get("pid")) is not int or after["pid"] <= 0 or
-                (before.get("bundleId"), before.get("pid")) != (after.get("bundleId"), after.get("pid"))):
+        if type(after.get("pid")) is not int or after["pid"] <= 0:
             self._offers.clear()
-            raise ObservationRejected("Foreground app changed during observation.")
+            raise ObservationRejected("Foreground process identity is unavailable.")
         if source is None:
             self.latest = Observation(uuid.uuid4().hex, self.connection.generation,
                 self.connection.device.udid, after["bundleId"], stamp, started,
@@ -164,7 +186,43 @@ class Executor:
                 captured_at=stamp, started=started, finished=time.monotonic(), process_id=after["pid"])
         return self.latest
 
-    def evaluate(self, observation: Observation, condition: Condition) -> str:
+    def _find(self, target: Selector | Element) -> list[str]:
+        using, query = target.locator()
+        return self.connection.require_active().find_elements(query, using=using)
+
+    def _read_condition(self, condition: Condition, reads: PredicateReads) -> str:
+        target = condition.target
+        if condition.kind == "value" and target.role not in EDITABLE | {"XCUIElementTypeOther"}:
+            return "unknown"
+        wda = self.connection.require_active()
+        if target not in reads.references:
+            reads.references[target] = self._find(target)
+        refs = reads.references[target]
+        if len(refs) != 1:
+            return "unsatisfied" if not refs else "unknown"
+        if condition.kind == "exists":
+            return "satisfied"
+        if condition.kind == "focused":
+            if reads.focused is None:
+                reads.focused = wda.active_element()
+            return "satisfied" if reads.focused == refs[0] else "unsatisfied"
+        if target not in reads.values:
+            try:
+                value = wda.element_value(refs[0], allow_null_empty=target.role in EDITABLE)
+            except WDAStaleElement:
+                # Only an explicit stale READ permits re-resolution. Transport
+                # failures are not a reason to replay a write or guess a value.
+                reads.references[target] = self._find(target)
+                if len(reads.references[target]) != 1:
+                    return "unknown"
+                value = wda.element_value(reads.references[target][0], allow_null_empty=target.role in EDITABLE)
+            reads.values[target] = value
+        self._values[condition] = reads.values[target]
+        return "satisfied" if reads.values[target] == condition.value else "unsatisfied"
+
+    def evaluate(self, observation: Observation, condition: Condition, *, reads: PredicateReads | None = None) -> str:
+        if observation is self.latest and condition in self._verified:
+            return self._verified[condition]
         if observation.app != condition.app:
             return "unsatisfied"
         if condition.kind == "app":
@@ -184,41 +242,64 @@ class Executor:
             return "satisfied"
         if condition.kind == "actionable":
             return "satisfied" if element.actionable else "unknown"
-        if condition.kind == "focused":
-            # iOS XML often omits focus. Ask WDA, never assume from a prior tap.
+        if condition.kind == "focused" or element.value is None or element.role == "XCUIElementTypeOther":
             try:
-                wda = self.connection.require_active()
-                refs = wda.find_elements(element.xpath)
-                return "satisfied" if len(refs) == 1 and wda.active_element() == refs[0] else "unsatisfied"
-            except WDAUnavailable:
-                return "unknown"
-        if element.role not in EDITABLE | {"XCUIElementTypeOther"}:
-            return "unknown"
-        value = element.value
-        if value is None or element.role == "XCUIElementTypeOther":
-            try:
-                reference = self._reference(element)
-                self._guard_app(observation.app, observation.process_id)
-                wda = self.connection.require_active()
-                value = (wda.element_value(reference, allow_null_empty=False)
-                         if element.role == "XCUIElementTypeOther" else wda.element_value(reference))
+                return self._read_condition(condition, reads if reads is not None else PredicateReads())
             except OpenClawIPhoneError:
                 return "unknown"
-        return "satisfied" if value == condition.value else "unsatisfied"
+        if element.role not in EDITABLE:
+            return "unknown"
+        return "satisfied" if element.value == condition.value else "unsatisfied"
 
-    def verify(self, observation: Observation, conditions: tuple[Condition, ...]) -> str:
+    def verify(self, observation: Observation, conditions: tuple[Condition, ...], *,
+               cache: dict[Condition, str] | None = None, reads: PredicateReads | None = None) -> str:
         if not conditions:
             return "unknown"
         state = "satisfied"
+        reads = reads if reads is not None else PredicateReads()
         for condition in conditions:
-            current = self.evaluate(observation, condition)
+            if cache is not None and condition in cache:
+                current = cache[condition]
+            else:
+                current = self.evaluate(observation, condition, reads=reads)
+                if cache is not None:
+                    cache[condition] = current
             if current == "unsatisfied":
                 return current
             if current == "unknown":
                 state = current
         return state
 
-    def wait(self, conditions: tuple[Condition, ...], *, seconds: float | None = None) -> tuple[str, Observation]:
+    def _observe_conditions(self, conditions: tuple[Condition, ...], *, full: bool = False,
+                            references: dict[Selector, str] | None = None) -> Observation:
+        kinds = {"app", "value", "focused"} if full else {"app", "value", "focused", "exists"}
+        narrow = all(c.kind in kinds for c in conditions)
+        observation = self.observe(app_only=narrow, invalidate_on_error=False)
+        if not narrow:
+            return observation
+        reads = PredicateReads({target: [ref] for target, ref in (references or {}).items()})
+        states: dict[Condition, str] = {}
+        for condition in dict.fromkeys(conditions):
+            if condition.kind == "app" or condition.app != observation.app:
+                states[condition] = self.evaluate(observation, condition)
+                continue
+            states[condition] = self._read_condition(condition, reads)
+        if references is not None:
+            # Keep a replacement handle only for this wait's existing hints;
+            # the next poll should not deliberately retry the stale handle.
+            for target in references:
+                refs = reads.references[target]
+                if len(refs) == 1:
+                    references[target] = refs[0]
+        # This is predicate evidence, NOT a full tree that could prove absence
+        # or authorize another action. A later decision acquires its tree once.
+        self._verified = states
+        self.latest = replace(observation, finished=time.monotonic())
+        return self.latest
+
+    def wait(self, conditions: tuple[Condition, ...], *, seconds: float | None = None,
+             once: bool = False, full: bool = False,
+             references: dict[Selector, str] | None = None) -> tuple[str, Observation]:
         duration = self.verification_seconds if seconds is None else seconds
         if not math.isfinite(duration) or duration <= 0:
             raise ValueError("Wait timeout must be finite and positive.")
@@ -227,23 +308,36 @@ class Executor:
         end = min(time.monotonic() + duration, self.connection.budget.deadline)
         wda = self.connection.require_active()
         previous = wda.deadline
-        wda.deadline = min(previous, end) if previous is not None else end
-        app_only = bool(conditions) and all(c.kind == "app" for c in conditions)
+        end = min(previous, end) if previous is not None else end
+        wda.deadline = end
         try:
             while True:
                 try:
-                    observation = self.observe(app_only=app_only)
+                    observation = self._observe_conditions(conditions, full=full, references=references)
                 except ObservationRejected:
                     # A transitioning app may change during a read. Retrying
                     # observation is safe; never repeat the preceding input.
                     if time.monotonic() >= end:
-                        raise
+                        raise VerificationExpired("Verification window expired; inspect without replaying input.")
                     self.connection.budget.sleep(min(0.2, end - time.monotonic()))
                     continue
                 state = self.verify(observation, conditions)
-                if state == "satisfied" or time.monotonic() >= end:
+                if time.monotonic() > end:
+                    raise VerificationExpired("Verification read exceeded its deadline; input is not replayed.")
+                if state == "satisfied" and self.pending == conditions:
+                    self.pending = None
+                if state == "satisfied" or once or time.monotonic() >= end:
                     return state, observation
                 self.connection.budget.sleep(min(0.2, max(0, end - time.monotonic())))
+                if time.monotonic() >= end:
+                    return state, observation
+        except OpenClawIPhoneError as exc:
+            self.discard()
+            self.connection.budget.remaining()
+            if isinstance(exc, VerificationExpired) or isinstance(exc, WDAUnavailable) and time.monotonic() >= end:
+                raise VerificationExpired("Verification window expired; dispatch is not retried.") from exc
+            self.connection.invalidate()
+            raise
         finally:
             wda.deadline = previous
 
@@ -252,8 +346,8 @@ class Executor:
         blockers: list[dict[str, object]] = []
         self._offer_blockers = ()
         self._check_snapshot(observation)
-        if self.stopped:
-            self._offer_blockers = ({"scope": "all", "reason": "executor_stopped"},)
+        if self.stopped or self.pending is not None:
+            self._offer_blockers = ({"scope": "all", "reason": "executor_stopped" if self.stopped else "verification_pending"},)
             return ()
         if observation.elements is None:
             self._offer_blockers = ({"scope": "all", "reason": "accessibility_unavailable"},)
@@ -261,6 +355,8 @@ class Executor:
         if observation.secure is not False:
             self._offer_blockers = ({"scope": "all", "reason": "secure_screen"},)
             return ()
+        predicates: dict[Condition, str] = {}
+        reads = PredicateReads()
         for index, grant in enumerate(self.grants):
             if self._uses[index] >= grant.max_uses:
                 blockers.append({"grant_index": index, "operation": grant.operation, "reason": "grant_exhausted"})
@@ -269,7 +365,7 @@ class Executor:
                 blockers.append({"grant_index": index, "operation": grant.operation, "reason": "foreground_app_mismatch"})
                 continue
             if grant.before:
-                before_state = self.verify(observation, grant.before)
+                before_state = self.verify(observation, grant.before, cache=predicates, reads=reads)
                 if before_state != "satisfied":
                     blockers.append({"grant_index": index, "operation": grant.operation,
                                      "reason": "precondition_unknown" if before_state == "unknown" else "precondition_unsatisfied"})
@@ -286,7 +382,7 @@ class Executor:
                 # the end. Never offer an append to existing text.
                 blockers.append({"grant_index": index, "operation": grant.operation, "reason": "field_not_verified_empty"})
                 continue
-            if grant.after and self.verify(observation, grant.after) == "satisfied":
+            if grant.after and self.verify(observation, grant.after, cache=predicates, reads=reads) == "satisfied":
                 blockers.append({"grant_index": index, "operation": grant.operation, "reason": "postcondition_already_satisfied"})
                 continue
             if target and grant.operation in {"tap", "back", "append", "replace", "clear", "keypad"} and not (target.name or target.label):
@@ -302,32 +398,66 @@ class Executor:
         return self._offer_blockers
 
     def _check_snapshot(self, observation: Observation) -> None:
+        if self.latest is not observation:
+            raise ObservationRejected("Snapshot was superseded; reobserve and choose again.")
+        self._check_binding(observation)
+
+    def _check_binding(self, observation: Observation) -> None:
+        """Local only: still enforced after slow validation/clear reads."""
         self.connection.require_active()
-        if (self.latest is not observation or observation.generation != self.connection.generation
+        if (observation.generation != self.connection.generation
                 or observation.device_udid != self.connection.device.udid
                 or time.monotonic() - observation.started > self.freshness):
-            raise ObservationRejected("Snapshot is stale, foreign or superseded; reobserve and choose again.")
+            raise ObservationRejected("Snapshot is stale or foreign; reobserve and choose again.")
 
-    def _guard_app(self, app: str, process_id: int | None) -> None:
+    def _guard_app(self, app: str, process_id: int | None = None) -> None:
         wda = self.connection.require_active()
-        # Observations and each transport mutation check lock state. This guard
-        # only closes the foreground-identity gap immediately before dispatch.
-        active = wda.active_app()
-        if active["bundleId"] != app or active.get("pid") != process_id:
+        if process_id is None:
+            matches = wda.app_state(app) == 4  # XCUIApplicationStateRunningForeground
+        else:
+            # Pixel evidence is tied to this exact process, unlike a freshly
+            # resolved native target. Preserve the strict guard for vision.
+            active = wda.active_app()
+            matches = active["bundleId"] == app and active.get("pid") == process_id
+        if not matches:
             raise ObservationRejected("Foreground app changed before dispatch.")
 
-    def _reference(self, element: Element) -> str:
-        refs = self.connection.require_active().find_elements(element.xpath)
+    def _reference(self, element: Element, *, hittable: bool = True) -> str:
+        refs = self._find(element)
         if len(refs) != 1:
             raise ObservationRejected("Target no longer resolves uniquely; no coordinate fallback.")
-        if not self.connection.require_active().element_hittable(refs[0]):
+        if hittable and not self.connection.require_active().element_hittable(refs[0]):
             raise ObservationRejected("Target is obscured or hit testing is unavailable.")
         return refs[0]
 
-    def execute(self, offer_id: str) -> StepResult:
+    def _keypad_points(self, observation: Observation, digits: str) -> list[tuple[float, float]]:
+        points = keypad_points(observation, digits)
+        wanted = set(digits)
+        keys = [e for e in observation.elements or () if e.role == "XCUIElementTypeKey"
+                and e.actionable and (e.name in wanted or e.label in wanted)
+                and e.bounds and (e.bounds[0] + e.bounds[2] / 2, e.bounds[1] + e.bounds[3] / 2) in points]
+        # One query validates every used key's identity AND geometry, without
+        # rereading the entire screen or checking each digit in the batch.
+        queries = []
+        for key in keys:
+            digit = key.name if key.name in wanted else key.label
+            label = xpath_literal(digit)
+            unique = ("//XCUIElementTypeKey[ancestor::XCUIElementTypeKeyboard and not(ancestor::*[@visible='false']) and @visible='true' "
+                      f"and @enabled='true' and (@name={label} or @label={label})]")
+            queries.append(f"{key.xpath}[count({unique})=1 and not(ancestor::*[@visible='false'])]")
+        refs = self.connection.require_active().find_elements(" | ".join(queries))
+        if len(set(refs)) != len(keys):
+            raise ObservationRejected("Native keypad changed; no touches sent.")
+        return points
+
+    def _dispatch_guard(self, observation: Observation, *, pixels: bool = False) -> None:
+        self._guard_app(observation.app, observation.process_id if pixels else None)
+        self._check_binding(observation)
+
+    def execute(self, offer_id: str, *, observe_next: bool = True) -> StepResult:
         original = self.latest
         offer = self._offers.get(offer_id)
-        if (self.stopped or offer is None or original is None or original.elements is None
+        if (self.stopped or self.pending is not None or offer is None or original is None or original.elements is None
                 or offer.snapshot_id != original.id):
             return StepResult("not_sent", "unknown", "invalid_or_consumed_offer")
         # Consume the entire observation's choices before any dispatch.
@@ -338,29 +468,36 @@ class Executor:
             self._check_snapshot(original)
             grant = self.grants[offer.grant_index]
             old = next((e for e in original.elements if e.id == offer.target_id), None)
-            current = self.observe()
-            target = current.unique(grant.target) if grant.target else None
-            if (current.secure or (current.app, current.process_id) != (original.app, original.process_id)
-                    or grant.target and (old is None or target is None or target.fingerprint() != old.fingerprint())):
-                raise ObservationRejected("App or target changed since selection.")
-            if time.monotonic() - original.started > self.freshness:
-                raise ObservationRejected("Choice expired during validation.")
-            if grant.before and self.verify(current, grant.before) != "satisfied":
-                raise ObservationRejected("Action precondition no longer holds.")
-            reference = self._reference(target) if target else None
-            self._guard_app(grant.app, current.process_id)
+            target = old
+            reference = self._reference(target, hittable=grant.operation not in {"append", "replace", "clear", "keypad"}) if target else None
+            references = {grant.target: reference} if target else {}
+            reads = PredicateReads({key: [ref] for key, ref in references.items()})
+            if grant.before:
+                # Read live preconditions using the selected target's existing
+                # reference, not a separate observation/dispatch pipeline.
+                for condition in grant.before:
+                    if condition.app != original.app:
+                        state = "unsatisfied"
+                    elif condition.kind == "app":
+                        state = "satisfied"  # The dispatch guard checks it once.
+                    elif condition.kind in {"focused", "value", "exists"}:
+                        state = self._read_condition(condition, reads)
+                    else:
+                        state, _ = self.wait((condition,), once=True)
+                    if state != "satisfied":
+                        raise ObservationRejected("Action precondition no longer holds.")
             wda = self.connection.require_active()
             operation = grant.operation
             conditions = grant.after
             self._uses[offer.grant_index] += 1
             if operation == "keypad":
                 supplied = self.texts[grant.text_id]
-                if (wda.active_element() != reference
-                        or wda.element_value(reference, allow_null_empty=target.role in EDITABLE) != ""):
+                if (self._read_condition(Condition("focused", grant.app, grant.target), reads) != "satisfied"
+                        or self._read_condition(Condition("value", grant.app, grant.target, ""), reads) != "satisfied"):
                     raise ObservationRejected("Keypad requires verified focus and an empty field.")
-                points = keypad_points(current, supplied)
-                self._check_snapshot(current)
-                self._guard_app(grant.app, current.process_id)
+                points = self._keypad_points(original, supplied)
+                self._dispatch_guard(original)
+                self.discard()
                 dispatching = True
                 wda.tap_sequence(points)
                 acknowledged += 1
@@ -369,33 +506,32 @@ class Executor:
                 # destination if supplied, otherwise verify the complete value.
                 conditions = conditions or (Condition("value", grant.app, grant.target, supplied),)
             elif operation in {"append", "replace", "clear"}:
-                if wda.active_element() != reference:
-                    raise ObservationRejected("Intended editable field is not focused.")
-                if operation == "append" and (target.value not in (None, "") or wda.element_value(reference) != ""):
+                if operation == "append" and (target.value not in (None, "") or
+                        self._read_condition(Condition("value", grant.app, grant.target, ""), reads) != "satisfied"):
                     raise ObservationRejected("Append requires a verified empty field; caret position is unknown. Use an explicit replace grant for whole-field entry.")
                 expected = self.texts[grant.text_id] if operation in {"append", "replace"} else ""
-                if operation in {"replace", "clear"}:
-                    dispatching = True
-                    wda.element_action(reference, "clear")
-                    acknowledged += 1
-                    dispatching = False
-                    state, current = self.wait((Condition("value", grant.app, grant.target, ""),))
-                    if state != "satisfied":
-                        self.stopped = True
-                        return StepResult("acknowledged", state, "clear_not_verified", current, acknowledged)
-                    if operation == "replace":
-                        target = current.unique(grant.target)
-                        reference = self._reference(target)
-                        self._guard_app(grant.app, current.process_id)
-                        if wda.active_element() != reference:
-                            raise ObservationRejected("Focus changed after clearing; text not sent.")
-                if operation != "clear":
-                    dispatching = True
-                    wda.element_action(reference, "value", text=self.texts[grant.text_id])
-                    acknowledged += 1
-                    dispatching = False
+                self._dispatch_guard(original)
+                self.discard()
+                with wda.input_transaction():
+                    if operation in {"replace", "clear"}:
+                        self._check_binding(original)
+                        dispatching = True
+                        wda.element_action(reference, "clear")
+                        acknowledged += 1
+                        dispatching = False
+                        if operation == "replace" and wda.element_value(reference):
+                            self.stopped = True
+                            return StepResult("acknowledged", "unsatisfied", "clear_not_verified", acknowledged_substeps=acknowledged)
+                    if operation != "clear":
+                        self._check_binding(original)
+                        dispatching = True
+                        wda.element_action(reference, "value", text=self.texts[grant.text_id])
+                        acknowledged += 1
+                        dispatching = False
                 conditions = (Condition("value", grant.app, grant.target, expected),) + conditions
             else:
+                self._dispatch_guard(original)
+                self.discard()
                 dispatching = True
                 if operation in {"tap", "back"}:
                     wda.element_action(reference, "click")
@@ -414,10 +550,17 @@ class Executor:
                            scoped_items(current, current_target) != scoped_items(original, old))
                 state = "satisfied" if current.app == grant.app and changed else "unsatisfied"
             else:
-                state, current = self.wait(conditions)
+                state, current = self.wait(conditions, full=observe_next, references=references)
             if state != "satisfied":
                 self.stopped = True  # An acknowledged action is never replayed on failed readback.
             return StepResult("acknowledged", state, "verified" if state == "satisfied" else "postcondition_not_verified", current, acknowledged)
+        except VerificationExpired:
+            # Only a completely acknowledged operation reaches postcondition
+            # polling. Preserve its proof obligation, not a replayable offer.
+            if acknowledged:
+                self.pending = conditions
+            return StepResult("acknowledged" if acknowledged else "not_sent", "unknown", "verification_expired",
+                              acknowledged_substeps=acknowledged)
         except OpenClawIPhoneError as exc:
             self.stopped = True
             if dispatching and isinstance(exc, WDAOutcomeUnknown):
