@@ -53,7 +53,7 @@ class TransportProbe:
 
     def send(self, path, *, method, payload, timeout):
         self.calls.append((method, path, timeout))
-        if path == "/source":
+        if path.startswith("/source?"):
             if self.screen_error:
                 raise WDAUnavailable("synthetic AX failure")
             value = self.xml()
@@ -98,8 +98,8 @@ class TransportProbe:
 
 class ControlLoopTests(unittest.TestCase):
     def test_warm_adaptive_request_budgets(self):
-        for action, mode, count, trees in (("tap", None, 7, 1), ("input", None, 7, 0),
-                                          ("input", "replace", 8, 0), ("keypad", None, 9, 0)):
+        for action, mode, count in (("tap", None, 7), ("input", None, 7),
+                                    ("input", "replace", 8), ("keypad", None, 9)):
             with self.subTest(action=action, mode=mode):
                 p = TransportProbe()
                 p.warm()
@@ -110,9 +110,102 @@ class ControlLoopTests(unittest.TestCase):
                     result = p.actor.act(request)
                 self.assertEqual(result["dispatch"], "acknowledged")
                 self.assertEqual(result["verification"], "unknown" if action == "tap" else "satisfied")
-                self.assertLessEqual(len(p.calls), count)
-                self.assertEqual(sum(path == "/source" for _, path, _ in p.calls), trees)
+                self.assertEqual(len(p.calls), count)
+                self.assertEqual(sum(path.startswith("/source?") for _, path, _ in p.calls), 1)
+                if action != "tap":
+                    self.assertEqual(sum(path.endswith("/attribute/value") for _, path, _ in p.calls), 1)
+                    self.assertIsNotNone(p.ex.latest.elements)
                 self.assertEqual(p.locators.count("xpath"), int(action == "keypad"))
+
+    def test_input_tree_verifies_and_is_reused_by_next_action(self):
+        p = TransportProbe()
+        p.warm()
+        with patch("openclaw_iphone.adaptive.read_input", return_value="121212"):
+            result = p.actor.act({"op": "act", "action": "input", "instruction": "Input", "text_ref": "text"})
+        self.assertEqual(result["verification"], "satisfied")
+        self.assertEqual(result["readback"]["observed_characters"], 6)
+        self.assertEqual([path.split("?", 1)[0] for _, path, _ in p.calls[-2:]], ["/source", "/wda/activeAppInfo"])
+        p.calls.clear()
+        self.assertEqual(p.actor.act({"op": "act", "action": "tap", "instruction": "Next"})["dispatch"], "acknowledged")
+        self.assertEqual(sum(path.startswith("/source?") for _, path, _ in p.calls), 1)  # After tap only.
+        self.assertEqual(p.calls[0][1], "/session/audit/elements")
+
+    def test_missing_tree_value_falls_back_to_selected_reference(self):
+        p = TransportProbe(missing_value=True)
+        p.warm()
+        with patch("openclaw_iphone.adaptive.read_input", return_value="121212"):
+            result = p.actor.act({"op": "act", "action": "input", "instruction": "Input", "text_ref": "text"})
+        self.assertEqual(result["verification"], "satisfied")
+        self.assertEqual(sum(path.startswith("/source?") for _, path, _ in p.calls), 1)
+        self.assertEqual(sum(path.endswith("/elements") for _, path, _ in p.calls), 1)
+        self.assertEqual(sum(path.endswith("/attribute/value") for _, path, _ in p.calls), 2)
+
+    def test_tree_mismatch_keeps_input_pending_until_read_only_reconcile(self):
+        p = TransportProbe()
+        p.warm()
+        def partial(path, **kwargs):
+            result = p.send(path, **kwargs)
+            if path.endswith("/value") and kwargs["method"] == "POST":
+                p.value = "121"
+            return result
+        p.wda._send = partial
+        with patch("openclaw_iphone.adaptive.read_input", return_value="121212"):
+            result = p.actor.act({"op": "act", "action": "input", "instruction": "Input", "text_ref": "text"})
+        self.assertEqual((result["dispatch"], result["verification"], result["input_pending"]),
+                         ("acknowledged", "unsatisfied", True))
+        self.assertEqual(result["readback"]["observed_characters"], 3)
+        self.assertEqual(sum(path.endswith("/attribute/value") for _, path, _ in p.calls), 1)
+        self.assertEqual(p.actor.act({"op": "act", "action": "tap", "instruction": "Next"})["dispatch"], "not_sent")
+        p.value = "121212"
+        p.calls.clear()
+        self.assertEqual(p.actor.reconcile()["verification"], "satisfied")
+        self.assertIsNone(p.actor.pending_input)
+        self.assertEqual(sum(path.endswith("/value") and method == "POST" for method, path, _ in p.calls), 0)
+
+    def test_duplicate_post_input_target_does_not_verify_via_old_reference(self):
+        p = TransportProbe()
+        p.warm()
+        original_xml = p.xml
+        def xml():
+            tree = original_xml()
+            if p.value:
+                duplicate = '<XCUIElementTypeTextField label="Input" value="121212" visible="true" enabled="true" x="150" y="50" width="100" height="30"/>'
+                return tree.replace('</XCUIElementTypeApplication>', duplicate + '</XCUIElementTypeApplication>')
+            return tree
+        p.xml = xml
+        with patch("openclaw_iphone.adaptive.read_input", return_value="121212"):
+            result = p.actor.act({"op": "act", "action": "input", "instruction": "Input", "text_ref": "text"})
+        self.assertEqual((result["dispatch"], result["verification"], result["input_pending"]),
+                         ("acknowledged", "unknown", True))
+        self.assertEqual(sum(path.endswith("/attribute/value") for _, path, _ in p.calls), 1)
+        self.assertEqual(p.actor.act({"op": "act", "action": "tap", "instruction": "Next"})["dispatch"], "not_sent")
+
+    def test_post_input_source_failure_keeps_acknowledgement_and_pending(self):
+        p = TransportProbe()
+        p.warm()
+        def failed_source(path, **kwargs):
+            if path.startswith("/source?") and p.value:
+                raise WDAUnavailable("synthetic AX failure")
+            return p.send(path, **kwargs)
+        p.wda._send = failed_source
+        with patch("openclaw_iphone.adaptive.read_input", return_value="121212"):
+            result = p.actor.act({"op": "act", "action": "input", "instruction": "Input", "text_ref": "text"})
+        self.assertEqual((result["dispatch"], result["verification"], result["input_pending"]),
+                         ("acknowledged", "unknown", True))
+        self.assertEqual(sum(path.endswith("/value") and method == "POST" for method, path, _ in p.calls), 1)
+        self.assertEqual(p.actor.act({"op": "act", "action": "tap", "instruction": "Next"})["dispatch"], "not_sent")
+
+    def test_explicit_after_remains_narrow(self):
+        p = TransportProbe()
+        p.warm()
+        after = [{"kind": "value", "app": APP,
+                  "target": {"role": "XCUIElementTypeTextField", "label": "Input"}, "value": "121212"}]
+        with patch("openclaw_iphone.adaptive.read_input", return_value="121212"):
+            result = p.actor.act({"op": "act", "action": "input", "instruction": "Input",
+                                  "text_ref": "text", "after": after})
+        self.assertEqual(result["verification"], "satisfied")
+        self.assertEqual(sum(path.startswith("/source?") for _, path, _ in p.calls), 0)
+        self.assertIsNone(p.ex.latest.elements)
 
     def test_fixed_input_budgets_and_no_replay(self):
         for operation, count in (("append", 7), ("replace", 8), ("keypad", 9)):
@@ -123,8 +216,9 @@ class ControlLoopTests(unittest.TestCase):
                 p.calls.clear()
                 result = p.ex.execute(offer.id)
                 self.assertEqual(result.verification, "satisfied")
-                self.assertLessEqual(len(p.calls), count)
-                self.assertFalse(any(path == "/source" for _, path, _ in p.calls))
+                self.assertEqual(len(p.calls), count)
+                self.assertEqual(sum(path.startswith("/source?") for _, path, _ in p.calls), 1)
+                self.assertIsNotNone(p.ex.latest.elements)
                 self.assertEqual(p.ex.execute(offer.id).dispatch, "not_sent")
 
     def test_two_steps_reuse_post_observation_and_done_reuses_success(self):
@@ -136,7 +230,7 @@ class ControlLoopTests(unittest.TestCase):
         spec = TaskSpec("Two screens", grants, (done,))
         self.assertEqual(run_task(p.ex, spec)["status"], "completed")
         self.assertLessEqual(len(p.calls), 16)
-        self.assertEqual(sum(path == "/source" for _, path, _ in p.calls), 2)
+        self.assertEqual(sum(path.startswith("/source?") for _, path, _ in p.calls), 2)
         self.assertNotIn("xpath", p.locators)
         p.calls.clear()
         self.assertEqual(PlannerSession(p.ex, spec).request({"op": "done"})["status"], "completed")
@@ -163,13 +257,13 @@ class ControlLoopTests(unittest.TestCase):
         self.assertEqual(p.ex.execute(offer.id).verification, "satisfied")
         self.assertEqual(sum(path.endswith("/elements") for _, path, _ in p.calls), 1)
         self.assertEqual(sum(path.endswith("/element/active") for _, path, _ in p.calls), 1)
-        self.assertEqual(sum(path.endswith("/attribute/value") for _, path, _ in p.calls), 2)
+        self.assertEqual(sum(path.endswith("/attribute/value") for _, path, _ in p.calls), 1)
         self.assertLessEqual(len(p.calls), 8)
 
     def test_only_explicit_stale_read_re_resolves_without_replaying_input(self):
         for failure in ("stale element reference", "unknown error"):
             with self.subTest(failure=failure):
-                p = TransportProbe()
+                p = TransportProbe(missing_value=True)
                 p.warm()
                 failed = False
                 def send(path, **kwargs):
@@ -246,7 +340,7 @@ class ControlLoopTests(unittest.TestCase):
         tick = [0.0]
         def slow(path, **kwargs):
             value = p.send(path, **kwargs)
-            tick[0] += 8 if path == "/wda/activeAppInfo" else 4 if path == "/source" else 0
+            tick[0] += 8 if path == "/wda/activeAppInfo" else 4 if path.startswith("/source?") else 0
             return value
         p.wda._send = slow
         with patch("time.monotonic", side_effect=lambda: tick[0]):
@@ -274,7 +368,7 @@ class ControlLoopTests(unittest.TestCase):
         for adaptive in (True, False):
             with self.subTest(adaptive=adaptive):
                 grants = () if adaptive else (Grant("append", APP, "Input", FIELD, text_id="text"),)
-                p = TransportProbe(grants)
+                p = TransportProbe(grants, missing_value=True)
                 p.warm()
                 offer = None if adaptive else p.ex.offers(p.ex.latest)[0]
                 tick = [0.0]
@@ -325,7 +419,7 @@ class ControlLoopTests(unittest.TestCase):
             result = p.actor.vision_tap({"op": "vision_tap", "snapshot_id": shot["snapshot_id"], "x": 2, "y": 4})
             self.assertEqual(result["dispatch"], "acknowledged")
             self.assertEqual(len(p.calls), 7)
-            self.assertFalse(any(path == "/source" for _, path, _ in p.calls))
+            self.assertFalse(any(path.startswith("/source?") for _, path, _ in p.calls))
             with self.assertRaises(ObservationRejected):
                 p.actor.vision_tap({"op": "vision_tap", "snapshot_id": shot["snapshot_id"], "x": 2, "y": 4})
 
@@ -346,7 +440,11 @@ class ControlLoopTests(unittest.TestCase):
         element = snapshot(source(extra=extra)).elements[-1]
         self.assertIn("XCUIElementTypeCell[1][@label='First']/", element.xpath)
         self.assertIn("@x='2'", element.xpath)
-        self.assertEqual(element.locator(), ("xpath", element.xpath))
+        using, query = element.locator()
+        self.assertEqual(using, "class chain")
+        self.assertIn('XCUIElementTypeCell[`label == "First"`]/XCUIElementTypeButton[', query)
+        self.assertIn('rect.x == 2.0', query)
+        self.assertNotIn('[1]', query)  # Anonymous-sibling reorder is not a positional identity check.
         using, query = snapshot(source()).elements[1].locator()
         self.assertEqual(using, "predicate string")
         self.assertIn('label == "Next"', query)

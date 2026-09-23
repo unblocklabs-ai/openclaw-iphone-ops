@@ -88,8 +88,11 @@ class WDAClient:
     def is_ready(self) -> bool:
         return self.status().ready is True
 
-    def source(self) -> str:
-        body = self._request("/source")
+    def source(self, *, compact: bool = False) -> str:
+        path = ("/source?format=xml&excluded_attributes="
+                "accessible,nativeAccessibilityElement,index,placeholderValue,traits,"
+                "nativeFrame,minValue,maxValue,customActions,type") if compact else "/source"
+        body = self._request(path)
         parsed = parse_json_bytes(body)
         if isinstance(parsed, dict):
             check_response(parsed, "/source")
@@ -326,8 +329,10 @@ class WDAClient:
             raise ValueError("Unsupported scroll direction.")
         self.require_unlocked()
         with self.session() as session_id:
-            path = f"/session/{session_id}/wda/element/{urllib.parse.quote(element_id, safe='')}/scroll"
-            return self._json_post(path, {"direction": direction, "distance": 0.5})
+            path = f"/session/{session_id}/wda/element/{urllib.parse.quote(element_id, safe='')}/swipe"
+            # Content scrolls opposite the finger. WDA's scroll route holds the
+            # press and can select text; native swipe is one gesture on this element.
+            return self._json_post(path, {"direction": "up" if direction == "down" else "down"})
 
     def element_action(self, element_id: str, action: str, *, text: str = "") -> dict[str, Any]:
         """Targeted click, clear or caret-based input; callers own authorization."""

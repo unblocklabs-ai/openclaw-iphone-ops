@@ -120,7 +120,7 @@ section to a version-1 task with ordinary `success` and `limits` fields:
 ```json
 "adaptive": {
   "apps": ["example.test"],
-  "operations": ["tap", "input", "keypad", "vision_tap", "relaunch"],
+  "operations": ["tap", "input", "keypad", "scroll", "vision_tap", "relaunch"],
   "cloud_labels": ["Next", "Email", "Continue with Email"],
   "inputs": {"email": "/absolute/private/email.txt", "code": "/absolute/private/code.txt"}
 }
@@ -150,6 +150,15 @@ without input. Use a fresh local selector or screenshot; do not end the whole
 task merely because Jev abstained. `max_decisions`, `max_steps`, request limit
 and wall deadline remain enforced. Jev is text-only.
 
+With `--include-labels`, the local adaptive view includes up to two named
+ancestor contexts per control (role, name and label, each label bounded and
+private-input redacted). Ordinary editable fields expose only
+`input_state: empty|nonempty|unknown` and `focused: true|false|null`; values
+never appear. Missing values and apparent placeholders are `unknown`, not
+proof of an empty field. Secure/custom field values remain hidden. Scrollable
+containers are listed as controls, including unnamed containers. These local
+fields do not change the separate Jev cloud projection or authorize input.
+
 ```json
 {"op":"act","action":"tap","instruction":"Continue with Email"}
 {"op":"act","action":"tap","instruction":"Focus the email field","target":{"role":"XCUIElementTypeTextField","name":"email"}}
@@ -162,6 +171,31 @@ Hittable `StaticText` and custom `Other` controls are supported. Selection is
 revalidated against the foreground app and a live native target before dispatch. An
 unrelated secure node does not block local actions. The fixed-grant executor
 withholds offers on an observed secure screen, reported as `fixed_grant_blockers`.
+When the XML application root explicitly names a different bundle ID or PID
+than the foreground read, that observation is rejected; missing root metadata
+remains supported. The two reads are not atomic, so this rejects contradictions
+rather than proving every transition-free capture.
+
+Adaptive `scroll` requires an observed scroll view, table or collection view
+and `direction: up|down`. Prefer its exact `target_id` and `snapshot_id` from
+the current observation (or a unique exact selector). One request sends one
+native swipe on that container (`down` means finger swipe up, and vice versa)
+and returns one fresh full observation for the next
+decision. With no `after`, changed named visible descendants or material
+movement (>4 points) count as progress, **not task completion**; minor layout
+jitter and anonymous wrappers do not. An unchanged container returns
+`verification: unsatisfied` with `reason: no_progress`. This means no observed
+named-content progress, not proof of the physical scroll position. Unlabeled
+or image-only content may report no progress despite visual movement; use an
+explicit `after` condition or inspect the returned observation. A
+missing/replaced container leaves verification unknown. An explicit `after`
+condition can verify the relevant destination.
+There is no implicit repeated scrolling or retry after an uncertain write;
+the task's ordinary step/request limits still apply.
+
+```json
+{"op":"act","action":"scroll","instruction":"Feed","target_id":"ID_FROM_OBSERVATION","snapshot_id":"SNAPSHOT_ID","direction":"down"}
+```
 
 Input references are owner-only regular files owned by the current user;
 symlinks and control characters are rejected. They are read at dispatch, so
@@ -180,8 +214,13 @@ the physical batch test. This is deliberate, slower entry,
 **not** an automatic retry after a failed bulk request.
 
 Ordinary fields get exact readback unless an explicit `after` condition is
-provided. Secure/custom input requires an observable non-app-only destination
-condition that is not already satisfied; do not demand a secret's readback.
+provided. No-`after` input on a normal editable field reads its unique value
+from a fresh tree reusable by the next decision; a missing tree value falls
+back to the selected native reference, while an ambiguous target remains
+unverified. Explicit-`after` and final actions retain targeted verification
+when their conditions permit it. Secure/custom input requires an observable
+non-app-only destination condition that is not already satisfied; do not demand
+a secret's readback.
 Auto-submit can therefore be verified by the destination, even if the input
 field disappears. A task `done` request still verifies overall success separately.
 

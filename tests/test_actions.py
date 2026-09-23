@@ -55,6 +55,32 @@ def tap_grant():
 
 
 class ObservationTests(unittest.TestCase):
+    def test_explicit_application_identity_must_match_foreground(self):
+        xml = source().replace('name="Test"', 'name="Test" bundleId="test.app" processId="1"', 1)
+        for candidate in (xml, f"<AppiumAUT>{xml}</AppiumAUT>"):
+            self.assertEqual(parse_observation(candidate, generation=1, device_udid="device", app=APP,
+                captured_at="now", started=0, finished=1, process_id=1).process_id, 1)
+        for candidate in (xml.replace('bundleId="test.app"', 'bundleId="other.app"'),
+                          xml.replace('processId="1"', 'processId="2"'),
+                          xml.replace('processId="1"', 'processId="invalid"'),
+                          f"<AppiumAUT>{xml.replace('bundleId="test.app"', 'bundleId="other.app"')}</AppiumAUT>"):
+            with self.assertRaises(ObservationRejected):
+                parse_observation(candidate, generation=1, device_udid="device", app=APP,
+                    captured_at="now", started=0, finished=1, process_id=1)
+        self.assertEqual(snapshot(source()).app, APP)  # Older sources omit metadata.
+        self.assertEqual(parse_observation(xml, generation=1, device_udid="device", app=APP,
+            captured_at="now", started=0, finished=1).app, APP)  # Optional PID caller has nothing to compare.
+
+    def test_contradictory_source_cannot_complete_foreign_app_condition(self):
+        ex, wda = executor([])
+        wda.source.return_value = source(button_label="Finished").replace(
+            'name="Test"', 'name="Test" bundleId="other.app" processId="999"', 1)
+        with self.assertRaises(ObservationRejected):
+            ex.observe()
+        wda.source.assert_called_once()
+        wda.active_app.assert_called_once()
+        wda.find_elements.assert_not_called()
+
     def test_ids_are_snapshot_local_and_hierarchy_is_retained(self):
         one, two = snapshot(source()), snapshot(source())
         self.assertNotEqual(one.elements[1].id, two.elements[1].id)
@@ -84,8 +110,49 @@ class ObservationTests(unittest.TestCase):
         self.assertEqual(using, "predicate string")
         self.assertTrue(query.endswith("label == " + predicate_literal(label)))
 
+    def test_named_ancestor_class_chain_escapes_literals_and_keeps_xpath_fallback(self):
+        extra = ('<XCUIElementTypeCell name="row-id" label="Row ` A">'
+                 '<XCUIElementTypeOther>'
+                 '<XCUIElementTypeButton name="go-id" label="Go ` now" value="ready" visible="true" '
+                 'enabled="true" x="2" y="3" width="4" height="5"/>'
+                 '</XCUIElementTypeOther></XCUIElementTypeCell>')
+        element = snapshot(source(extra=extra)).elements[-1]
+        using, query = element.locator()
+        self.assertEqual(using, "class chain")
+        self.assertEqual(query,
+            'XCUIElementTypeCell[`name == "row-id" AND label == "Row `` A"`]/'
+            'XCUIElementTypeOther/'
+            'XCUIElementTypeButton[`name == "go-id" AND label == "Go `` now" AND '
+            'value == "ready" AND visible == 1 AND enabled == 1 AND rect.x == 2.0 AND '
+            'rect.y == 3.0 AND rect.width == 4.0 AND rect.height == 5.0`]')
+        self.assertEqual(replace(element, bounds=None).locator(), ("xpath", element.xpath))
+        self.assertEqual(replace(element, enabled=False).locator(), ("xpath", element.xpath))
+        self.assertEqual(replace(element, ancestors=element.ancestors[1:]).locator(), ("xpath", element.xpath))
+        self.assertEqual(replace(element, label="x" * 257).locator(), ("xpath", element.xpath))
+        ancestors = element.ancestors[:1] + (("XCUIElementTypeCell", "x" * 257, "Row ` A"),) + element.ancestors[2:]
+        self.assertEqual(replace(element, ancestors=ancestors).locator(), ("xpath", element.xpath))
+        self.assertEqual(snapshot(source()).elements[1].locator()[0], "predicate string")
+        self.assertEqual(Selector("XCUIElementTypeButton", ancestor_label="Row ` A").locator()[0], "xpath")
+
 
 class ExecutorTests(unittest.TestCase):
+    def test_named_ancestor_ambiguous_class_chain_never_writes(self):
+        extra = ('<XCUIElementTypeCell label="Row">'
+                 '<XCUIElementTypeButton label="Go" visible="true" enabled="true" '
+                 'x="2" y="3" width="4" height="5"/>'
+                 '</XCUIElementTypeCell>')
+        grant = Grant("tap", APP, "Tap the row button",
+                      Selector("XCUIElementTypeButton", label="Go", ancestor_label="Row"),
+                      after=(Condition("exists", APP, Selector("XCUIElementTypeButton", label="Finished")),))
+        ex, wda = executor([grant], xml=source(extra=extra))
+        offer, = ex.offers(ex.observe())
+        wda.find_elements.return_value = ["one", "two"]
+        self.assertEqual(ex.execute(offer.id).dispatch, "not_sent")
+        query = wda.find_elements.call_args.args[0]
+        self.assertEqual(wda.find_elements.call_args.kwargs["using"], "class chain")
+        self.assertIn('XCUIElementTypeCell[`label == "Row"`]/XCUIElementTypeButton[`', query)
+        wda.element_action.assert_not_called()
+
     def test_app_wait_reads_identity_without_source_or_lock_preflight(self):
         ex, wda = executor([])
         state, obs = ex.wait((Condition("app", APP),))
@@ -258,13 +325,14 @@ class ExecutorTests(unittest.TestCase):
         self.assertTrue(ex.stopped)
         self.assertEqual(ex.execute(offer.id).dispatch, "not_sent")
         wda.element_action.assert_called_once_with("ref", "click")
-        self.assertEqual(wda.source.call_count, 1)
+        self.assertEqual(wda.source.call_count, 1)  # App-only postcondition stays narrow.
 
     def test_native_append_prepares_focus_and_verifies_exact_unicode(self):
         grant = Grant("append", APP, "Enter supplied text", FIELD, text_id="query")
         ex, wda = executor([grant], texts={"query": "hé🙂"})
         offer, = ex.offers(ex.observe())
         wda.element_value.side_effect = ["", "hé🙂"]
+        wda.source.side_effect = lambda **kwargs: source(value="hé🙂" if wda.element_action.called else "")
         self.assertEqual(ex.execute(offer.id).verification, "satisfied")
         wda.element_action.assert_called_once_with("ref", "value", text="hé🙂")
         wda.source.side_effect = None
@@ -274,6 +342,7 @@ class ExecutorTests(unittest.TestCase):
         offer, = ex.offers(ex.observe())
         wda.active_element.return_value = "different"
         wda.element_value.side_effect = ["", "hi"]
+        wda.source.side_effect = lambda **kwargs: source(value="hi" if wda.element_action.called else "")
         self.assertEqual(ex.execute(offer.id).verification, "satisfied")
         wda.active_element.assert_not_called()
         wda.element_action.assert_called_once_with("ref", "value", text="hi")
@@ -317,7 +386,7 @@ class ExecutorTests(unittest.TestCase):
         grant = Grant("append", APP, "Enter supplied text", FIELD, text_id="query")
         ex, wda = executor([grant], texts={"query": "X"})
         offer, = ex.offers(ex.observe())
-        wda.source.side_effect = lambda: source(value="abXCD" if wda.element_action.called else "")
+        wda.source.side_effect = lambda **kwargs: source(value="abXCD" if wda.element_action.called else "")
         result = ex.execute(offer.id)
         self.assertEqual((result.dispatch, result.verification), ("acknowledged", "unsatisfied"))
         self.assertTrue(ex.stopped)
@@ -341,6 +410,7 @@ class ExecutorTests(unittest.TestCase):
         ex, wda = executor([grant], xml=source(value="old"), texts={"query": "new"})
         offer, = ex.offers(ex.observe())
         wda.element_value.side_effect = ["", "new"]
+        wda.source.side_effect = lambda **kwargs: source(value="new" if wda.element_action.called else "old")
         result = ex.execute(offer.id)
         self.assertEqual((result.verification, result.acknowledged_substeps), ("satisfied", 2))
         self.assertEqual(wda.element_action.call_count, 2)

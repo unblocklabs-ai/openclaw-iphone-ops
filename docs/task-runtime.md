@@ -100,7 +100,9 @@ contain private non-secure text; do not serialize them into logs or model input.
 
 `execute(offer.id)` consumes the observation's choices once. It resolves a live
 native reference using the observed identity and location. Simple controls use
-native predicates; meaningful ancestor context retains XPath targeting.
+native predicates; eligible named-ancestor targets use WDA class chain, while
+other ancestor cases retain XPath targeting. Class chain allows anonymous
+sibling reorder only when hierarchy, identity and geometry still resolve uniquely.
 Pointer actions check hittability; field reads and native typing do not.
 A known-app foreground-state query and local freshness/device checks guard
 dispatch. Native targets are resolved anew, so a same-bundle process restart
@@ -180,15 +182,20 @@ the accessibility tree. Their returned `Observation` has `elements=None` and
 `secure=None`: screen contents and secure-field presence were **not observed**.
 It can verify app identity only; unevaluated element conditions return `unknown`,
 direct element matching is rejected, and it cannot produce action offers or Jev
-input. Value/focus/existence waits use targeted native queries and retain
+input. Ordinary value/focus/existence waits use targeted native queries and retain
 only those exact condition results alongside app-only evidence. Those proofs
 are discarded on mutation or another observation; they never prove absence of
-other elements. A new decision that needs controls acquires its full tree once.
+other elements. No-`after` input on a normal editable field instead captures
+one fresh full tree: a unique readable value verifies input and the tree can
+authorize the next decision. Missing tree values fall back to the selected
+native reference; ambiguous targets do not verify. Explicit-`after` and final
+actions retain targeted verification when their conditions permit it. A
+decision without sufficient full evidence acquires its tree once.
 Absence/actionability waits still use XML. A simple selector uses a native
-predicate, while ancestry-sensitive selectors retain XPath (which itself builds
-XML inside WDA). Field resolution, focus and value reads are shared within one
-predicate pass, never across subsequent enumerations. Same-field readback reuses
-the selected native reference; only an explicit stale read permits read-only
+predicate, while ancestry-sensitive `Selector` queries retain XPath (which
+itself builds XML inside WDA). Field resolution, focus and value reads are shared within one
+predicate pass, never across subsequent enumerations. Targeted same-field
+readback reuses the selected native reference; only an explicit stale read permits read-only
 re-resolution. Transport failures never cause input replay.
 
 The task loop reuses a fresh full post-action observation for its next decision.

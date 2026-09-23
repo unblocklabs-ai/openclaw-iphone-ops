@@ -14,15 +14,15 @@ import time
 import unicodedata
 import uuid
 
-from .actions import Condition, Executor
+from .actions import Condition, Executor, scoped_items, scoped_progress
 from .errors import OpenClawIPhoneError, VerificationExpired, WDAOutcomeUnknown, WDAUnavailable
 from .evidence import artifact_path, write_private
 from .jev import DecisionUnavailable, JevDriver, LowConfidenceDecision
-from .observations import EDITABLE, Element, Observation, ObservationRejected, Selector
+from .observations import EDITABLE, SCROLLABLE, Element, Observation, ObservationRejected, Selector
 
 SECURE = "XCUIElementTypeSecureTextField"
 INPUTS = EDITABLE | {SECURE, "XCUIElementTypeOther"}
-CONTROLS = INPUTS | {"XCUIElementTypeButton", "XCUIElementTypeCell", "XCUIElementTypeLink",
+CONTROLS = INPUTS | SCROLLABLE | {"XCUIElementTypeButton", "XCUIElementTypeCell", "XCUIElementTypeLink",
                      "XCUIElementTypeStaticText"}
 
 
@@ -47,7 +47,7 @@ def parse_scope(value: object) -> dict:
         if not isinstance(values, list) or len(values) > 100 or key != "cloud_labels" and not values:
             raise ValueError("Adaptive scope requires bounded app/operation/approved-label lists.")
         result[key] = tuple(text(v) for v in values)
-    if not set(result["operations"]) <= {"tap", "input", "keypad", "vision_tap", "relaunch"}:
+    if not set(result["operations"]) <= {"tap", "input", "keypad", "vision_tap", "relaunch", "scroll"}:
         raise ValueError("Unknown adaptive operation.")
     inputs = scope.get("inputs", {})
     if not isinstance(inputs, dict) or len(inputs) > 32:
@@ -88,20 +88,31 @@ class AdaptiveAct:
         # Omit structural wrappers and keyboard keys, not useful controls late
         # in the tree. This is a display projection; targeting uses the full tree.
         relevant = [e for e in observation.elements or () if e.visible is True and
-                    e.role in CONTROLS and (e.name or e.label or e.role == SECURE)]
+                    e.role in CONTROLS and (e.name or e.label or e.role == SECURE or e.role in SCROLLABLE)]
         result["elements"] = [{"id": e.id, "role": e.role, "enabled": e.enabled,
                                 "actionable": e.actionable, "named": bool(e.name or e.label)} for e in relevant[:80]]
         result["omitted_relevant"] = max(0, len(relevant) - 80)
         result["omitted_visible"] = result["counts"]["visible"] - len(result["elements"])
+        def safe_label(value: str | None) -> str:
+            value = value or ""
+            for secret in self.secrets:
+                value = value.replace(secret, "[private input]")
+            return value[:256]
+
         for row in result["elements"]:
             element = rows[row["id"]]
             row["bounds"] = element.bounds
+            if element.role in EDITABLE:
+                # A missing value or a possible placeholder is not evidence of emptiness.
+                value = element.value
+                row["input_state"] = ("unknown" if value is None or value != "" and
+                    value in {element.name, element.label} else "empty" if value == "" else "nonempty")
+                row["focused"] = element.focused
             if labels and element.role != SECURE:
-                for key in ("name", "label"):
-                    value = getattr(element, key) or ""
-                    for secret in self.secrets:
-                        value = value.replace(secret, "[private input]")
-                    row[key] = value[:256]
+                row.update(name=safe_label(element.name), label=safe_label(element.label),
+                           ancestors=[{"role": role, "name": safe_label(name), "label": safe_label(label)}
+                                      for role, name, label in element.ancestors
+                                      if role != "XCUIElementTypeApplication" and (name or label)][-2:])
         result.update(labels_included=labels, input_stopped=self.ex.stopped,
                       input_pending=self.pending_input is not None)
         return result
@@ -115,8 +126,8 @@ class AdaptiveAct:
     def _target(self, data: dict, observation: Observation):
         from .tasks import selector
         action = data["action"]
-        candidates = [e for e in observation.elements if e.actionable and
-                      e.role in (INPUTS if action in {"input", "keypad"} else CONTROLS)]
+        roles = INPUTS if action in {"input", "keypad"} else SCROLLABLE if action == "scroll" else CONTROLS - SCROLLABLE
+        candidates = [e for e in observation.elements if e.actionable and e.role in roles]
         if "target_id" in data:
             if data.get("snapshot_id") != observation.id:
                 raise ObservationRejected("Target ID belongs to a different snapshot.")
@@ -175,13 +186,18 @@ class AdaptiveAct:
     def act(self, request: object) -> dict:
         from .tasks import conditions, object_fields, text
         data = object_fields(request, {"op", "action", "instruction", "target", "target_id", "snapshot_id",
-                              "text_ref", "mode", "after", "empty_focus_confirmed", "strategy"}, {"op", "action", "instruction"})
+                              "text_ref", "mode", "after", "empty_focus_confirmed", "strategy", "direction"}, {"op", "action", "instruction"})
         action = text(data["action"])
         text(data["instruction"], maximum=1024)
         if action not in self.scope["operations"] or action == "vision_tap":
             raise ValueError("Operation is not authorized for adaptive Act.")
         if "target" in data and "target_id" in data:
             raise ValueError("Choose one targeting mechanism.")
+        if action == "scroll":
+            if data.get("direction") not in {"up", "down"}:
+                raise ValueError("Scroll requires up or down direction.")
+        elif "direction" in data:
+            raise ValueError("Only scroll accepts direction.")
         after = conditions(data.get("after", []))
         if any(c.app not in self.scope["apps"] for c in after):
             raise ValueError("Postcondition app is outside scope.")
@@ -283,14 +299,30 @@ class AdaptiveAct:
                 if action == "tap":
                     wda.element_action(reference, "click")
                     acknowledged += 1
+                elif action == "scroll":
+                    wda.element_scroll(reference, data["direction"])
+                    acknowledged += 1
                 elif action == "relaunch":
                     wda.terminate_app(current.app)
                     acknowledged += 1
                     wda.activate_app(current.app)
                     acknowledged += 1
-            if action in {"input", "keypad"}:
+            if action == "scroll":
+                current = self.ex.observe()
+                same = [e for e in current.elements or () if e.path == target.path and e.role == target.role
+                        and e.name == target.name and e.label == target.label and e.ancestors == target.ancestors]
+                if current.app != original.app or len(same) != 1:
+                    state = "unknown"
+                else:
+                    changed = scoped_progress(scoped_items(original, target), scoped_items(current, same[0]))
+                    state = self.ex.verify(current, after) if after else "satisfied" if changed else "unsatisfied"
+            elif action in {"input", "keypad"}:
                 references = {input_conditions[0].target: reference} if not after and reference and input_conditions else None
-                state, current = self.ex.wait(input_conditions, once=not after, references=references)
+                # A normal field's post-input tree is also the next decision's
+                # evidence. Verify its value there, rather than reading a narrow
+                # value now and immediately fetching the same screen afterward.
+                full = not after and target.role in EDITABLE
+                state, current = self.ex.wait(input_conditions, once=not after, full=full, references=references)
             elif after:
                 state, current = self.ex.wait(after)
             else:
@@ -299,7 +331,8 @@ class AdaptiveAct:
             if action in {"input", "keypad"} and state == "satisfied":
                 self.pending_input = None
                 self.pending_target = None
-            reason = "verified" if state == "satisfied" else "inspect_result"
+            reason = ("no_progress" if action == "scroll" and state == "unsatisfied" and not changed
+                      else "verified" if state == "satisfied" else "inspect_result")
             result = {"status": "step", "dispatch": "acknowledged", "verification": state, "reason": reason}
             if action == "input" and not after and state in {"satisfied", "unsatisfied"}:
                 readback = self.ex._values.get(input_conditions[0])
