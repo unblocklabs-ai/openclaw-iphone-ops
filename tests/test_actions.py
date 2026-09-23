@@ -63,7 +63,7 @@ class ObservationTests(unittest.TestCase):
         for candidate in (xml.replace('bundleId="test.app"', 'bundleId="other.app"'),
                           xml.replace('processId="1"', 'processId="2"'),
                           xml.replace('processId="1"', 'processId="invalid"'),
-                          f"<AppiumAUT>{xml.replace('bundleId="test.app"', 'bundleId="other.app"')}</AppiumAUT>"):
+                          "<AppiumAUT>" + xml.replace('bundleId="test.app"', 'bundleId="other.app"') + "</AppiumAUT>"):
             with self.assertRaises(ObservationRejected):
                 parse_observation(candidate, generation=1, device_udid="device", app=APP,
                     captured_at="now", started=0, finished=1, process_id=1)
