@@ -4,6 +4,14 @@ Offline validation recorded 2026-09-22 against v0.4.0 (`c983109`). This report
 covers pre-release tests, not deployment, phone interaction or live Jev calls.
 See the v0.4.1 release notes for subsequent installed-release validation.
 
+**Current-behavior note (2026-09-22):** The table below is the historical
+v0.4.1 consolidation baseline, not current request counts. Ordinary no-`after`
+editable input now captures a reusable post-input full observation, with
+targeted fallback only when its value is missing. The warm input → tap path is
+14 requests rather than 16. Eligible named-ancestor targets now use WDA class
+chain; other ancestor cases retain XPath. See
+[`phoneagent-refactor-plan.md`](phoneagent-refactor-plan.md) for physical timings.
+
 ## Before / after
 
 These are **offline WDA request counts**, not physical-device latency. Both
@@ -26,22 +34,24 @@ initial observation and includes explicit caller-reviewed masks on the new path.
 | Two-step deterministic task | 34 | 22 | 16 |
 | Ten offers sharing focus/value predicates | 60 | 6 | 3 |
 
-The simplified warm tap captures one full screen; the two-step task captures
-two (initial and intermediate). The other cases issue no `/source` requests.
+In this historical measurement, the simplified warm tap captured one full
+screen; the two-step task captured two (initial and intermediate). The other
+cases issued no `/source` requests.
 **No `/source` does not mean no accessibility work:** XPath queries build XML
 inside WDA. These simple tap/input/predicate cases now use native predicates,
 not XPath. The keypad cases retain one union XPath to validate keyboard layout.
-Named-ancestor targeting also retains XPath rather than weakening context.
+At the time, named-ancestor targeting retained XPath rather than weakening context.
 Native lookup/attributes can still take accessibility snapshots internally.
 
 The adaptive tap has no explicit postcondition and reports verification
 `unknown`; the vision tap reports acknowledgment, not completion. Input and the
 two-step task verify their specified results. Setup/cleanup remain excluded.
 
-Composition check: input followed by a tap takes **16 requests (7 + 9)**,
+Historical composition check: input followed by a tap took **16 requests (7 + 9)**,
 down from 25 (12 + 13) after the first consolidation, excluding the initial
 observation. The following tap needs two observation requests to acquire controls
-not present in field-only readback; its isolated warm count is seven.
+not present in field-only readback; its isolated warm count was seven. Current
+post-input full observation supplies those controls, making this path 14 requests.
 
 A screenshot with an existing fresh full observation uses three requests;
 without one it also uses three. Vision dispatch uses four. Each image has a distinct,
@@ -51,7 +61,8 @@ one-use ID even when captures reuse the same accessibility observation.
 
 1. **Unconditional reobservation:** fixed/adaptive actions resolve the exact
    observed native target rather than recapture XML. Simple controls use native
-   identity/geometry predicates; named ancestors retain XPath. Foreground state
+   identity/geometry predicates; eligible named ancestors now use native class
+   chain, with XPath for other ancestor cases. Foreground state
    and local freshness/device identity guard native dispatch. Pixel evidence
    retains the original process/PID guard. Keypad layout uses one union query.
 2. **Overbroad verification:** value/focus/existence predicates use targeted
@@ -139,10 +150,11 @@ targets, lock state, secure input, exact readback and no-replay coverage. Test
 fixtures were updated to respond to native queries instead of expecting the
 removed XML reads.
 
-The initial consolidation also checked XPath semantics locally. The simplified
-path keeps the ancestor/keypad fallback but no longer adds a whole-screen secure
-field XPath predicate before each fixed action: observed secure screens still
-withhold fixed offers, and fixed input targets remain non-secure editable roles.
+The initial consolidation also checked XPath semantics locally. The current
+path keeps XPath for ineligible ancestor cases and the keypad union, but no
+longer adds a whole-screen secure-field XPath predicate before each fixed action:
+observed secure screens still withhold fixed offers, and fixed input targets
+remain non-secure editable roles.
 
 ## Remaining work and intentional checks
 
@@ -152,15 +164,14 @@ simple targeted dispatch uses the cheaper app-state route instead. Native click
 hit testing and keypad layout validation remain intentional costs. There are
 no speculative WDA server modifications or new runtime dependencies.
 
-The full next screen is captured when a subsequent decision actually needs its
-controls. A field-only result cannot supply those controls for free. Screenshot
-fallback checks app/process, geometry, age and ownership, but cannot guarantee
+Ordinary no-`after` input captures a full next screen even if the caller stops
+there; other actions capture it when the subsequent decision needs its controls.
+Screenshot fallback checks app/process, geometry, age and ownership, but cannot guarantee
 arbitrary pixels stayed unchanged; use it only on an inspected stable target.
 Explicit masks remain the trusted local caller's responsibility.
 
-Before claiming live speed gains: install a candidate build on Bill, run the same
-synthetic input/navigation tasks with the same device state before and after,
-then measure verified completion, total latency, route counts, p50/p95 and
-reconciliation behavior. Test an AX-broken screen and custom keypad separately.
-No X login speedup, unattended-readiness claim, or model-performance gain is
-established by these offline results.
+The [narrow physical comparison](phoneagent-refactor-plan.md) now measures a
+synthetic input/navigation gain on Bill. Before generalizing, measure verified
+completion, total latency, route counts, tails, and reconciliation on broader
+screens; test an AX-broken screen and custom keypad separately. No X login,
+unattended-readiness, or model-performance gain is established.

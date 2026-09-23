@@ -7,6 +7,7 @@ import tempfile
 import unittest
 
 from openclaw_iphone.errors import WDASetupError, WDAUnavailable, WDAUnsupportedCommand
+from openclaw_iphone.observations import parse_observation
 from openclaw_iphone.wda import WDAClient, WDARunConfig, build_xcodebuild_command, find_xcode_container, parse_ready
 
 
@@ -82,6 +83,45 @@ class WDATests(unittest.TestCase):
 
         self.assertEqual(client.source(), "<App />")
 
+    def test_source_compact_route_leaves_default_raw(self) -> None:
+        from unittest.mock import Mock
+        compact = ("/source?format=xml&excluded_attributes=accessible,nativeAccessibilityElement,"
+                   "index,placeholderValue,traits,nativeFrame,minValue,maxValue,customActions,type")
+        client = WDAClient(url="http://wda.test", timeout=1)
+        client._send = Mock(return_value=b'<App />')
+        self.assertEqual(client.source(), "<App />")
+        self.assertEqual(client.source(compact=True), "<App />")
+        self.assertEqual([call.args[0] for call in client._send.call_args_list], ["/source", compact])
+        self.assertTrue(all(call.kwargs["method"] == "GET" for call in client._send.call_args_list))
+        self.assertEqual(client.metrics.summary()["counts"], {"wda GET /source": 2})
+
+    def test_compact_xml_retains_observation_semantics(self) -> None:
+        attributes = ('accessible="true" nativeAccessibilityElement="noop" index="3" '
+                      'placeholderValue="hint" traits="0" nativeFrame="none" '
+                      'minValue="0" maxValue="1" customActions="none" type="TextField"')
+        raw = ('<XCUIElementTypeApplication name="Test" visible="true" enabled="true" '
+               'x="0" y="0" width="400" height="800"><XCUIElementTypeTextField '
+               'label="Input" visible="true" enabled="true" focused="true" '
+               'x="1" y="50" width="100" height="30" ' + attributes + '/>'
+               '<XCUIElementTypeSecureTextField value="SECRET" visible="false" '
+               'enabled="true" x="2" y="90" width="100" height="30" ' + attributes + '/>'
+               '</XCUIElementTypeApplication>')
+        reduced = raw.replace(' ' + attributes, '')
+        def parse(xml: str):
+            return parse_observation(xml, generation=1, device_udid="device", app="test.app",
+                                     captured_at="now", started=1, finished=2, process_id=1)
+        full, compact = parse(raw), parse(reduced)
+        self.assertEqual(full.signature, compact.signature)
+        self.assertEqual(full.secure, compact.secure)
+        self.assertTrue(compact.secure)  # Hidden secure nodes still constrain projection.
+        self.assertEqual([(e.role, e.name, e.label, e.value, e.visible, e.enabled,
+                           e.focused, e.bounds, e.path, e.xpath) for e in full.elements],
+                         [(e.role, e.name, e.label, e.value, e.visible, e.enabled,
+                           e.focused, e.bounds, e.path, e.xpath) for e in compact.elements])
+        self.assertIsNone(compact.elements[1].value)
+        self.assertEqual(compact.elements[1].bounds, (1.0, 50.0, 100.0, 30.0))
+        self.assertTrue(compact.elements[1].focused)
+
     def test_source_accepts_raw_text(self) -> None:
         client = FakeWDAClient({"/source": b"<App />"})
 
@@ -133,6 +173,17 @@ class WDATests(unittest.TestCase):
         client.lock()
 
         self.assertEqual(client.posts, [("/wda/lock", {})])
+
+    def test_element_scroll_uses_one_targeted_native_swipe(self) -> None:
+        for content_direction, finger_direction in (("down", "up"), ("up", "down")):
+            client = RecordingWDAClient()
+            client.element_scroll("container/1", content_direction)
+            self.assertEqual(client.posts[2:], [("/session/session-123/wda/element/container%2F1/swipe",
+                                                {"direction": finger_direction})])
+        client = RecordingWDAClient()
+        with self.assertRaises(ValueError):
+            client.element_scroll("container", "left")
+        self.assertEqual(client.posts, [])
 
     def test_tap_posts_w3c_touch_action_and_deletes_session(self) -> None:
         client = RecordingWDAClient()

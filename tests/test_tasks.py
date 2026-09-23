@@ -254,7 +254,7 @@ class TaskTests(unittest.TestCase):
             with self.subTest(jev=use_jev):
                 ex, wda = executor([grant])
                 wda.active_app.side_effect = lambda: {"bundleId": "next.app" if wda.element_action.called else APP, "pid": 1}
-                wda.source.side_effect = lambda: source(button_label="Finished" if wda.element_action.called else "Next")
+                wda.source.side_effect = lambda **kwargs: source(button_label="Finished" if wda.element_action.called else "Next")
                 driver = Mock() if use_jev else None
                 if driver:
                     driver.choose.side_effect = lambda view, options, budget: Decision(

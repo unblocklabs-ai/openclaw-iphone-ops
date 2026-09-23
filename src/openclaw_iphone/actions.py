@@ -167,7 +167,7 @@ class Executor:
         started = time.monotonic()
         stamp = datetime.now(timezone.utc).isoformat()
         try:
-            source = None if app_only else wda.source()
+            source = None if app_only else wda.source(compact=True)
             after = wda.active_app()
         except OpenClawIPhoneError:
             if invalidate_on_error:
@@ -249,6 +249,7 @@ class Executor:
                 return "unknown"
         if element.role not in EDITABLE:
             return "unknown"
+        self._values[condition] = element.value
         return "satisfied" if element.value == condition.value else "unsatisfied"
 
     def verify(self, observation: Observation, conditions: tuple[Condition, ...], *,
@@ -272,8 +273,10 @@ class Executor:
 
     def _observe_conditions(self, conditions: tuple[Condition, ...], *, full: bool = False,
                             references: dict[Selector, str] | None = None) -> Observation:
-        kinds = {"app", "value", "focused"} if full else {"app", "value", "focused", "exists"}
-        narrow = all(c.kind in kinds for c in conditions)
+        # App identity alone never needs a tree, even if the caller could use
+        # next-screen evidence. Element predicates with full=True do.
+        narrow = (all(c.kind == "app" for c in conditions)
+                  or not full and all(c.kind in {"app", "value", "focused", "exists"} for c in conditions))
         observation = self.observe(app_only=narrow, invalidate_on_error=False)
         if not narrow:
             return observation
@@ -321,7 +324,13 @@ class Executor:
                         raise VerificationExpired("Verification window expired; inspect without replaying input.")
                     self.connection.budget.sleep(min(0.2, end - time.monotonic()))
                     continue
-                state = self.verify(observation, conditions)
+                reads = PredicateReads({target: [ref] for target, ref in (references or {}).items()}) if full else None
+                state = self.verify(observation, conditions, reads=reads)
+                if full and references is not None and reads is not None:
+                    for target in references:
+                        refs = reads.references[target]
+                        if len(refs) == 1:
+                            references[target] = refs[0]
                 if time.monotonic() > end:
                     raise VerificationExpired("Verification read exceeded its deadline; input is not replayed.")
                 if state == "satisfied" and self.pending == conditions:
@@ -547,7 +556,7 @@ class Executor:
                 current = self.observe()
                 current_target = current.unique(grant.target)
                 changed = (current_target is not None and
-                           scoped_items(current, current_target) != scoped_items(original, old))
+                           scoped_progress(scoped_items(original, old), scoped_items(current, current_target)))
                 state = "satisfied" if current.app == grant.app and changed else "unsatisfied"
             else:
                 state, current = self.wait(conditions, full=observe_next, references=references)
@@ -577,4 +586,17 @@ def scoped_items(observation: Observation, container: Element) -> tuple[object, 
     if observation.elements is None:
         raise ObservationRejected("App-only observation cannot verify scroll progress.")
     return tuple((e.role, e.name, e.label, e.value, e.bounds) for e in observation.elements
-                 if e.visible is True and e.path.startswith(container.path + "/"))
+                 if e.visible is True and e.path.startswith(container.path + "/")
+                 and (e.label or e.name and e.role not in {"XCUIElementTypeOther", "XCUIElementTypeScrollView"}))
+
+
+def scoped_progress(before: tuple[object, ...], after: tuple[object, ...]) -> bool:
+    # Compare visible content, not anonymous wrappers or bounce/rounding jitter.
+    if len(before) != len(after):
+        return True
+    for old, new in zip(before, after):
+        if old[:4] != new[:4]:
+            return True
+        if old[4] is not None and new[4] is not None and any(abs(a - b) > 4 for a, b in zip(old[4], new[4])):
+            return True
+    return False

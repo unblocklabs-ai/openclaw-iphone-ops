@@ -26,6 +26,15 @@ def make(*, extra="", driver=None, inputs=None):
     return actor, wda
 
 
+def scroll_actor(*, item="First"):
+    xml = source(extra=f'<XCUIElementTypeScrollView name="Feed" visible="true" enabled="true" x="0" y="100" width="300" height="500">'
+                 f'<XCUIElementTypeCell label="{item}" visible="true" x="0" y="100" width="300" height="50"/>'
+                 '</XCUIElementTypeScrollView>')
+    ex, wda = executor([], xml=xml)
+    actor = AdaptiveAct(ex, parse_scope({"apps": [APP], "operations": ["scroll"], "cloud_labels": []}))
+    return actor, wda
+
+
 def png(width=8, height=16, filter_type=0):
     def chunk(kind, body):
         return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body))
@@ -35,6 +44,138 @@ def png(width=8, height=16, filter_type=0):
 
 
 class AdaptiveTests(unittest.TestCase):
+    def test_scroll_one_dispatch_and_reusable_full_observation(self):
+        actor, wda = scroll_actor()
+        before = actor.ex.observe()
+        view = actor.view(before)
+        container = next(row for row in view["elements"] if row["role"] == "XCUIElementTypeScrollView")
+        wda.source.return_value = source(extra='<XCUIElementTypeScrollView name="Feed" visible="true" enabled="true" x="0" y="100" width="300" height="500">'
+            '<XCUIElementTypeCell label="Second" visible="true" x="0" y="100" width="300" height="50"/>'
+            '</XCUIElementTypeScrollView>')
+        result = actor.act({"op": "act", "action": "scroll", "instruction": "Feed", "target_id": container["id"],
+                            "snapshot_id": before.id, "direction": "down"})
+        self.assertEqual((result["dispatch"], result["verification"], result["reason"]),
+                         ("acknowledged", "satisfied", "verified"))
+        self.assertIs(actor.ex.latest, result["observation"])
+        wda.element_scroll.assert_called_once_with("ref", "down")
+        self.assertEqual(wda.source.call_count, 2)
+
+    def test_scroll_rejects_bad_direction_stale_ambiguous_and_wrong_app(self):
+        for mode in ("direction", "stale", "ambiguous", "app"):
+            actor, wda = scroll_actor()
+            before = actor.ex.observe()
+            request = {"op": "act", "action": "scroll", "instruction": "Feed", "direction": "up",
+                       "target_id": before.elements[-2].id, "snapshot_id": before.id}
+            if mode == "direction":
+                request["direction"] = "left"
+                with self.assertRaises(ValueError):
+                    actor.act(request)
+            else:
+                if mode == "stale":
+                    request["snapshot_id"] = "old"
+                elif mode == "ambiguous":
+                    wda.find_elements.return_value = ["one", "two"]
+                else:
+                    wda.app_state.return_value = 3
+                self.assertEqual(actor.act(request)["dispatch"], "not_sent")
+            wda.element_scroll.assert_not_called()
+
+    def test_scroll_no_progress_and_unknown_write_are_not_replayed(self):
+        actor, wda = scroll_actor()
+        result = actor.act({"op": "act", "action": "scroll", "instruction": "Feed", "direction": "down"})
+        self.assertEqual((result["dispatch"], result["verification"], result["reason"]),
+                         ("acknowledged", "unsatisfied", "no_progress"))
+        self.assertFalse(actor.ex.stopped)
+        wda.element_scroll.assert_called_once()
+        actor, wda = scroll_actor()
+        wda.element_scroll.side_effect = WDAOutcomeUnknown("PRIVATE")
+        request = {"op": "act", "action": "scroll", "instruction": "Feed", "direction": "down"}
+        self.assertEqual(actor.act(request)["dispatch"], "unknown")
+        self.assertEqual(actor.act(request)["dispatch"], "not_sent")
+        wda.element_scroll.assert_called_once()
+
+    def test_scroll_ignores_bounce_jitter_but_accepts_material_content_movement(self):
+        for offset, expected in ((2, "unsatisfied"), (12, "satisfied")):
+            actor, wda = scroll_actor()
+            wda.source.side_effect = [wda.source.return_value,
+                source(extra='<XCUIElementTypeScrollView name="Feed" visible="true" enabled="true" x="0" y="100" width="300" height="500">'
+                    f'<XCUIElementTypeCell label="First" visible="true" x="0" y="{100 + offset}" width="300" height="49"/>'
+                    '<XCUIElementTypeOther visible="true" x="10" y="10" width="4" height="10"/>'
+                    '</XCUIElementTypeScrollView>')]
+            result = actor.act({"op": "act", "action": "scroll", "instruction": "Feed", "direction": "down"})
+            self.assertEqual(result["verification"], expected)
+            self.assertEqual(result["reason"], "no_progress" if offset == 2 else "verified")
+            wda.element_scroll.assert_called_once()
+            self.assertEqual(wda.source.call_count, 2)
+
+    def test_scroll_explicit_after_is_checked_in_reused_tree(self):
+        actor, wda = scroll_actor()
+        wda.source.side_effect = [wda.source.return_value,
+            source(extra='<XCUIElementTypeScrollView name="Feed" visible="true" enabled="true" x="0" y="100" width="300" height="500">'
+            '<XCUIElementTypeCell label="Second" visible="true" x="0" y="100" width="300" height="50"/>'
+            '</XCUIElementTypeScrollView>')]
+        result = actor.act({"op": "act", "action": "scroll", "instruction": "Feed", "direction": "down",
+            "after": [{"kind": "exists", "app": APP, "target": {"role": "XCUIElementTypeCell", "label": "Second"}}]})
+        self.assertEqual((result["verification"], result["reason"]), ("satisfied", "verified"))
+        wda.source.assert_called()
+        self.assertEqual(wda.source.call_count, 2)
+        wda.element_scroll.assert_called_once()
+
+    def test_scroll_lost_container_is_unknown_not_no_progress(self):
+        actor, wda = scroll_actor()
+        wda.source.side_effect = [wda.source.return_value,
+            source(extra='<XCUIElementTypeScrollView name="Other" visible="true" enabled="true" x="0" y="100" width="300" height="500"/>')]
+        result = actor.act({"op": "act", "action": "scroll", "instruction": "Feed", "direction": "down"})
+        self.assertEqual((result["dispatch"], result["verification"], result["reason"]),
+                         ("acknowledged", "unknown", "inspect_result"))
+        wda.element_scroll.assert_called_once()
+
+    def test_pending_input_blocks_scroll(self):
+        actor, wda = scroll_actor()
+        actor.pending_input = (Condition("exists", APP, BUTTON),)
+        result = actor.act({"op": "act", "action": "scroll", "instruction": "Feed", "direction": "down"})
+        self.assertEqual((result["dispatch"], result["reason"]), ("not_sent", "input_requires_reconciliation"))
+        wda.element_scroll.assert_not_called()
+
+    def test_local_context_distinguishes_duplicate_rows_without_values(self):
+        extra = ''.join(
+            f'<XCUIElementTypeCell label="{name}" visible="true" enabled="true" x="1" y="{y}" width="200" height="40">'
+            f'<XCUIElementTypeButton label="Edit" visible="true" enabled="true" x="160" y="{y}" width="40" height="40"/>'
+            '</XCUIElementTypeCell>' for name, y in (("Alice", 100), ("Bob", 150)))
+        actor, _ = make(extra=extra)
+        observed = actor.ex.observe()
+        plain = actor.view(observed)
+        self.assertNotIn("Alice", json.dumps(plain))
+        local = actor.view(observed, labels=True)
+        edits = [row for row in local["elements"] if row.get("label") == "Edit"]
+        self.assertEqual([row["ancestors"][0]["label"] for row in edits], ["Alice", "Bob"])
+        self.assertNotEqual(edits[0]["id"], edits[1]["id"])
+
+    def test_local_editable_state_is_coarse_and_private(self):
+        extra = ('<XCUIElementTypeTextField label="Empty" value="" focused="true" visible="true"/>'
+                 '<XCUIElementTypeTextField label="Placeholder" value="Placeholder" focused="false" visible="true"/>'
+                 '<XCUIElementTypeTextField label="Private" value="SECRET" visible="true"/>'
+                 '<XCUIElementTypeSecureTextField label="Password" value="SECRET" visible="true"/>')
+        actor, _ = make(extra=extra)
+        actor.ex.connection.require_active().source.return_value = source(extra=extra).replace('label="Input" value=""', 'label="Input"')
+        view = actor.view(actor.ex.observe(), labels=True)
+        rows = {row.get("label"): row for row in view["elements"]}
+        self.assertEqual(rows["Input"]["input_state"], "unknown")
+        self.assertEqual((rows["Empty"]["input_state"], rows["Empty"]["focused"]), ("empty", True))
+        self.assertEqual(rows["Placeholder"]["input_state"], "unknown")
+        self.assertEqual(rows["Private"]["input_state"], "nonempty")
+        self.assertNotIn("input_state", next(row for row in view["elements"] if row["role"] == "XCUIElementTypeSecureTextField"))
+        self.assertNotIn("SECRET", json.dumps(view))
+
+    def test_ancestor_context_and_projection_remain_bounded(self):
+        label = "L" * 400
+        extra = '<XCUIElementTypeCell label="' + label + '"><XCUIElementTypeButton label="Go" visible="true"/></XCUIElementTypeCell>'
+        actor, _ = make(extra=extra)
+        view = actor.view(actor.ex.observe(), labels=True)
+        row = next(row for row in view["elements"] if row.get("label") == "Go")
+        self.assertEqual(len(row["ancestors"][0]["label"]), 256)
+        self.assertLessEqual(len(view["elements"]), 80)
+
     def test_opt_in_preserves_fixed_session_and_scope(self):
         ex, _ = executor([])
         spec = TaskSpec("navigate", (), (Condition("exists", APP, BUTTON),))
@@ -204,7 +345,7 @@ class AdaptiveTests(unittest.TestCase):
         self.assertEqual((result["dispatch"], result["acknowledged_substeps"]), ("not_sent", 0))
         wda.type_text.assert_not_called()
 
-    def test_input_verifies_native_value_without_recapturing_xml(self):
+    def test_input_falls_back_to_native_value_when_xml_omits_it(self):
         actor, wda = make(inputs={"text": "/unused"})
         wda.element_value.side_effect = ["", "exact"]
         with patch("openclaw_iphone.adaptive.read_input", return_value="exact"):
@@ -212,7 +353,7 @@ class AdaptiveTests(unittest.TestCase):
         self.assertEqual(result["verification"], "satisfied")
         self.assertEqual(wda.find_elements.call_count, 1)  # Readback reuses the selected field.
         self.assertEqual(wda.element_value.call_count, 2)  # Empty and exact final value.
-        wda.source.assert_called_once()  # Initial selection only.
+        self.assertEqual(wda.source.call_count, 2)  # Fresh reusable tree cannot prove its omitted value.
 
     def test_custom_keypad_uses_fresh_visual_confirmation_and_destination(self):
         from openclaw_iphone.adaptive import VisualEvidence

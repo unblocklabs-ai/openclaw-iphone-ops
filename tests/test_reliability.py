@@ -156,7 +156,7 @@ class KeypadTests(unittest.TestCase):
         def xml():
             text = source(value=state["value"], extra=keys)
             return text.replace("XCUIElementTypeTextField", "XCUIElementTypeOther") if custom else text
-        wda.source.side_effect = xml
+        wda.source.side_effect = lambda **kwargs: xml()
         wda.find_elements.side_effect = lambda xpath, **kwargs: ([f"key{digit}" for digit in "12" if f"@name='{digit}'" in xpath]
                                                       if "XCUIElementTypeKey[" in xpath else ["field"])
         wda.active_element.return_value = "field"
@@ -173,8 +173,8 @@ class KeypadTests(unittest.TestCase):
             self.assertEqual(state["value"], "12")
             wda.tap_sequence.assert_called_once_with([(15.0, 615.0), (55.0, 615.0)])
             wda.element_action.assert_not_called()
-            # One initial tree; key validation and final value use native queries.
-            self.assertEqual(wda.source.call_count, 1)
+            # The final tree verifies a readable field and is available to the next action.
+            self.assertEqual(wda.source.call_count, 2)
             wda.element_value.assert_any_call("field", allow_null_empty=not custom)
             self.assertEqual(ex.execute(offer.id).dispatch, "not_sent")
 
@@ -227,7 +227,7 @@ class KeypadTests(unittest.TestCase):
     def test_auto_submit_verifies_destination_without_requiring_disappeared_field(self):
         ex, wda, state = self.make()
         ex.grants = (replace(ex.grants[0], after=(Condition("exists", APP, BUTTON),)),)
-        wda.source.side_effect = lambda: source(button_label="Waiting", extra=(
+        wda.source.side_effect = lambda **kwargs: source(button_label="Waiting", extra=(
             '<XCUIElementTypeKeyboard visible="true">' + ''.join(
                 f'<XCUIElementTypeKey name="{d}" visible="true" enabled="true" x="{i * 40}" y="600" width="30" height="30"/>'
                 for i, d in enumerate("12")) + '</XCUIElementTypeKeyboard>'))
@@ -416,7 +416,7 @@ class SessionIntegrationTests(unittest.TestCase):
                 return b'{"value":{"ready":true}}'
             if path == "/wda/activeAppInfo":
                 return json.dumps({"value": {"bundleId": APP, "pid": 1}}).encode()
-            if path == "/source":
+            if path.startswith("/source?"):
                 return json.dumps({"value": source(value="PRIVATE")}).encode()
             if method == "DELETE":
                 self.assertLessEqual(timeout, 2)

@@ -17,6 +17,7 @@ Do not edit an npm-managed installation; upgrades replace its files.
 | Known reliable workflow | Existing deterministic recipe/deep link with destination verification |
 | Bounded multi-step task with one eligible action at each step | `task run --file TASK.json --driver deterministic` |
 | Planner needs to choose each step | **One** `task session --file TASK.json` process; retain its process handle across JSON-line requests |
+| Reveal more content | Adaptive `act` with `action: scroll`, an observed container and `direction: up|down`; inspect the returned tree, stop on `no_progress` |
 | Unfamiliar controls/auth forms (experimental, v0.4.0+) | Opt-in `adaptive` task scope; session `act`, local input references and same-session `screenshot`/`vision_tap`; read planner-session docs first |
 | Inspect an unfamiliar screen | `ui observe`; add `--include-labels` only when local private labels are appropriate |
 | Wait for a known condition | Runtime `wait()`/session `wait`; one-shot `ui wait-text` for manual work |
@@ -36,8 +37,11 @@ caller workflows/app skills. Core control remains app-independent.
 
 Use returned evidence for the next decision and completion check. Acquisition
 already validates readiness/device/lock; do not add a status/doctor/capture chain.
-Field verification uses targeted reads; a field-only result is not a full screen.
-Ask for a new observation only when the next decision needs it or evidence expired.
+Ordinary no-`after` input returns a fresh tree that verifies a unique readable
+field value and can supply the next decision. A missing tree value falls back
+to a targeted read; an ambiguous target is not verified. Explicit-`after` and
+final actions retain targeted verification when their conditions permit it.
+Ask for a new observation only when evidence is insufficient or expired.
 
 ## Input and completion
 

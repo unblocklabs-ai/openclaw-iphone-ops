@@ -56,7 +56,7 @@ def xpath_literal(value: str) -> str:
     return "concat(" + ', "\'", '.join(f"'{part}'" for part in value.split("'")) + ")"
 
 
-def predicate_literal(value: str) -> str:
+def predicate_literal(value: str | int | float) -> str:
     # NSPredicate quoted strings, never caller-provided predicate expressions.
     return json.dumps(value, ensure_ascii=False)
 
@@ -125,11 +125,27 @@ class Element:
                 self.enabled, self.bounds, self.ancestors, self.path)
 
     def locator(self) -> tuple[str, str]:
-        # Named ancestors distinguish rows/forms. Preserve their exact hierarchy
-        # with XPath instead of silently weakening to a global label match.
-        if (any(role != "XCUIElementTypeApplication" and (name or label)
-                for role, name, label in self.ancestors)
-                or any(len(value or "") > 256 for value in (self.name, self.label))):
+        named_ancestor = any(role != "XCUIElementTypeApplication" and (name or label)
+                             for role, name, label in self.ancestors)
+        short_identity = all(len(value or "") <= 256 for _, name, label in
+                             (*self.ancestors, (self.role, self.name, self.label)) for value in (name, label))
+        if (named_ancestor and self.actionable and short_identity
+                and self.ancestors[0][0] == "XCUIElementTypeApplication"):
+            def step(role: str, checks: list[tuple[str, str | int | float | None]]) -> str:
+                predicates = [f"{key} == {predicate_literal(value)}" for key, value in checks if value is not None]
+                return role + ("[`" + " AND ".join(predicates).replace("`", "``") + "`]" if predicates else "")
+
+            # Direct-child roles and named ancestors preserve row/form context.
+            # Unlike positional XPath, this accepts anonymous-sibling reorder
+            # when the hierarchy, identity, and geometry still match uniquely.
+            parts = [step(role, [("name", name), ("label", label)])
+                     for role, name, label in self.ancestors[1:]]
+            parts.append(step(self.role, [("name", self.name), ("label", self.label),
+                                          ("value", self.value), ("visible", 1), ("enabled", 1)]
+                              + [(f"rect.{key}", value) for key, value in
+                                 zip(("x", "y", "width", "height"), self.bounds)]))
+            return "class chain", "/".join(parts)
+        if named_ancestor or any(len(value or "") > 256 for value in (self.name, self.label)):
             return "xpath", self.xpath
         _, query = Selector(self.role, self.name or None, self.label or None).locator()
         checks = [query, f"enabled == {int(self.enabled is True)}"]
@@ -201,6 +217,15 @@ def parse_observation(source: str, *, generation: int, device_udid: str,
         root = ET.fromstring(source)
     except ET.ParseError as exc:
         raise ObservationRejected("Invalid accessibility XML.") from exc
+    application = root[0] if root.tag == "AppiumAUT" and len(root) == 1 else root
+    if application.tag == "XCUIElementTypeApplication":
+        bundle = application.get("bundleId")
+        if bundle is not None and bundle != app:
+            raise ObservationRejected("Accessibility source contradicts foreground app identity.")
+        pid = application.get("processId")
+        if pid is not None and (len(pid) > 20 or not pid.isascii() or not pid.isdecimal() or
+                                int(pid) <= 0 or process_id is not None and int(pid) != process_id):
+            raise ObservationRejected("Accessibility source contradicts foreground process identity.")
     snapshot_id = uuid.uuid4().hex
     elements: list[Element] = []
     secure = False
