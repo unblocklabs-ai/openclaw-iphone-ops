@@ -133,7 +133,7 @@ def verify_handles(
         "deadline_seconds": deadline_seconds,
     }
 
-    for handle in normalized_handles:
+    for index, handle in enumerate(normalized_handles):
         handle_prefix = f"{prefix}-{handle}"
         result: dict[str, Any] = {
             "handle": handle,
@@ -144,18 +144,19 @@ def verify_handles(
         steps = StepBudget(max_steps_per_handle, deadline_seconds=deadline_seconds)
         handle_client = client.with_deadline(deadline_seconds)
         try:
-            steps.take(result, "capture-start")
-            start = capture_instagram_context(handle_client, output_dir=str(base), prefix=f"{handle_prefix}-start")
-            result["artifacts"]["start_manifest"] = str(start.manifest)
-            if context_matches_handle(start.payload, handle):
-                result["profile"] = start.payload.get("current_profile")
-                result["current_reel"] = start.payload.get("current_reel")
-                result["visible_videos"] = start.payload.get("visible_videos", [])
-                result["status"] = "captured_current_context_match"
-                result["identity_verified"] = True
-                result["observed_handle"] = handle
-                payload["handles"].append(result)
-                continue
+            if index == 0:
+                steps.take(result, "capture-start")
+                start = capture_instagram_context(handle_client, output_dir=str(base), prefix=f"{handle_prefix}-start")
+                result["artifacts"]["start_manifest"] = str(start.manifest)
+                if context_matches_handle(start.payload, handle):
+                    result["profile"] = start.payload.get("current_profile")
+                    result["current_reel"] = start.payload.get("current_reel")
+                    result["visible_videos"] = start.payload.get("visible_videos", [])
+                    result["status"] = "captured_current_context_match"
+                    result["identity_verified"] = True
+                    result["observed_handle"] = handle
+                    payload["handles"].append(result)
+                    continue
 
             steps.take(result, "open-profile-deep-link")
             deep_link = f"instagram://user?username={handle}"

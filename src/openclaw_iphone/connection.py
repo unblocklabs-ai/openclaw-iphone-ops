@@ -23,13 +23,16 @@ class TaskConnection:
 
     def __init__(self, ctl: DeviceCtl, *, device: str | None = None,
                  seconds: float = 60, lock_path: Path | None = None,
-                 read_timeout: float = DEFAULT_SCREEN_READ_TIMEOUT) -> None:
+                 read_timeout: float = DEFAULT_SCREEN_READ_TIMEOUT,
+                 read_only: bool = False) -> None:
         self.ctl = ctl
         self.requested = device
         self.budget = Budget.seconds(seconds)
         self.metrics = Metrics()
         self.lock_path = lock_path
         self.read_timeout = read_timeout
+        # Acquisition policy for ui observe only; WDA still guards every mutation.
+        self.read_only = read_only
         self.device: Device | None = None
         self.wda: WDAClient | None = None
         self.generation = 0
@@ -64,16 +67,18 @@ class TaskConnection:
 
     def _connect(self, selector: str | None) -> None:
         self.budget.remaining()
-        device = self.ctl.select_device(selector)
+        device = self.ctl.select_device(selector, read_only=True) if self.read_only else self.ctl.select_device(selector)
         if not device.udid or self.device is not None and device.udid != self.device.udid:
             raise DeviceSelectionError("A task requires the same explicit physical UDID; device identity unavailable or changed.")
-        self.ctl.require_unlocked(device.identifier)
+        if not self.read_only:
+            self.ctl.require_unlocked(device.identifier)
         url, _ = self.ctl.coredevice_wda_url(device.identifier)
         wda = WDAClient(url=url, timeout=self.ctl.runner.timeout, read_timeout=self.read_timeout)
         wda.budget, wda.metrics = self.budget, self.metrics
         if not wda.is_ready():
             raise WDAUnavailable("WDA is not ready; no task action dispatched.")
-        wda.require_unlocked()
+        if not self.read_only:
+            wda.require_unlocked()
         self.device, self.wda = device, wda
         self._sessions.enter_context(wda.session())
         self.generation += 1

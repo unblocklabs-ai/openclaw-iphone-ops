@@ -557,7 +557,7 @@ def handle_ui_observe(args: argparse.Namespace) -> int:
     if config.wda_url:
         raise ValueError("Compact observation requires a resolved CoreDevice endpoint.")
     with TaskConnection(client_from_args(args), device=device_selector_from_args(args, config=config),
-                        seconds=args.deadline_seconds, read_timeout=args.read_timeout) as connection:
+                        seconds=args.deadline_seconds, read_timeout=args.read_timeout, read_only=True) as connection:
         result = Executor(connection, ()).observe().compact(include_labels=args.include_labels)
     result["cleanup"] = "warning" if connection.cleanup_failed else "completed"
     print(json.dumps(result, ensure_ascii=True))

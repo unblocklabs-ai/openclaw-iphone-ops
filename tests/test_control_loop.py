@@ -154,13 +154,110 @@ class ControlLoopTests(unittest.TestCase):
         self.assertEqual((result["dispatch"], result["verification"], result["input_pending"]),
                          ("acknowledged", "unsatisfied", True))
         self.assertEqual(result["readback"]["observed_characters"], 3)
-        self.assertEqual(sum(path.endswith("/attribute/value") for _, path, _ in p.calls), 1)
+        self.assertEqual(sum(path.endswith("/attribute/value") for _, path, _ in p.calls), 2)
         self.assertEqual(p.actor.act({"op": "act", "action": "tap", "instruction": "Next"})["dispatch"], "not_sent")
         p.value = "121212"
         p.calls.clear()
         self.assertEqual(p.actor.reconcile()["verification"], "satisfied")
         self.assertIsNone(p.actor.pending_input)
         self.assertEqual(sum(path.endswith("/value") and method == "POST" for method, path, _ in p.calls), 0)
+
+    def test_stale_empty_tree_native_exact_proof_is_reused_by_done(self):
+        p = TransportProbe()
+        p.warm()
+        original_xml = p.xml
+        p.xml = lambda: original_xml().replace(f'value="{p.value}"', 'value=""') if p.value else original_xml()
+        with patch("openclaw_iphone.adaptive.read_input", return_value="121212"):
+            result = p.actor.act({"op": "act", "action": "input", "instruction": "Input", "text_ref": "text"})
+        self.assertEqual((result["dispatch"], result["verification"], result["input_pending"]),
+                         ("acknowledged", "satisfied", False))
+        self.assertEqual(result["readback"]["observed_characters"], 6)
+        self.assertEqual(sum(path.endswith("/attribute/value") for _, path, _ in p.calls), 2)
+        self.assertEqual(sum(path.endswith("/value") and method == "POST" for method, path, _ in p.calls), 1)
+        view = p.actor.view(result["observation"])
+        self.assertEqual(next(row["input_state"] for row in view["elements"] if row["role"] == FIELD.role), "nonempty")
+        spec = TaskSpec("Synthetic exact field", (), (Condition("value", APP, FIELD, "121212"),))
+        p.calls.clear()
+        self.assertEqual(PlannerSession(p.ex, spec).request({"op": "done"})["status"], "completed")
+        self.assertEqual(p.calls, [])
+
+    def test_native_mismatch_recheck_rejects_post_xml_app_or_pid_switch(self):
+        for switch_at in ("lookup", "value", "pid"):
+            with self.subTest(switch_at=switch_at):
+                p = TransportProbe()
+                p.warm()
+                original_xml = p.xml
+                p.xml = lambda: original_xml().replace(f'value="{p.value}"', 'value=""') if p.value else original_xml()
+                def switched(path, **kwargs):
+                    response = p.send(path, **kwargs)
+                    if p.value and ((switch_at in {"lookup", "pid"} and path.endswith("/elements"))
+                                    or switch_at == "value" and path.endswith("/attribute/value")):
+                        if switch_at == "pid":
+                            p.pid = 2
+                        else:
+                            p.app, p.pid = "unapproved.app", 2
+                    return response
+                p.wda._send = switched
+                with patch("openclaw_iphone.adaptive.read_input", return_value="121212"):
+                    result = p.actor.act({"op": "act", "action": "input", "instruction": "Input", "text_ref": "text"})
+                self.assertEqual((result["dispatch"], result["verification"], result["input_pending"]),
+                                 ("acknowledged", "unknown", True))
+                self.assertEqual(result["observation"].app, APP)
+                self.assertIsNone(p.actor.pending_target)
+                self.assertNotIn(Condition("value", APP, FIELD, "121212"), p.ex._values)
+                spec = TaskSpec("Synthetic exact field", (), (Condition("value", APP, FIELD, "121212"),))
+                self.assertEqual(PlannerSession(p.ex, spec).request({"op": "done"})["status"], "incomplete")
+                self.assertEqual(p.actor.act({"op": "act", "action": "tap", "instruction": "Next"})["dispatch"], "not_sent")
+                self.assertEqual(sum(path.endswith("/value") and method == "POST" for method, path, _ in p.calls), 1)
+
+    def test_cross_app_tree_match_cannot_promote_native_input_proof(self):
+        p = TransportProbe()
+        p.warm()
+        def changed_app(path, **kwargs):
+            result = p.send(path, **kwargs)
+            if path.endswith("/value") and kwargs["method"] == "POST":
+                p.app, p.pid = "other.app", 2
+            return result
+        p.wda._send = changed_app
+        with patch("openclaw_iphone.adaptive.read_input", return_value="121212"):
+            result = p.actor.act({"op": "act", "action": "input", "instruction": "Input", "text_ref": "text"})
+        self.assertEqual((result["verification"], result["input_pending"]), ("unsatisfied", True))
+        self.assertIsNone(p.actor.pending_target)
+        self.assertEqual(sum(path.endswith("/attribute/value") for _, path, _ in p.calls), 1)
+        self.assertEqual(sum(path.endswith("/value") and method == "POST" for method, path, _ in p.calls), 1)
+
+    def test_missing_post_input_field_does_not_trigger_native_recheck(self):
+        p = TransportProbe()
+        p.warm()
+        original_xml = p.xml
+        p.xml = lambda: original_xml().replace("XCUIElementTypeTextField", "XCUIElementTypeOther") if p.value else original_xml()
+        with patch("openclaw_iphone.adaptive.read_input", return_value="121212"):
+            result = p.actor.act({"op": "act", "action": "input", "instruction": "Input", "text_ref": "text"})
+        self.assertEqual((result["verification"], result["input_pending"]), ("unsatisfied", True))
+        self.assertIsNone(p.actor.pending_target)
+        self.assertEqual(sum(path.endswith("/attribute/value") for _, path, _ in p.calls), 1)
+        self.assertEqual(sum(path.endswith("/value") and method == "POST" for method, path, _ in p.calls), 1)
+
+    def test_unknown_native_mismatch_read_requires_reconciliation(self):
+        p = TransportProbe()
+        p.warm()
+        original_xml = p.xml
+        p.xml = lambda: original_xml().replace(f'value="{p.value}"', 'value=""') if p.value else original_xml()
+        def unreadable(path, **kwargs):
+            result = p.send(path, **kwargs)
+            if path.endswith("/attribute/value") and p.value:
+                raise WDAUnavailable("synthetic read failure")
+            return result
+        p.wda._send = unreadable
+        with patch("openclaw_iphone.adaptive.read_input", return_value="121212"):
+            result = p.actor.act({"op": "act", "action": "input", "instruction": "Input", "text_ref": "text"})
+        self.assertEqual((result["verification"], result["input_pending"]), ("unknown", True))
+        self.assertIsNone(p.actor.pending_target)
+        self.assertEqual(p.actor.act({"op": "act", "action": "input", "instruction": "Input",
+                                      "text_ref": "text", "mode": "replace"})["dispatch"], "not_sent")
+        self.assertEqual(sum(path.endswith("/value") and method == "POST" for method, path, _ in p.calls), 1)
+        p.wda._send = p.send
+        self.assertEqual(p.actor.reconcile()["verification"], "satisfied")
 
     def test_duplicate_post_input_target_does_not_verify_via_old_reference(self):
         p = TransportProbe()
@@ -302,15 +399,17 @@ class ControlLoopTests(unittest.TestCase):
         self.assertEqual(sum(path == "/wda/locked" for _, path, _ in p.calls), 2)
 
     def test_locked_device_remains_readable_but_cannot_receive_input(self):
-        p = TransportProbe()
-        def send(path, **kwargs):
-            response = p.send(path, **kwargs)
-            return b'{"value":true}' if path == "/wda/locked" else response
-        p.wda._send = send
-        p.warm()
-        result = p.actor.act({"op": "act", "action": "tap", "instruction": "Next"})
-        self.assertEqual((result["dispatch"], result["error_type"]), ("not_sent", "DeviceLocked"))
-        self.assertFalse(any(path.endswith("/click") for _, path, _ in p.calls))
+        for lock_response in (b'{"value":true}', b'{"value":null}'):
+            with self.subTest(lock_response=lock_response):
+                p = TransportProbe()
+                def send(path, **kwargs):
+                    response = p.send(path, **kwargs)
+                    return lock_response if path == "/wda/locked" else response
+                p.wda._send = send
+                p.warm()
+                result = p.actor.act({"op": "act", "action": "tap", "instruction": "Next"})
+                self.assertEqual((result["dispatch"], result["error_type"]), ("not_sent", "DeviceLocked"))
+                self.assertFalse(any(path.endswith("/click") for _, path, _ in p.calls))
 
     def test_native_target_is_resolved_again_after_same_app_restart(self):
         p = TransportProbe()
@@ -422,6 +521,29 @@ class ControlLoopTests(unittest.TestCase):
             self.assertFalse(any(path.startswith("/source?") for _, path, _ in p.calls))
             with self.assertRaises(ObservationRejected):
                 p.actor.vision_tap({"op": "vision_tap", "snapshot_id": shot["snapshot_id"], "x": 2, "y": 4})
+
+    def test_failed_source_recover_then_masked_vision_tap_without_more_xml(self):
+        p = TransportProbe()
+        spec = TaskSpec("Visual fallback", (), (Condition("app", APP),), adaptive=p.actor.scope)
+        p.screen_error = True
+        with tempfile.TemporaryDirectory() as directory:
+            session = PlannerSession(p.ex, spec, evidence_base=directory)
+            with self.assertRaises(WDAUnavailable):
+                session.request({"op": "observe"})
+            self.assertFalse(p.ex.connection.valid)
+            def reacquire():
+                p.ex.connection.valid = True
+                p.ex.connection.generation += 1
+            p.ex.connection.recover_read = Mock(side_effect=reacquire)
+            recovered = session.request({"op": "recover_read"})
+            self.assertEqual(recovered["status"], "recovered")
+            self.assertEqual(recovered["observation"]["app"], APP)
+            shot = session.request({"op": "screenshot", "redact": [[0, 0, 400, 100]]})
+            result = session.request({"op": "vision_tap", "snapshot_id": shot["snapshot_id"], "x": 2, "y": 4})
+            self.assertEqual((result["dispatch"], result["verification"]), ("acknowledged", "unknown"))
+            p.ex.connection.recover_read.assert_called_once_with()
+            self.assertEqual(sum(path.startswith("/source?") for _, path, _ in p.calls), 1)
+            self.assertEqual(sum(path.endswith("/actions") for _, path, _ in p.calls), 1)
 
     def test_visual_fallback_requires_explicit_masks_without_ax_and_rejects_identity_change(self):
         p = TransportProbe()
