@@ -15,6 +15,14 @@ from .errors import OpenClawIPhoneError
 class ObservationRejected(OpenClawIPhoneError):
     """Observation is incomplete, ambiguous, or no longer valid for an action."""
 
+    CODES = frozenset({"observation_rejected", "snapshot_expired", "snapshot_superseded",
+                       "foreground_changed", "geometry_changed", "evidence_unavailable"})
+
+    def __init__(self, message: str, *, code: str = "observation_rejected") -> None:
+        super().__init__(message)
+        # Public diagnostics never derive from private exception messages.
+        self.code = code if code in self.CODES else "observation_rejected"
+
 
 def keypad_points(observation: Observation, digits: str) -> list[tuple[float, float]]:
     """Resolve the entire input against one current native keyboard layout."""
@@ -171,7 +179,8 @@ class Observation:
 
     def matches(self, selector: Selector) -> tuple[Element, ...]:
         if self.elements is None:
-            raise ObservationRejected("App-only observation has no accessibility evidence; observe the full screen first.")
+            raise ObservationRejected("App-only observation has no accessibility evidence; observe the full screen first.",
+                                      code="evidence_unavailable")
         return tuple(e for e in self.elements if e.visible is True and e.matches(selector))
 
     def unique(self, selector: Selector) -> Element | None:

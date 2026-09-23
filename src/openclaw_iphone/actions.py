@@ -155,22 +155,30 @@ class Executor:
         self._check_snapshot(observation)
         return observation
 
-    def observe(self, *, app_only: bool = False, invalidate_on_error: bool = True) -> Observation:
+    def observe(self, *, app_only: bool = False, invalidate_on_error: bool = True,
+                optional_source: bool = False) -> Observation:
         """Read a full screen by default; app-only evidence cannot authorize input."""
         wda = self.connection.require_active()
         self.discard()
         started = time.monotonic()
         stamp = datetime.now(timezone.utc).isoformat()
         try:
-            source = None if app_only else wda.source(compact=True)
+            source = None
+            if not app_only:
+                try:
+                    source = wda.source(compact=True)
+                except WDAUnavailable:
+                    # Only optional next-screen AX may degrade to app identity.
+                    # Required observations and independent proofs stay strict.
+                    if not optional_source:
+                        raise
             after = wda.active_app()
+            if type(after.get("pid")) is not int or after["pid"] <= 0:
+                raise ObservationRejected("Foreground process identity is unavailable.")
         except OpenClawIPhoneError:
             if invalidate_on_error:
                 self.connection.invalidate()
             raise
-        if type(after.get("pid")) is not int or after["pid"] <= 0:
-            self._offers.clear()
-            raise ObservationRejected("Foreground process identity is unavailable.")
         if source is None:
             self.latest = Observation(uuid.uuid4().hex, self.connection.generation,
                 self.connection.device.udid, after["bundleId"], stamp, started,
@@ -422,17 +430,25 @@ class Executor:
         return self._offer_blockers
 
     def _check_snapshot(self, observation: Observation) -> None:
-        if self.latest is not observation:
-            raise ObservationRejected("Snapshot was superseded; reobserve and choose again.")
+        self._check_snapshot_identity(observation)
         self._check_binding(observation)
+
+    def _check_snapshot_identity(self, observation: Observation) -> None:
+        if self.latest is not observation:
+            raise ObservationRejected("Snapshot was superseded; reobserve and choose again.", code="snapshot_superseded")
+        self._check_identity(observation)
 
     def _check_binding(self, observation: Observation) -> None:
         """Local only: still enforced after slow validation/clear reads."""
+        self._check_identity(observation)
+        if time.monotonic() - observation.started > self.freshness:
+            raise ObservationRejected("Snapshot expired; reobserve and choose again.", code="snapshot_expired")
+
+    def _check_identity(self, observation: Observation) -> None:
         self.connection.require_active()
         if (observation.generation != self.connection.generation
-                or observation.device_udid != self.connection.device.udid
-                or time.monotonic() - observation.started > self.freshness):
-            raise ObservationRejected("Snapshot is stale or foreign; reobserve and choose again.")
+                or observation.device_udid != self.connection.device.udid):
+            raise ObservationRejected("Snapshot belongs to another device or connection.", code="evidence_unavailable")
 
     def _guard_app(self, app: str, process_id: int | None = None) -> None:
         wda = self.connection.require_active()
@@ -444,7 +460,7 @@ class Executor:
             active = wda.active_app()
             matches = active["bundleId"] == app and active.get("pid") == process_id
         if not matches:
-            raise ObservationRejected("Foreground app changed before dispatch.")
+            raise ObservationRejected("Foreground app changed before dispatch.", code="foreground_changed")
 
     def _reference(self, element: Element, *, hittable: bool = True) -> str:
         refs = self._find(element)
@@ -596,7 +612,9 @@ class Executor:
         except ObservationRejected as exc:
             if not acknowledged and not dispatching:
                 self.discard()
-                return StepResult("not_sent", "unknown", "validation_failed", error_type=type(exc).__name__)
+                return StepResult("not_sent", "unknown",
+                                  exc.code if exc.code != "observation_rejected" else "validation_failed",
+                                  error_type=type(exc).__name__)
             self.stopped = True
             return StepResult("acknowledged" if acknowledged else "not_sent", "unknown",
                               "verification_unavailable" if acknowledged else "validation_failed",

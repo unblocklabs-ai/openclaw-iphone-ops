@@ -425,7 +425,8 @@ def build_parser() -> argparse.ArgumentParser:
     task_run.set_defaults(handler=handle_task_run)
     task_session = task_subcommands.add_parser("session", help="Keep one bounded task/session open for a planner over stdin/stdout JSON lines.")
     add_device_arg(task_session)
-    task_session.add_argument("--file", type=Path, required=True, help="Trusted grants/text/success conditions; same schema as task run.")
+    task_session.add_argument("--file", type=Path, required=True, help="Trusted task file; --explore accepts adaptive scope without grants/success.")
+    task_session.add_argument("--explore", action="store_true", help="Use bounded caller-directed adaptive control without fixed grants or task success conditions.")
     task_session.add_argument("--include-labels", action="store_true", help="Opt into local private UI labels, not cloud disclosure.")
     task_session.add_argument("--driver", choices=("deterministic", "jev"), default="deterministic")
     task_session.add_argument("--allow-cloud", action="store_true", help="Approve adaptive instructions and explicit cloud_labels to TypeSafe.")
@@ -497,7 +498,9 @@ def handle_task_session(args: argparse.Namespace) -> int:
     emit = json_line_emitter(sys.stdout, Budget.seconds(5))
     driver = None
     try:
-        spec = load_task(args.file)
+        spec = load_task(args.file, explore=args.explore)
+        if args.explore and args.driver == "jev":
+            raise ValueError("Exploration does not use a model driver.")
         if args.driver == "jev" and (not args.allow_cloud or spec.adaptive is None):
             raise ValueError("Adaptive task and cloud approval are required for session Jev.")
         driver = JevDriver(timeout=args.timeout, min_confidence=args.min_confidence) if args.driver == "jev" else None

@@ -31,7 +31,7 @@ class PlannerSession:
                                         max_decisions=spec.limits.max_decisions, evidence_base=evidence_base)
 
     def view(self, observation: Observation) -> dict[str, object]:
-        offers = self.executor.offers(observation)
+        offers = self.executor.offers(observation) if self.spec.grants else ()
         view = (self.adaptive.view(observation, labels=self.include_labels) if self.adaptive
                 else observation.compact(include_labels=self.include_labels))
         view["actions"] = [{"id": o.id, "snapshot_id": o.snapshot_id, "target_id": o.target_id,
@@ -63,7 +63,12 @@ class PlannerSession:
             if data["op"] == "act":
                 result = self.adaptive.act(data)
             elif data["op"] == "vision_tap":
-                result = self.adaptive.vision_tap(data)
+                try:
+                    result = self.adaptive.vision_tap(data)
+                except ObservationRejected as exc:
+                    # This operation raises observation rejection only before
+                    # its single tap; shared guards elsewhere may follow writes.
+                    result = {"status": "blocked", "dispatch": "not_sent", "reason": exc.code}
             elif data["op"] == "screenshot":
                 object_fields(data, {"op", "redact"}, {"op"})
                 result = self.adaptive.screenshot(redact=data.get("redact"))
@@ -92,6 +97,12 @@ class PlannerSession:
             state, observation = self.executor.wait(self.executor.pending or (), once=True)
             return {"status": "observed", "verification": state, "observation": self.view(observation)}
         if operation in {"wait", "done"}:
+            if not self.spec.success:
+                if operation == "done":
+                    self.closed = True
+                    return {"status": "closed", "verification": "unknown", "reason": "caller_finished"}
+                return {"status": "blocked", "verification": "unknown",
+                        "reason": "success_conditions_unconfigured"}
             if operation == "wait":
                 state, observation = self.executor.wait(self.spec.success)
             else:
@@ -164,24 +175,43 @@ def read_requests(fd: int, budget: Budget) -> Iterator[bytes]:
 
 def serve(session: PlannerSession, requests: Iterator[bytes], emit: Callable[[dict[str, object]], None]) -> int:
     """Emit safe errors only; never echo requests, UI values or exception bodies."""
+    sequence = 0
     for line in requests:
+        sequence += 1
+        started = time.monotonic()
+        events = session.executor.connection.metrics.events
+        event_start = len(events)
+        invalid = False
+        stopped = False
         try:
             result = session.request(strict_json(line))
         except TaskStopped:
-            raise
+            result = {"status": "blocked", "reason": "deadline_or_limit"}
+            stopped = True
         except (ValueError, TypeError, UnicodeError, RecursionError):
             # Malformed input ends ownership; no ambiguous framing/retry loop.
-            emit({"status": "blocked", "reason": "invalid_request"})
-            return 1
-        except ObservationRejected:
-            result = {"status": "blocked", "reason": "observation_rejected"}
+            result = {"status": "blocked", "reason": "invalid_request"}
+            invalid = True
+        except ObservationRejected as exc:
+            result = {"status": "blocked", "reason": exc.code}
         except VerificationExpired:
             result = {"status": "incomplete", "verification": "unknown", "reason": "verification_expired"}
         except OSError:
             result = {"status": "blocked", "reason": "local_input_or_evidence_unavailable"}
         except OpenClawIPhoneError:
             result = {"status": "blocked", "reason": "read_or_recovery_unavailable"}
+        finished = time.monotonic()
+        result["request_sequence"] = sequence
+        result["timing"] = {
+            "handling_started_monotonic": started,
+            "handling_finished_monotonic": finished,
+            "handling_seconds": round(finished - started, 6),
+            "transport_event_start": event_start,
+            "transport_event_end": len(events),
+        }
         emit(result)
+        if invalid or stopped:
+            return 1
         if session.closed:
             return 0 if result["status"] == "completed" else 1
     emit({"status": "closed", "reason": "input_ended", "verification": "unknown"})
@@ -200,7 +230,8 @@ class JsonLineEmitter:
         if oversized:
             # Do not hide a completed/partial mutation behind a generic error.
             summary = {key: value[key] for key in ("status", "dispatch", "verification", "reason",
-                       "acknowledged_substeps", "input_stopped", "cleanup") if key in value}
+                       "acknowledged_substeps", "input_stopped", "cleanup", "request_sequence", "timing")
+                       if key in value}
             summary["output_warning"] = "response_too_large_session_closed"
             raw = (json.dumps(summary, separators=(",", ":")) + "\n").encode()
         try:
