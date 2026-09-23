@@ -14,7 +14,7 @@ from openclaw_iphone.actions import Condition, Executor, Grant
 from openclaw_iphone.adaptive import AdaptiveAct, parse_scope
 from openclaw_iphone.connection import TaskConnection
 from openclaw_iphone.errors import WDAOutcomeUnknown, WDAUnavailable
-from openclaw_iphone.execution import TaskStopped
+from openclaw_iphone.execution import Metrics, TaskStopped
 from openclaw_iphone.observations import ObservationRejected
 from openclaw_iphone.planner import PlannerSession, serve
 from openclaw_iphone.tasks import TaskSpec, run_task
@@ -513,11 +513,11 @@ class ControlLoopTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             p.actor.evidence_base = directory
             shot = p.actor.screenshot(redact=[])
-            self.assertEqual(len(p.calls), 3)
+            self.assertEqual(len(p.calls), 5)  # Identity before and after capture; still no XML.
             self.assertEqual(Path(shot["path"]).stat().st_mode & 0o777, 0o600)
             result = p.actor.vision_tap({"op": "vision_tap", "snapshot_id": shot["snapshot_id"], "x": 2, "y": 4})
             self.assertEqual(result["dispatch"], "acknowledged")
-            self.assertEqual(len(p.calls), 7)
+            self.assertEqual(len(p.calls), 9)
             self.assertFalse(any(path.startswith("/source?") for _, path, _ in p.calls))
             with self.assertRaises(ObservationRejected):
                 p.actor.vision_tap({"op": "vision_tap", "snapshot_id": shot["snapshot_id"], "x": 2, "y": 4})
@@ -547,10 +547,12 @@ class ControlLoopTests(unittest.TestCase):
 
     def test_visual_fallback_requires_explicit_masks_without_ax_and_rejects_identity_change(self):
         p = TransportProbe()
+        p.screen_error = True
         with tempfile.TemporaryDirectory() as directory:
             p.actor.evidence_base = directory
-            with self.assertRaises(ObservationRejected): p.actor.screenshot()
+            with self.assertRaises(WDAUnavailable): p.actor.screenshot()
             self.assertEqual(list(Path(directory).iterdir()), [])
+            p.ex.connection.valid = True
             shot = p.actor.screenshot(redact=[[0, 0, 400, 100]])
             p.pid = 2
             with self.assertRaises(ObservationRejected):
@@ -590,7 +592,8 @@ class ControlLoopTests(unittest.TestCase):
             p.actor.evidence_base = directory
             first, second = p.actor.screenshot(), p.actor.screenshot()
             self.assertNotEqual(first["snapshot_id"], second["snapshot_id"])
-            self.assertEqual(len(p.calls), 6)  # Each warm capture uses three reads, no XML.
+            self.assertEqual(sum(path.startswith("/source?") for _, path, _ in p.calls), 2)
+            self.assertEqual(len(p.calls), 12)  # Fresh AX masks and two exact identity guards per capture.
             with self.assertRaises(ObservationRejected):
                 p.actor.vision_tap({"op": "vision_tap", "snapshot_id": first["snapshot_id"], "x": 1, "y": 1})
             self.assertFalse(any(path.endswith("/actions") for _, path, _ in p.calls))
@@ -598,6 +601,7 @@ class ControlLoopTests(unittest.TestCase):
     def test_planner_recovery_avoids_ax_and_timeout_is_not_reported_as_outage(self):
         from openclaw_iphone.errors import VerificationExpired
         ex, wda = executor(())
+        ex.connection.metrics = Metrics()
         spec = TaskSpec("Read", (), (Condition("app", APP),))
         session = PlannerSession(ex, spec)
         wda.source.side_effect = WDAUnavailable("broken AX")
@@ -607,7 +611,10 @@ class ControlLoopTests(unittest.TestCase):
         ex.wait = Mock(side_effect=VerificationExpired("private"))
         replies = []
         serve(session, iter([b'{"op":"wait"}']), replies.append)
-        self.assertEqual(replies[0], {"status": "incomplete", "verification": "unknown", "reason": "verification_expired"})
+        self.assertEqual({key: replies[0][key] for key in ("status", "verification", "reason", "request_sequence")},
+                         {"status": "incomplete", "verification": "unknown",
+                          "reason": "verification_expired", "request_sequence": 1})
+        self.assertIn("handling_seconds", replies[0]["timing"])
 
     def test_read_timeout_covers_identity_and_post_queries_without_unknown_write(self):
         p = TransportProbe()

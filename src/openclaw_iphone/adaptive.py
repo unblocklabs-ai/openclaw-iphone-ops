@@ -31,6 +31,7 @@ class VisualEvidence:
     observation: Observation
     device_size: tuple[float, float]
     image_size: tuple[int, int]
+    started: float = field(default_factory=time.monotonic)
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
 
@@ -129,7 +130,7 @@ class AdaptiveAct:
     def _current(self, *, full: bool = True) -> Observation:
         observation = self.ex.current(full=full)
         if observation.app not in self.scope["apps"] or (full and observation.elements is None):
-            raise ObservationRejected("Adaptive action is outside the observed app scope.")
+            raise ObservationRejected("Adaptive action is outside the observed app scope.", code="foreground_changed")
         return observation
 
     def _target(self, data: dict, observation: Observation):
@@ -139,7 +140,7 @@ class AdaptiveAct:
         candidates = [e for e in observation.elements if e.actionable and e.role in roles]
         if "target_id" in data:
             if data.get("snapshot_id") != observation.id:
-                raise ObservationRejected("Target ID belongs to a different snapshot.")
+                raise ObservationRejected("Target ID belongs to a different snapshot.", code="snapshot_superseded")
             exact = [e for e in candidates if e.id == data["target_id"]]
         elif "target" in data:
             target = selector(data["target"])
@@ -232,7 +233,8 @@ class AdaptiveAct:
         try:
             original = current = self._current(full=action != "relaunch")
             if action == "relaunch" and "snapshot_id" in data and data["snapshot_id"] != original.id:
-                raise ObservationRejected("Relaunch snapshot was superseded; reobserve and choose again.")
+                raise ObservationRejected("Relaunch snapshot was superseded; reobserve and choose again.",
+                                          code="snapshot_superseded")
             target = None
             if action != "relaunch":
                 target, resolution, decision = self._target(data, original)
@@ -349,12 +351,13 @@ class AdaptiveAct:
             elif after:
                 state, current = self.ex.wait(after)
             else:
-                current = self.ex.observe(app_only=action == "relaunch")
+                current = self.ex.observe(app_only=action == "relaunch", optional_source=action == "tap")
                 state = "unknown"
             if action in {"input", "keypad"} and state == "satisfied":
                 self.pending_input = None
                 self.pending_target = None
-            reason = ("no_progress" if action == "scroll" and state == "unsatisfied" and not changed
+            reason = ("accessibility_unavailable" if action == "tap" and not after and current.elements is None
+                      else "no_progress" if action == "scroll" and state == "unsatisfied" and not changed
                       else "verified" if state == "satisfied" else "inspect_result")
             result = {"status": "step", "dispatch": "acknowledged", "verification": state, "reason": reason}
             if state != "satisfied":
@@ -387,6 +390,10 @@ class AdaptiveAct:
             result = {"status": "fallback", "dispatch": "acknowledged" if acknowledged else "not_sent",
                       "verification": "unknown", "reason": "verification_unavailable" if acknowledged else "validation_failed",
                       "error_type": type(exc).__name__, "validation_stage": self.validation_stage}
+            if isinstance(exc, ObservationRejected) and exc.code != "observation_rejected":
+                result["rejection_code"] = exc.code
+                if not acknowledged:
+                    result["reason"] = exc.code
             current = None
         if action == "relaunch" and acknowledged == 1 and result["dispatch"] == "acknowledged":
             self.ex.stopped = True
@@ -409,13 +416,12 @@ class AdaptiveAct:
     def screenshot(self, *, redact: object = None) -> dict:
         from .image_evidence import redact_png
         self.visual = None
-        previous = self.ex.latest
-        observation = self.ex.current(full=False)
+        # Automatic rectangles are derived only from a newly captured tree.
+        # Explicit reviewed rectangles need app identity, not AX authority.
+        observation = self.ex.observe() if redact is None else self.ex.current(full=False)
         if observation.app not in self.scope["apps"]:
-            raise ObservationRejected("Screenshot is outside the authorized app scope.")
+            raise ObservationRejected("Screenshot is outside the authorized app scope.", code="foreground_changed")
         if redact is None:
-            if observation.elements is None:
-                raise ObservationRejected("Screenshot-only capture requires explicit redaction rectangles, or [] for a caller-confirmed non-sensitive screen.")
             bounds = [e.bounds for e in observation.elements if e.bounds and
                       (e.role in EDITABLE | {SECURE} or any(secret in (e.name or "") or secret in (e.label or "")
                                               for secret in self.secrets))]
@@ -427,17 +433,26 @@ class AdaptiveAct:
                 raise ValueError("Redaction requires bounded [x,y,width,height] rectangles in device points.")
             bounds = redact
         wda = self.ex.connection.require_active()
+        self.ex._check_snapshot_identity(observation)
+        self.ex._guard_app(observation.app, observation.process_id)
         size = wda.window_size()
+        if redact is None:
+            self.ex._check_binding(observation)
+        started = time.monotonic()
         raw = wda.screenshot()
-        if observation is previous:
-            self.ex._guard_app(observation.app, observation.process_id)
         raw, pixels = redact_png(raw, size, bounds)
-        self.ex._check_snapshot(observation)
+        self.ex._guard_app(observation.app, observation.process_id)
+        self.ex._check_snapshot_identity(observation)
+        if redact is None:
+            self.ex._check_binding(observation)
         path = artifact_path("adaptive-screen", suffix=".png", base=self.evidence_base)
         write_private(path, raw)
-        self.visual = VisualEvidence(observation, size, pixels)
-        return {"status": "screenshot", "path": str(path), "snapshot_id": self.visual.id,
-                "image_size": pixels, "device_size": size, "redacted_regions": len(bounds)}
+        self.visual = VisualEvidence(observation, size, pixels, started)
+        result = {"status": "screenshot", "path": str(path), "snapshot_id": self.visual.id,
+                  "image_size": pixels, "device_size": size, "redacted_regions": len(bounds)}
+        if redact is None:
+            result["observation"] = observation
+        return result
 
     def vision_tap(self, request: object) -> dict:
         from .tasks import object_fields
@@ -447,16 +462,22 @@ class AdaptiveAct:
             raise ObservationRejected("Vision input is not authorized/available.")
         visual, self.visual = self.visual, None
         if visual is None or data["snapshot_id"] != visual.id:
-            raise ObservationRejected("No matching unconsumed screenshot.")
+            raise ObservationRejected("No matching unconsumed screenshot.",
+                                      code="evidence_unavailable" if visual is None else "snapshot_superseded")
         old, size, pixels = visual.observation, visual.device_size, visual.image_size
         if any(type(data[k]) not in (float, int) or not math.isfinite(data[k]) or not 0 <= data[k] < end
                for k, end in zip(("x", "y"), pixels)):
             raise ValueError("Coordinates must be inside the captured image.")
-        self.ex._check_snapshot(old)
+        self.ex._check_snapshot_identity(old)
+        if time.monotonic() - visual.started > self.ex.freshness:
+            raise ObservationRejected("Screenshot expired; capture again.", code="snapshot_expired")
         wda = self.ex.connection.require_active()
         if wda.window_size() != size:
-            raise ObservationRejected("Screen geometry changed since screenshot; capture again.")
-        self.ex._dispatch_guard(old, pixels=True)
+            raise ObservationRejected("Screen geometry changed since screenshot; capture again.", code="geometry_changed")
+        self.ex._guard_app(old.app, old.process_id)
+        self.ex._check_snapshot_identity(old)
+        if time.monotonic() - visual.started > self.ex.freshness:
+            raise ObservationRejected("Screenshot expired; capture again.", code="snapshot_expired")
         self.ex.discard()
         try:
             wda.tap(data["x"] * size[0] / pixels[0], data["y"] * size[1] / pixels[1])

@@ -66,12 +66,15 @@ def conditions(value: object) -> tuple[Condition, ...]:
     return tuple(result)
 
 
-def parse_task(data: object) -> TaskSpec:
+def parse_task(data: object, *, explore: bool = False) -> TaskSpec:
     data = object_fields(data, {"version", "objective", "grants", "success", "texts", "limits", "adaptive"},
+                         {"version", "objective", "adaptive"} if explore else
                          {"version", "objective", "grants", "success"})
     if type(data["version"]) is not int or data["version"] != 1:
         raise ValueError("Only task schema version 1 is supported.")
-    raw_grants = data["grants"]
+    if explore and (data.get("grants") or data.get("success") or data.get("texts")):
+        raise ValueError("Exploration uses adaptive scope, not fixed grants, success conditions or inline texts.")
+    raw_grants = data.get("grants", [])
     if not isinstance(raw_grants, list) or len(raw_grants) > 252:
         raise ValueError("Task grants must be a list with at most 252 entries.")
     grants = []
@@ -86,8 +89,8 @@ def parse_task(data: object) -> TaskSpec:
             destination=text(grant["destination"], maximum=2048) if "destination" in grant else None,
             after=conditions(grant.get("after", [])), before=conditions(grant.get("before", [])),
             max_uses=grant.get("max_uses", 1)))
-    success = conditions(data["success"])
-    if not success:
+    success = conditions(data.get("success", []))
+    if not success and not explore:
         raise ValueError("At least one independently observable success condition is required.")
     supplied = data.get("texts", {})
     if not isinstance(supplied, dict) or len(supplied) > 32:
@@ -111,7 +114,7 @@ def parse_task(data: object) -> TaskSpec:
     return TaskSpec(text(data["objective"], maximum=1024), tuple(grants), success, texts, Limits(**limits), adaptive)
 
 
-def load_task(path: Path) -> TaskSpec:
+def load_task(path: Path, *, explore: bool = False) -> TaskSpec:
     with path.open("rb") as stream:
         raw = stream.read(262_145)
     if len(raw) > 262_144:
@@ -120,7 +123,7 @@ def load_task(path: Path) -> TaskSpec:
         data = strict_json(raw)
     except (ValueError, UnicodeError, RecursionError):
         raise ValueError("Task file is not valid bounded JSON.") from None
-    return parse_task(data)
+    return parse_task(data, explore=explore)
 
 
 def cloud_view(spec: TaskSpec, observation: Observation, offers: tuple[Offer, ...],

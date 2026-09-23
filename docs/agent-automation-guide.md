@@ -9,6 +9,10 @@ to choose steps. Do not rebuild DeviceCtl/WDA for every action. `ui observe`
 replaces ad hoc observation formatting; raw source/screenshots are explicit
 local diagnostic fallbacks. See [task-runtime.md](task-runtime.md) for verified
 replace/keypad input, predicates and the distinction from raw `ui type`.
+For a planner session, keep its process handle and read each complete JSON
+response line promptly after sending one request; do not wait for the process
+to exit. Its per-request sequence/timing and final transport events can separate
+server/WDA time from caller wait when the caller also records send/receive times.
 
 ## Design Rule
 

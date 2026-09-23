@@ -306,7 +306,7 @@ class AdaptiveTests(unittest.TestCase):
         result = actor.act({"op": "act", "action": "tap", "instruction": "Next"})
         self.assertEqual((result["dispatch"], result["reason"], result["validation_stage"],
                           result["acknowledged_substeps"]),
-                         ("acknowledged", "verification_unavailable", "post_action_verification", 1))
+                         ("acknowledged", "accessibility_unavailable", "post_action_verification", 1))
         wda.element_action.assert_called_once_with("ref", "click")
 
     def test_acknowledged_tap_predicate_failure_reports_verification_stage(self):
@@ -544,6 +544,23 @@ class AdaptiveTests(unittest.TestCase):
         wda.element_action.assert_not_called()
         self.assertEqual(wda.find_elements.call_count, 3)  # Container, keypad geometry, destination.
 
+    def test_fresh_pixels_do_not_renew_custom_keypad_ax_proof(self):
+        from openclaw_iphone.adaptive import VisualEvidence
+        extra = '<XCUIElementTypeOther name="code" visible="true" enabled="true" x="1" y="120" width="200" height="40"/>'
+        actor, wda = make(extra=extra, inputs={"code": "/unused"})
+        clock = [0.0]
+        with patch("time.monotonic", side_effect=lambda: clock[0]):
+            observation = actor.ex.observe()
+            clock[0] = 31.0
+            actor.visual = VisualEvidence(observation, (400, 800), (800, 1600))
+            with patch("openclaw_iphone.adaptive.read_input", return_value="1"):
+                result = actor.act({"op": "act", "action": "keypad", "instruction": "code", "text_ref": "code",
+                    "empty_focus_confirmed": actor.visual.id,
+                    "after": [{"kind": "exists", "app": APP,
+                               "target": {"role": "XCUIElementTypeButton", "label": "Finished"}}]})
+        self.assertEqual(result["dispatch"], "not_sent")
+        wda.tap_sequence.assert_not_called()
+
     def test_secure_input_never_uses_value_readback_for_completion(self):
         extra = '<XCUIElementTypeSecureTextField name="password" visible="true" enabled="true" x="1" y="120" width="200" height="40"/>'
         actor, wda = make(extra=extra, inputs={"password": "/unused"})
@@ -566,6 +583,94 @@ class AdaptiveTests(unittest.TestCase):
             wda.tap.assert_called_once_with(100, 200)
             with self.assertRaises(ObservationRejected):
                 actor.vision_tap({"op": "vision_tap", "snapshot_id": shot["snapshot_id"], "x": 2, "y": 4})
+
+    def test_auto_screenshot_exposes_refreshed_ax_target_for_next_act(self):
+        actor, wda = make()
+        wda.window_size.return_value = (400, 800)
+        wda.screenshot.return_value = png()
+        spec = TaskSpec("inspect", (), (), adaptive=actor.scope)
+        with tempfile.TemporaryDirectory() as directory:
+            session = PlannerSession(actor.ex, spec, evidence_base=directory)
+            old = session.request({"op": "observe"})["observation"]
+            shot = session.request({"op": "screenshot"})
+            fresh = shot["observation"]
+            old_target = next(e["id"] for e in old["elements"] if e["role"] == "XCUIElementTypeButton")
+            fresh_target = next(e["id"] for e in fresh["elements"] if e["role"] == "XCUIElementTypeButton")
+            self.assertNotEqual(old["snapshot_id"], fresh["snapshot_id"])
+            self.assertNotEqual(shot["snapshot_id"], fresh["snapshot_id"])  # Pixel token is separate.
+            self.assertNotEqual(old_target, fresh_target)
+            stale = session.request({"op": "act", "action": "tap", "instruction": "Next",
+                                     "target_id": old_target, "snapshot_id": old["snapshot_id"]})
+            self.assertEqual(stale["dispatch"], "not_sent")
+            wda.element_action.assert_not_called()
+            result = session.request({"op": "act", "action": "tap", "instruction": "Next",
+                                      "target_id": fresh_target, "snapshot_id": fresh["snapshot_id"]})
+            self.assertEqual(result["dispatch"], "acknowledged")
+            wda.element_action.assert_called_once_with("ref", "click")
+
+    def test_screenshot_rejects_capture_time_app_or_pid_drift_before_saving(self):
+        for reused in (False, True):
+            for changed in ({"bundleId": "other.app", "pid": 1}, {"bundleId": APP, "pid": 2}):
+                actor, wda = make()
+                wda.window_size.return_value = (400, 800)
+                if reused:
+                    actor.ex.observe(app_only=True)
+                wda.active_app.side_effect = lambda: ({"bundleId": APP, "pid": 1}
+                    if not wda.screenshot.called else changed)
+                wda.screenshot.return_value = png()
+                with tempfile.TemporaryDirectory() as directory:
+                    actor.evidence_base = directory
+                    with self.assertRaises(ObservationRejected):
+                        actor.screenshot(redact=[])
+                    self.assertEqual(list(Path(directory).iterdir()), [])
+                    self.assertIsNone(actor.visual)
+
+    def test_pixel_age_is_independent_of_old_ax_and_auto_masks_refresh_ax(self):
+        actor, wda = make()
+        wda.window_size.return_value = (400, 800)
+        wda.screenshot.return_value = png()
+        clock = [0.0]
+        with patch("time.monotonic", side_effect=lambda: clock[0]):
+            old_ax = actor.ex.observe()
+            clock[0] = 29.0
+            with tempfile.TemporaryDirectory() as directory:
+                actor.evidence_base = directory
+                shot = actor.screenshot(redact=[])
+                self.assertIs(actor.visual.observation, old_ax)
+                self.assertEqual(actor.visual.started, 29.0)
+                clock[0] = 31.0
+                self.assertEqual(actor.vision_tap({"op": "vision_tap", "snapshot_id": shot["snapshot_id"],
+                                                   "x": 2, "y": 4})["dispatch"], "acknowledged")
+                wda.tap.assert_called_once()
+
+                newer = actor.screenshot(redact=[])
+                clock[0] = 62.0
+                with self.assertRaises(ObservationRejected):
+                    actor.vision_tap({"op": "vision_tap", "snapshot_id": newer["snapshot_id"], "x": 2, "y": 4})
+                wda.tap.assert_called_once()
+
+        actor, wda = make()
+        wda.window_size.return_value = (400, 800)
+        wda.screenshot.return_value = png()
+        actor.ex.observe()
+        with tempfile.TemporaryDirectory() as directory:
+            actor.evidence_base = directory
+            shot = actor.screenshot()
+            self.assertEqual(wda.source.call_count, 2)
+            self.assertEqual(shot["redacted_regions"], 1)
+
+        actor, wda = make()
+        wda.window_size.return_value = (400, 800)
+        clock = [0.0]
+        def slow_capture():
+            clock[0] = 31.0
+            return png()
+        wda.screenshot.side_effect = slow_capture
+        with tempfile.TemporaryDirectory() as directory, patch("time.monotonic", side_effect=lambda: clock[0]):
+            actor.evidence_base = directory
+            with self.assertRaises(ObservationRejected):
+                actor.screenshot()
+            self.assertEqual(list(Path(directory).iterdir()), [])
 
     def test_redaction_and_invalid_png_never_save_original(self):
         for filtering in range(5):

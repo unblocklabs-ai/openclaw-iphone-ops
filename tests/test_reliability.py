@@ -17,7 +17,7 @@ from openclaw_iphone.control_lock import control_lock
 from openclaw_iphone.devicectl import Device, DeviceCtl
 from openclaw_iphone.errors import (DeviceLocked, DeviceSelectionError, SessionOutputUnavailable,
                                     WDAOutcomeUnknown, WDAUnavailable)
-from openclaw_iphone.execution import Budget, TaskStopped
+from openclaw_iphone.execution import Budget, Metrics, TaskStopped
 from openclaw_iphone.planner import JsonLineEmitter, PlannerSession, read_requests, serve
 from openclaw_iphone.observations import ObservationRejected
 from openclaw_iphone.runner import Runner
@@ -267,6 +267,7 @@ class KeypadTests(unittest.TestCase):
 class PlannerTests(unittest.TestCase):
     def make(self, **limits):
         ex, wda = executor([tap_grant()])
+        ex.connection.metrics = Metrics()
         spec = TaskSpec("Synthetic navigation", ex.grants, (Condition("exists", APP, BUTTON),), limits=Limits(**limits))
         return PlannerSession(ex, spec), wda
 
@@ -336,7 +337,10 @@ class PlannerTests(unittest.TestCase):
             session, wda = self.make()
             replies = []
             self.assertEqual(serve(session, iter([raw]), replies.append), 1)
-            self.assertEqual(replies, [{"status": "blocked", "reason": "invalid_request"}])
+            self.assertEqual(len(replies), 1)
+            self.assertEqual({key: replies[0][key] for key in ("status", "reason", "request_sequence")},
+                             {"status": "blocked", "reason": "invalid_request", "request_sequence": 1})
+            self.assertIn("handling_seconds", replies[0]["timing"])
             wda.source.assert_not_called()
 
     def test_idle_partial_line_and_action_request_limits(self):
