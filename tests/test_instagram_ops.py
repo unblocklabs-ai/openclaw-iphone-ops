@@ -136,6 +136,136 @@ class InstagramOpsTests(unittest.TestCase):
             self.assertEqual(item["profile"]["followers"], "9,812 followers")
             self.assertIn("deep_link_manifest", item["artifacts"])
 
+    def test_verify_handles_only_captures_start_for_first_handle(self) -> None:
+        def profile_source(handle: str) -> str:
+            return f'''<XCUIElementTypeApplication bundleId="com.burbn.instagram">
+              <XCUIElementTypeStaticText name="{handle}" label="{handle}" visible="true" y="29" />
+              <XCUIElementTypeButton name="user-detail-header-followers" value="42 followers" />
+            </XCUIElementTypeApplication>'''
+
+        class CountingWDA(FakeWDA):
+            def __init__(self) -> None:
+                super().__init__(profile_source("first.creator"))
+                self.source_reads = 0
+                self.screenshots = 0
+
+            def source(self) -> str:
+                self.source_reads += 1
+                return super().source()
+
+            def screenshot(self) -> bytes:
+                self.screenshots += 1
+                return super().screenshot()
+
+            def open_url(self, url: str) -> None:
+                super().open_url(url)
+                self.source_text = profile_source("second.creator")
+
+        client = CountingWDA()
+        with tempfile.TemporaryDirectory() as tmp:
+            result = verify_handles(
+                client,  # type: ignore[arg-type]
+                ["first.creator", "second.creator"],
+                output_dir=tmp,
+                max_steps_per_handle=2,
+            )
+
+            first, second = result.payload["handles"]
+            self.assertEqual(first["status"], "captured_current_context_match")
+            self.assertEqual([step["name"] for step in first["steps"]], ["capture-start"])
+            self.assertTrue(Path(first["artifacts"]["start_manifest"]).exists())
+            self.assertEqual(second["status"], "captured_deep_link")
+            self.assertTrue(second["identity_verified"])
+            self.assertEqual(second["observed_handle"], "second.creator")
+            self.assertEqual([step["name"] for step in second["steps"]], ["open-profile-deep-link", "capture-deep-link"])
+            self.assertNotIn("start_manifest", second["artifacts"])
+            self.assertTrue(Path(second["artifacts"]["deep_link_manifest"]).exists())
+            self.assertEqual(client.source_reads, 2)
+            self.assertEqual(client.screenshots, 2)
+            self.assertEqual(client.calls, [("open_url", ("instagram://user?username=second.creator",), {})])
+
+    def test_verify_handles_later_wrong_profile_is_not_attributed_to_requested_handle(self) -> None:
+        first_source = '''<XCUIElementTypeApplication bundleId="com.burbn.instagram">
+          <XCUIElementTypeStaticText name="first.creator" label="first.creator" visible="true" y="29" />
+          <XCUIElementTypeButton name="user-detail-header-followers" value="42 followers" />
+        </XCUIElementTypeApplication>'''
+        wrong_source = '''<XCUIElementTypeApplication bundleId="com.burbn.instagram">
+          <XCUIElementTypeStaticText name="wrong.creator" label="wrong.creator" visible="true" y="29" />
+          <XCUIElementTypeButton name="user-detail-header-followers" value="999 followers" />
+        </XCUIElementTypeApplication>'''
+
+        class WrongProfileWDA(FakeWDA):
+            def open_url(self, url: str) -> None:
+                super().open_url(url)
+                self.source_text = wrong_source
+
+        client = WrongProfileWDA(first_source)
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "openclaw_iphone.instagram_ops.UIController.wait_source",
+            autospec=True,
+            side_effect=lambda controller, predicate, *, timeout: controller.client.source(),
+        ):
+            result = verify_handles(
+                client,  # type: ignore[arg-type]
+                ["first.creator", "wanted.creator"],
+                output_dir=tmp,
+                max_steps_per_handle=2,
+            )
+
+            second = result.payload["handles"][1]
+            self.assertEqual(second["status"], "identity_mismatch")
+            self.assertFalse(second["identity_verified"])
+            self.assertEqual(second["observed_handle"], "wrong.creator")
+            self.assertNotIn("profile", second)
+            self.assertNotIn("start_manifest", second["artifacts"])
+            self.assertTrue(Path(second["artifacts"]["deep_link_manifest"]).exists())
+
+    def test_verify_handles_first_mismatch_still_needs_three_steps(self) -> None:
+        source = '<XCUIElementTypeApplication bundleId="com.burbn.instagram" />'
+        client = FakeWDA(source)
+        with tempfile.TemporaryDirectory() as tmp:
+            result = verify_handles(
+                client,  # type: ignore[arg-type]
+                ["wanted.creator"],
+                output_dir=tmp,
+                max_steps_per_handle=2,
+            )
+
+            item = result.payload["handles"][0]
+            self.assertEqual(item["status"], "failed")
+            self.assertIn("before capture-deep-link", item["error"])
+            self.assertEqual([step["name"] for step in item["steps"]], ["capture-start", "open-profile-deep-link"])
+            self.assertIn("start_manifest", item["artifacts"])
+            self.assertIn("failure_screenshot", item["artifacts"])
+            self.assertEqual(client.calls, [("open_url", ("instagram://user?username=wanted.creator",), {})])
+
+    def test_verify_handles_later_navigation_failure_still_captures_evidence(self) -> None:
+        source = '''<XCUIElementTypeApplication bundleId="com.burbn.instagram">
+          <XCUIElementTypeStaticText name="first.creator" label="first.creator" visible="true" y="29" />
+          <XCUIElementTypeButton name="user-detail-header-followers" value="42 followers" />
+        </XCUIElementTypeApplication>'''
+
+        class FailingWDA(FakeWDA):
+            def open_url(self, url: str) -> None:
+                super().open_url(url)
+                raise RuntimeError("deep link failed")
+
+        client = FailingWDA(source)
+        with tempfile.TemporaryDirectory() as tmp:
+            result = verify_handles(
+                client,  # type: ignore[arg-type]
+                ["first.creator", "second.creator"],
+                output_dir=tmp,
+                max_steps_per_handle=2,
+            )
+
+            second = result.payload["handles"][1]
+            self.assertEqual(second["status"], "failed")
+            self.assertEqual(second["error"], "deep link failed")
+            self.assertEqual([step["name"] for step in second["steps"]], ["open-profile-deep-link"])
+            self.assertNotIn("start_manifest", second["artifacts"])
+            self.assertTrue(Path(second["artifacts"]["failure_screenshot"]).exists())
+
     def test_verify_handles_does_not_treat_reel_as_profile_verification(self) -> None:
         source = """<XCUIElementTypeApplication bundleId="com.burbn.instagram" name="Instagram" label="Instagram">
           <XCUIElementTypeOther label="Reel by prenatal.creator." />

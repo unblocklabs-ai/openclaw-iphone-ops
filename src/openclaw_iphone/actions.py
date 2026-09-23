@@ -110,6 +110,7 @@ class PredicateReads:
     references: dict[Selector, list[str]] = field(default_factory=dict)
     values: dict[Selector, str] = field(default_factory=dict)
     focused: str | None = None
+    native_mismatch: bool = False
 
 
 class Executor:
@@ -138,12 +139,6 @@ class Executor:
         self._uses = [0] * len(grants)
         self.stopped = False
         self.pending: tuple[Condition, ...] | None = None
-        destinations = {g.destination for g in grants if g.operation == "activate"}
-        if destinations:
-            connection.require_active()
-            installed, _ = connection.ctl.list_apps(connection.device.identifier)
-            if not destinations <= {a.bundle_identifier for a in installed}:
-                raise ObservationRejected("An authorized destination app is not installed.")
 
     def discard(self) -> None:
         """A mutation or failed read consumes every prior choice and proof."""
@@ -249,6 +244,24 @@ class Executor:
                 return "unknown"
         if element.role not in EDITABLE:
             return "unknown"
+        if (condition.kind == "value" and element.value != condition.value and reads is not None
+                and reads.native_mismatch and condition.target in reads.references):
+            try:
+                # This is only a supplied post-input field. Re-resolve it on
+                # the current screen before one native read; never trust a
+                # previous write reference when the XML disagrees.
+                reads.references[condition.target] = self._find(condition.target)
+                self._guard_app(observation.app, observation.process_id)
+                state = self._read_condition(condition, reads)
+                self._guard_app(observation.app, observation.process_id)
+            except OpenClawIPhoneError:
+                self._values.pop(condition, None)
+                state = "unknown"
+            if len(reads.references.get(condition.target, [])) != 1:
+                self._values.pop(condition, None)
+                state = "unknown"
+            self._verified[condition] = state
+            return state
         self._values[condition] = element.value
         return "satisfied" if element.value == condition.value else "unsatisfied"
 
@@ -302,7 +315,8 @@ class Executor:
 
     def wait(self, conditions: tuple[Condition, ...], *, seconds: float | None = None,
              once: bool = False, full: bool = False,
-             references: dict[Selector, str] | None = None) -> tuple[str, Observation]:
+             references: dict[Selector, str] | None = None,
+             native_mismatch: bool = False) -> tuple[str, Observation]:
         duration = self.verification_seconds if seconds is None else seconds
         if not math.isfinite(duration) or duration <= 0:
             raise ValueError("Wait timeout must be finite and positive.")
@@ -324,7 +338,8 @@ class Executor:
                         raise VerificationExpired("Verification window expired; inspect without replaying input.")
                     self.connection.budget.sleep(min(0.2, end - time.monotonic()))
                     continue
-                reads = PredicateReads({target: [ref] for target, ref in (references or {}).items()}) if full else None
+                reads = PredicateReads({target: [ref] for target, ref in (references or {}).items()},
+                                       native_mismatch=native_mismatch) if full else None
                 state = self.verify(observation, conditions, reads=reads)
                 if full and references is not None and reads is not None:
                     for target in references:
@@ -498,7 +513,6 @@ class Executor:
             wda = self.connection.require_active()
             operation = grant.operation
             conditions = grant.after
-            self._uses[offer.grant_index] += 1
             if operation == "keypad":
                 supplied = self.texts[grant.text_id]
                 if (self._read_condition(Condition("focused", grant.app, grant.target), reads) != "satisfied"
@@ -508,6 +522,7 @@ class Executor:
                 self._dispatch_guard(original)
                 self.discard()
                 dispatching = True
+                self._uses[offer.grant_index] += 1
                 wda.tap_sequence(points)
                 acknowledged += 1
                 dispatching = False
@@ -525,6 +540,7 @@ class Executor:
                     if operation in {"replace", "clear"}:
                         self._check_binding(original)
                         dispatching = True
+                        self._uses[offer.grant_index] += 1
                         wda.element_action(reference, "clear")
                         acknowledged += 1
                         dispatching = False
@@ -534,14 +550,21 @@ class Executor:
                     if operation != "clear":
                         self._check_binding(original)
                         dispatching = True
+                        if operation == "append":
+                            self._uses[offer.grant_index] += 1
                         wda.element_action(reference, "value", text=self.texts[grant.text_id])
                         acknowledged += 1
                         dispatching = False
                 conditions = (Condition("value", grant.app, grant.target, expected),) + conditions
             else:
+                if operation == "activate":
+                    installed, _ = self.connection.ctl.list_apps(self.connection.device.identifier)
+                    if grant.destination not in {app.bundle_identifier for app in installed}:
+                        raise ObservationRejected("The selected destination app is not installed.")
                 self._dispatch_guard(original)
                 self.discard()
                 dispatching = True
+                self._uses[offer.grant_index] += 1
                 if operation in {"tap", "back"}:
                     wda.element_action(reference, "click")
                 elif operation == "activate":
@@ -570,6 +593,14 @@ class Executor:
                 self.pending = conditions
             return StepResult("acknowledged" if acknowledged else "not_sent", "unknown", "verification_expired",
                               acknowledged_substeps=acknowledged)
+        except ObservationRejected as exc:
+            if not acknowledged and not dispatching:
+                self.discard()
+                return StepResult("not_sent", "unknown", "validation_failed", error_type=type(exc).__name__)
+            self.stopped = True
+            return StepResult("acknowledged" if acknowledged else "not_sent", "unknown",
+                              "verification_unavailable" if acknowledged else "validation_failed",
+                              acknowledged_substeps=acknowledged, error_type=type(exc).__name__)
         except OpenClawIPhoneError as exc:
             self.stopped = True
             if dispatching and isinstance(exc, WDAOutcomeUnknown):

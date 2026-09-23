@@ -92,6 +92,15 @@ openclaw-iphone ui observe
 openclaw-iphone ui observe --include-labels
 ```
 
+`ui observe` uses read-only acquisition: it still owns the control lock, pins
+the physical UDID, checks the CoreDevice tunnel and WDA session/readiness, and
+keeps its deadline, but does not require the CoreDevice or WDA **input** unlock
+probes before reading. Normal `task run`/`task session` acquisition and WDA's
+per-mutation lock check are unchanged. CoreDevice `passcodeRequired` and WDA
+`/wda/locked` are distinct signals; neither proves that locked-screen source
+will be available. An unreadable source still fails clearly. Physical
+locked-device readability has not been validated.
+
 The default projection contains snapshot ID/time, app/PID, connection generation,
 capture duration, roles and visibility counts. The physical UDID stays internal.
 The view reports source-node/visible/unnamed counts and omitted rows (80 visible
@@ -125,6 +134,19 @@ section to a version-1 task with ordinary `success` and `limits` fields:
   "inputs": {"email": "/absolute/private/email.txt", "code": "/absolute/private/code.txt"}
 }
 ```
+
+For an OAuth handoff, prepare the task file **before** starting the session:
+include the source app and the exact consent-host bundle ID observed locally
+(for example, an observed SpringBoard-hosted alert), only needed operations
+such as `tap` and `input`, and anticipated owner-only input paths. For example,
+`"apps": ["com.example.source", "ACTUALLY_OBSERVED_CONSENT_BUNDLE_ID"]`
+and `"inputs": {"account": "/absolute/private/account.txt"}` are entries
+to replace with reviewed identities and paths. Do not preauthorize every
+browser/system app for convenience. The path is authorized at startup; its
+file can arrive later and is read at dispatch. An unexpected app, operation
+or input reference requires explicit scope review and a new session, never
+permission inferred from screen text. Reobserve after restart; prior ownership
+and snapshots are gone.
 
 This is a **trusted caller** interface. The caller can authorize any target
 within these app/operation boundaries, including consequential taps. Review
@@ -161,7 +183,7 @@ fields do not change the separate Jev cloud projection or authorize input.
 
 ```json
 {"op":"act","action":"tap","instruction":"Continue with Email"}
-{"op":"act","action":"tap","instruction":"Focus the email field","target":{"role":"XCUIElementTypeTextField","name":"email"}}
+{"op":"act","action":"tap","instruction":"Focus the email field","target":{"role":"XCUIElementTypeTextField","name":"email"},"after":[{"kind":"focused","app":"example.test","target":{"role":"XCUIElementTypeTextField","name":"email"}}]}
 {"op":"act","action":"input","instruction":"email","text_ref":"email","mode":"replace","strategy":"sequential"}
 ```
 
@@ -204,7 +226,9 @@ Do not put passwords/codes in instructions, task JSON, CLI arguments or logs.
 `mode: empty` requires native emptiness; `replace` explicitly clears first.
 WDA sometimes returns a placeholder instead of empty: after acknowledged clear,
 a matching native `placeholderValue` is accepted. `strategy: native` (default)
-uses one targeted bulk request and lets WDA prepare target focus. Clear/type
+uses one targeted bulk request; WDA does not prove usable keyboard focus on
+every WebView. The explicit field tap above can prepare and verify focus before
+sequential input; an uncertain click is never replayed. Clear/type
 shares one foreground/lock boundary and reads back the same field reference.
 `sequential` checks app/focus at the input
 boundary and sends separate key events in the same session, at most eight per
@@ -216,9 +240,12 @@ the physical batch test. This is deliberate, slower entry,
 Ordinary fields get exact readback unless an explicit `after` condition is
 provided. No-`after` input on a normal editable field reads its unique value
 from a fresh tree reusable by the next decision; a missing tree value falls
-back to the selected native reference, while an ambiguous target remains
-unverified. Explicit-`after` and final actions retain targeted verification
-when their conditions permit it. Secure/custom input requires an observable
+back to the selected native reference. A non-null XML mismatch on one uniquely
+observed ordinary field gets one targeted native value recheck. Matching XML
+adds no request. Missing/duplicated targets and unknown readback remain
+unverified; this post-input recheck never reads secure-field values. Explicit-`after` and final actions
+retain targeted verification when their conditions permit it. Secure/custom
+input requires an observable
 non-app-only destination condition that is not already satisfied; do not demand
 a secret's readback.
 Auto-submit can therefore be verified by the destination, even if the input
@@ -269,6 +296,12 @@ Do not upload the image without appropriate approval.
 A vision tap returns acknowledgement with unknown verification, not another
 automatic AX capture or a success claim. Choose `observe`, `screenshot` or a
 relevant task `wait` next; this keeps the fallback usable on AX-broken screens.
+If `/source` fails in a planner session, use its one `recover_read` allowance,
+then take an app-only screenshot with caller-reviewed `redact` rectangles (or
+`[]` only for a confirmed non-sensitive screen). Inspect the current image and
+send one scoped `vision_tap` from its one-use ID; do not retry `tap-text` or
+force another XML read on a known AX-broken screen. App/PID/geometry and
+freshness checks still apply. This is a fallback, not a measured speedup on X.
 
 For a custom `Other` code control without native empty/focus evidence, a trusted
 caller may inspect a just-captured screenshot and explicitly attest to an empty,
@@ -288,8 +321,13 @@ Screenshots can mask field geometry; if the empty/focused state cannot actually
 be inspected, do not attest. Prefer native evidence whenever it is available.
 
 An authorized `act`/`relaunch` terminates and reactivates the current scoped app,
-not WDA or the device. Its result is another observation, not automatic task
-success. `session_end` reports content-free transport and aggregate model metrics.
+not WDA or the device. Without an element `after` condition it uses app-only
+evidence before and after, so a broken accessibility tree does not prevent this
+explicit recovery action. The returned app identity is not task success; with
+no `after`, verification remains unknown. If termination is acknowledged but
+activation fails, input stops for that executor: do not replay termination.
+Unknown writes also remain stopped. `session_end` reports content-free transport
+and aggregate model metrics.
 See [proposal and live iteration ledger](adaptive-act-proposal.md) for measured
 results and remaining limitations rather than treating offline tests as live proof.
 

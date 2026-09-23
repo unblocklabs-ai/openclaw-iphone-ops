@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import os
 import math
 import subprocess
+import time
 
 from .errors import CommandFailed
 from .execution import Budget, Metrics
@@ -32,12 +33,17 @@ class Runner:
             seconds = min(seconds, self.budget.remaining())
         # Only fixed executable/subcommand names enter telemetry, never argv values.
         operation = "devicectl" if command[:2] == ["xcrun", "devicectl"] else "subprocess"
+        phase = devicectl_phase(command) if operation == "devicectl" else None
         with self.metrics.measure(operation):
-            return self._run(command, timeout=seconds)
+            if phase:
+                with self.metrics.measure(phase):
+                    return self._run(command, timeout=seconds, phase=phase)
+            return self._run(command, timeout=seconds, phase=operation if operation == "devicectl" else None)
 
-    def _run(self, command: list[str], *, timeout: float) -> CommandResult:
+    def _run(self, command: list[str], *, timeout: float, phase: str | None = None) -> CommandResult:
         env = os.environ.copy()
         env.update(self.env)
+        started = time.monotonic()
         try:
             proc = subprocess.run(
                 command,
@@ -51,6 +57,8 @@ class Runner:
             )
         except subprocess.TimeoutExpired as exc:
             raise CommandFailed(
+                (f"{phase} timed out after {time.monotonic() - started:.3f}s "
+                 f"(limit {timeout or self.timeout:g}s).") if phase else
                 f"Command timed out after {timeout or self.timeout}s: {format_command(command)}",
                 command=command,
                 stdout=decode_output(exc.stdout),
@@ -70,6 +78,22 @@ class Runner:
                 stderr=proc.stderr,
             )
         return CommandResult(command, proc.returncode, proc.stdout, proc.stderr)
+
+
+def devicectl_phase(command: list[str]) -> str | None:
+    """Fixed labels only; never include device selectors, output paths, or app names."""
+    parts = command[2:5]
+    if parts[:2] == ["list", "devices"]:
+        return "devicectl list devices"
+    if parts[:2] == ["device", "info"] and len(parts) == 3:
+        return {
+            "details": "devicectl device details",
+            "lockState": "devicectl device lock state",
+            "apps": "devicectl device apps",
+        }.get(parts[2])
+    if parts == ["device", "process", "launch"]:
+        return "devicectl process launch"
+    return None
 
 
 def decode_output(value: str | bytes | None) -> str:

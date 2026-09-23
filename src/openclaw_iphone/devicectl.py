@@ -91,7 +91,7 @@ class DeviceCtl:
 
         return f"http://{url_host(str(tunnel_ip))}:{port}", output
 
-    def select_device(self, requested: str | None = None) -> Device:
+    def select_device(self, requested: str | None = None, *, read_only: bool = False) -> Device:
         requested = requested or None
         devices, _ = self.list_devices()
         connected = [
@@ -107,7 +107,7 @@ class DeviceCtl:
             if len(exact) > 1:
                 raise DeviceSelectionError("Device identity matched multiple records.")
             if exact:
-                return exact[0] if exact[0] in connected else self._wake_pinned(exact[0])
+                return exact[0] if exact[0] in connected else self._wake_pinned(exact[0], read_only=read_only)
             matches = [
                 device
                 for device in connected
@@ -130,7 +130,7 @@ class DeviceCtl:
             f"or pass --device where supported. Candidates: {names}"
         )
 
-    def _wake_pinned(self, original: Device) -> Device:
+    def _wake_pinned(self, original: Device, *, read_only: bool = False) -> Device:
         """One read-only details probe and recheck, bounded by 10s/task budget."""
         if not original.udid:
             raise DeviceSelectionError("Disconnected device has no physical UDID; reconnect it manually.")
@@ -151,7 +151,8 @@ class DeviceCtl:
                        and d.model.casefold().startswith("iphone") and d.state.lower() == "connected"]
             if len(matches) != 1:
                 raise DeviceSelectionError("Pinned iPhone is still disconnected; no alternative device selected.")
-            self.require_unlocked(matches[0].identifier)
+            if not read_only:
+                self.require_unlocked(matches[0].identifier)
             return matches[0]
         finally:
             self.runner.budget = previous
@@ -212,29 +213,7 @@ class DeviceCtl:
 
     def find_app(self, device_id: str, query: str) -> App:
         apps, _ = self.list_apps(device_id, include_all=True)
-        query_lower = query.lower()
-
-        exact_bundle = [app for app in apps if app.bundle_identifier == query]
-        if exact_bundle:
-            return exact_bundle[0]
-
-        exact_name = [app for app in apps if app.name.lower() == query_lower]
-        if len(exact_name) == 1:
-            return exact_name[0]
-        if len(exact_name) > 1:
-            raise AppNotFound(f"App name {query!r} matched multiple apps; use an exact bundle identifier.")
-
-        contains = [
-            app
-            for app in apps
-            if query_lower in app.name.lower() or query_lower in app.bundle_identifier.lower()
-        ]
-        if len(contains) == 1:
-            return contains[0]
-        if len(contains) > 1:
-            choices = ", ".join(f"{app.name} ({app.bundle_identifier})" for app in contains)
-            raise AppNotFound(f"App query {query!r} matched multiple apps: {choices}")
-        raise AppNotFound(f"App {query!r} was not found on device {device_id}.")
+        return resolve_app(apps, query, device_id)
 
     def launch_app(self, device_id: str, bundle_id: str) -> None:
         self.runner.run(
@@ -249,6 +228,32 @@ class DeviceCtl:
                 bundle_id,
             ]
         )
+
+
+def resolve_app(apps: list[App], query: str, device_id: str) -> App:
+    query_lower = query.lower()
+
+    exact_bundle = [app for app in apps if app.bundle_identifier == query]
+    if exact_bundle:
+        return exact_bundle[0]
+
+    exact_name = [app for app in apps if app.name.lower() == query_lower]
+    if len(exact_name) == 1:
+        return exact_name[0]
+    if len(exact_name) > 1:
+        raise AppNotFound(f"App name {query!r} matched multiple apps; use an exact bundle identifier.")
+
+    contains = [
+        app
+        for app in apps
+        if query_lower in app.name.lower() or query_lower in app.bundle_identifier.lower()
+    ]
+    if len(contains) == 1:
+        return contains[0]
+    if len(contains) > 1:
+        choices = ", ".join(f"{app.name} ({app.bundle_identifier})" for app in contains)
+        raise AppNotFound(f"App query {query!r} matched multiple apps: {choices}")
+    raise AppNotFound(f"App {query!r} was not found on device {device_id}.")
 
 def read_json(path: Path) -> dict[str, Any]:
     data = json.loads(path.read_text(encoding="utf-8"))

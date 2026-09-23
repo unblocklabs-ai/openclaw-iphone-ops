@@ -116,6 +116,26 @@ class TransportTests(unittest.TestCase):
 
 
 class ConnectionTests(unittest.TestCase):
+    def test_read_only_recovery_still_requires_original_physical_udid(self):
+        ctl = Mock()
+        ctl.runner = Runner()
+        ctl.select_device.side_effect = [Device("one", "core", "connected", "iPhone", "one"),
+                                         Device("two", "core", "connected", "iPhone", "two")]
+        ctl.coredevice_wda_url.return_value = ("http://wda.test", None)
+        wda = TransportTests().client()
+        wda.is_ready = Mock(return_value=True)
+        wda.require_unlocked = Mock(side_effect=DeviceLocked("locked"))
+        with tempfile.TemporaryDirectory() as tmp, patch("openclaw_iphone.connection.WDAClient", return_value=wda):
+            with TaskConnection(ctl, lock_path=Path(tmp) / "lock", read_only=True) as task:
+                task.invalidate()
+                with self.assertRaises(DeviceSelectionError):
+                    task.recover_read()
+                self.assertFalse(task.valid)
+        self.assertEqual(ctl.select_device.call_args_list[1].args, ("one",))
+        self.assertEqual(ctl.select_device.call_args_list[1].kwargs, {"read_only": True})
+        ctl.require_unlocked.assert_not_called()
+        wda.require_unlocked.assert_not_called()
+
     def test_ownership_cached_setup_and_same_udid_recovery(self):
         ctl = Mock()
         ctl.runner = Runner()

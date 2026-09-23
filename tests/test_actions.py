@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import Mock, call
 
 from openclaw_iphone.actions import Condition, Executor, Grant
-from openclaw_iphone.devicectl import Device
+from openclaw_iphone.devicectl import App, Device
 from openclaw_iphone.errors import DeviceLocked, WDAOutcomeUnknown, WDAUnavailable
 from openclaw_iphone.execution import Budget, TaskStopped
 from openclaw_iphone.observations import ObservationRejected, Selector, parse_observation, predicate_literal, xpath_literal
@@ -288,6 +288,70 @@ class ExecutorTests(unittest.TestCase):
                     ex.connection.device = replace(ex.connection.device, udid="other")
                 self.assertEqual(ex.execute(offer.id).dispatch, "not_sent")
                 wda.element_action.assert_not_called()
+
+    def test_known_no_write_rejection_discards_snapshot_and_recovers_with_new_offer(self):
+        ex, wda = executor([tap_grant()])
+        old, = ex.offers(ex.observe())
+        wda.find_elements.return_value = []
+        result = ex.execute(old.id)
+        self.assertEqual((result.dispatch, result.error_type), ("not_sent", "ObservationRejected"))
+        self.assertFalse(ex.stopped)
+        self.assertEqual(ex._uses, [0])
+        self.assertIsNone(ex.latest)
+        self.assertEqual(ex.execute(old.id).reason, "invalid_or_consumed_offer")
+        wda.find_elements.return_value = ["ref"]
+        fresh, = ex.offers(ex.observe())
+        self.assertNotEqual(old.id, fresh.id)
+        wda.source.return_value = source(button_label="Finished")
+        self.assertEqual(ex.execute(fresh.id).verification, "satisfied")
+        wda.element_action.assert_called_once_with("ref", "click")
+
+    def test_pre_dispatch_input_validation_does_not_consume_grant(self):
+        grant = Grant("append", APP, "Enter supplied text", FIELD, text_id="query")
+        ex, wda = executor([grant], texts={"query": "hello"})
+        offer, = ex.offers(ex.observe())
+        wda.element_value.return_value = "not empty"
+        result = ex.execute(offer.id)
+        self.assertEqual(result.dispatch, "not_sent")
+        self.assertFalse(ex.stopped)
+        self.assertEqual(ex._uses, [0])
+        wda.element_action.assert_not_called()
+
+    def test_keypad_focus_and_layout_rejections_do_not_consume_grant(self):
+        grant = Grant("keypad", APP, "Enter code", FIELD, text_id="code")
+        ex, wda = executor([grant], texts={"code": "12"})
+        wda.active_element.return_value = "other"
+        first, = ex.offers(ex.observe())
+        self.assertEqual(ex.execute(first.id).dispatch, "not_sent")
+        self.assertEqual(ex._uses, [0])
+        wda.active_element.return_value = "ref"
+        second, = ex.offers(ex.observe())
+        self.assertEqual(ex.execute(second.id).dispatch, "not_sent")
+        self.assertEqual(ex._uses, [0])
+        self.assertFalse(ex.stopped)
+        wda.tap_sequence.assert_not_called()
+
+    def test_missing_selected_activation_is_recoverable_and_unused_one_is_not_checked(self):
+        activation = Grant("activate", APP, "Open installed app", destination="next.app",
+                           after=(Condition("app", "next.app"),))
+        ex, wda = executor([tap_grant(), activation])
+        ex.connection.ctl.list_apps.assert_not_called()
+        offers = ex.offers(ex.observe())
+        tap = next(o for o in offers if o.grant_index == 0)
+        activate = next(o for o in offers if o.grant_index == 1)
+        ex.connection.ctl.list_apps.return_value = ([], None)
+        result = ex.execute(activate.id)
+        self.assertEqual((result.dispatch, result.error_type), ("not_sent", "ObservationRejected"))
+        self.assertFalse(ex.stopped)
+        self.assertEqual(ex._uses, [0, 0])
+        wda.activate_app.assert_not_called()
+        self.assertEqual(ex.execute(tap.id).reason, "invalid_or_consumed_offer")
+        ex.connection.ctl.list_apps.return_value = ([App("Next", "next.app")], None)
+        new_activate = next(o for o in ex.offers(ex.observe()) if o.grant_index == 1)
+        wda.active_app.return_value = {"bundleId": "next.app", "pid": 2}
+        self.assertEqual(ex.execute(new_activate.id).verification, "satisfied")
+        self.assertEqual(ex._uses, [0, 1])
+        wda.activate_app.assert_called_once_with("next.app")
 
     def test_unknown_mutation_stops_all_future_dispatch(self):
         ex, wda = executor([tap_grant()])

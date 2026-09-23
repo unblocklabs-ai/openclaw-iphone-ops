@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..devicectl import Device, DeviceCtl
+from ..devicectl import Device, DeviceCtl, resolve_app
 from ..wda import WDAClient
 
 
@@ -30,7 +30,8 @@ def smoke(
     url, _ = client.coredevice_wda_url(device.identifier)
     WDAClient(url=url).require_unlocked()
 
-    app = client.find_app(device.identifier, app_query)
+    apps, apps_artifact = client.list_apps(device.identifier, include_all=True)
+    app = resolve_app(apps, app_query, device.identifier)
     if app.bundle_identifier != INSTAGRAM_BUNDLE_ID:
         # Keep this as a guardrail, not a dependency of the generic app resolver.
         raise ValueError(
@@ -38,7 +39,6 @@ def smoke(
             f"not expected Instagram bundle {INSTAGRAM_BUNDLE_ID}."
         )
 
-    _, apps_artifact = client.list_apps(device.identifier, include_all=True)
     client.launch_app(device.identifier, app.bundle_identifier)
     return InstagramSmokeResult(
         device=device,

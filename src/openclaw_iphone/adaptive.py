@@ -103,8 +103,17 @@ class AdaptiveAct:
             element = rows[row["id"]]
             row["bounds"] = element.bounds
             if element.role in EDITABLE:
-                # A missing value or a possible placeholder is not evidence of emptiness.
+                # A targeted native recheck may have superseded stale XML for
+                # this same snapshot. Never expose the value in the view.
                 value = element.value
+                if observation is self.ex.latest:
+                    for condition, state in self.ex._verified.items():
+                        if (state in {"satisfied", "unsatisfied"} and condition.kind == "value" and
+                                condition.app == observation.app and element.matches(condition.target) and
+                                condition in self.ex._values):
+                            value = self.ex._values[condition]
+                            break
+                # A missing value or a possible placeholder is not evidence of emptiness.
                 row["input_state"] = ("unknown" if value is None or value != "" and
                     value in {element.name, element.label} else "empty" if value == "" else "nonempty")
                 row["focused"] = element.focused
@@ -117,9 +126,9 @@ class AdaptiveAct:
                       input_pending=self.pending_input is not None)
         return result
 
-    def _current(self) -> Observation:
-        observation = self.ex.current()
-        if observation.app not in self.scope["apps"] or observation.elements is None:
+    def _current(self, *, full: bool = True) -> Observation:
+        observation = self.ex.current(full=full)
+        if observation.app not in self.scope["apps"] or (full and observation.elements is None):
             raise ObservationRejected("Adaptive action is outside the observed app scope.")
         return observation
 
@@ -193,6 +202,8 @@ class AdaptiveAct:
             raise ValueError("Operation is not authorized for adaptive Act.")
         if "target" in data and "target_id" in data:
             raise ValueError("Choose one targeting mechanism.")
+        if action == "relaunch" and ("target" in data or "target_id" in data):
+            raise ValueError("Relaunch targets only the current scoped app, not an element.")
         if action == "scroll":
             if data.get("direction") not in {"up", "down"}:
                 raise ValueError("Scroll requires up or down direction.")
@@ -219,7 +230,9 @@ class AdaptiveAct:
         current = None
         resolution, decision = "caller", None
         try:
-            original = current = self._current()
+            original = current = self._current(full=action != "relaunch")
+            if action == "relaunch" and "snapshot_id" in data and data["snapshot_id"] != original.id:
+                raise ObservationRejected("Relaunch snapshot was superseded; reobserve and choose again.")
             target = None
             if action != "relaunch":
                 target, resolution, decision = self._target(data, original)
@@ -271,17 +284,20 @@ class AdaptiveAct:
                         self.ex._check_binding(current)
                         wda.element_action(reference, "clear")
                         acknowledged += 1
-                    self.validation_stage = "input_empty"
+                    self.validation_stage = "post_clear" if acknowledged else "input_empty"
                     if not visual_input:
                         value = wda.element_value(reference, allow_null_empty=target.role in EDITABLE)
                         # Empty fields may expose their placeholder after clear.
                         if value and not (replacing and value == wda.element_placeholder(reference)):
                             raise ObservationRejected("Input is not verified empty; authorize replacement if appropriate.")
                         if action == "keypad" or data.get("strategy") == "sequential":
-                            self.validation_stage = "input_focus"
+                            if not acknowledged:
+                                self.validation_stage = "input_focus"
                             if wda.active_element() != reference:
                                 raise ObservationRejected("Focus changed after empty verification.")
                     if action == "keypad":
+                        if not acknowledged:
+                            self.validation_stage = "keypad_layout"
                         points = self.ex._keypad_points(current, supplied)
                         self.ex._check_binding(current)
                         wda.tap_sequence(points)
@@ -290,11 +306,11 @@ class AdaptiveAct:
                         if data.get("strategy", "native") == "sequential":
                             wda.type_text(supplied, frequency=8)
                         else:
-                            # Native element typing prepares focus on this target.
+                            # Targeted WDA typing does not guarantee keyboard focus.
                             wda.element_action(reference, "value", text=supplied)
                     acknowledged += 1
             else:
-                self.ex._dispatch_guard(current)
+                self.ex._dispatch_guard(current, pixels=action == "relaunch")
                 self.ex.discard()
                 if action == "tap":
                     wda.element_action(reference, "click")
@@ -305,8 +321,10 @@ class AdaptiveAct:
                 elif action == "relaunch":
                     wda.terminate_app(current.app)
                     acknowledged += 1
+                    self.validation_stage = "post_terminate_activation"
                     wda.activate_app(current.app)
                     acknowledged += 1
+            self.validation_stage = "post_action_verification"
             if action == "scroll":
                 current = self.ex.observe()
                 same = [e for e in current.elements or () if e.path == target.path and e.role == target.role
@@ -322,11 +340,16 @@ class AdaptiveAct:
                 # evidence. Verify its value there, rather than reading a narrow
                 # value now and immediately fetching the same screen afterward.
                 full = not after and target.role in EDITABLE
-                state, current = self.ex.wait(input_conditions, once=not after, full=full, references=references)
+                state, current = self.ex.wait(input_conditions, once=not after, full=full,
+                                              references=references, native_mismatch=action == "input" and full)
+                if state == "unknown" or current.app != input_conditions[0].app:
+                    self.pending_target = None
+                elif full and state == "unsatisfied" and current.unique(input_conditions[0].target) is None:
+                    self.pending_target = None
             elif after:
                 state, current = self.ex.wait(after)
             else:
-                current = self.ex.observe()
+                current = self.ex.observe(app_only=action == "relaunch")
                 state = "unknown"
             if action in {"input", "keypad"} and state == "satisfied":
                 self.pending_input = None
@@ -334,6 +357,8 @@ class AdaptiveAct:
             reason = ("no_progress" if action == "scroll" and state == "unsatisfied" and not changed
                       else "verified" if state == "satisfied" else "inspect_result")
             result = {"status": "step", "dispatch": "acknowledged", "verification": state, "reason": reason}
+            if state != "satisfied":
+                result["validation_stage"] = "post_action_verification"
             if action == "input" and not after and state in {"satisfied", "unsatisfied"}:
                 readback = self.ex._values.get(input_conditions[0])
                 result["readback"] = {"matches": state == "satisfied", "expected_characters": len(supplied),
@@ -348,6 +373,8 @@ class AdaptiveAct:
                 self.pending_target = None  # A missing readback is not a known mismatch to replace.
             result = {"status": "fallback", "dispatch": "acknowledged" if acknowledged else "not_sent",
                       "verification": "unknown", "reason": "verification_expired"}
+            if acknowledged:
+                result["validation_stage"] = self.validation_stage
             current = None
         except OpenClawIPhoneError as exc:
             if isinstance(exc, WDAUnavailable):
@@ -361,6 +388,9 @@ class AdaptiveAct:
                       "verification": "unknown", "reason": "verification_unavailable" if acknowledged else "validation_failed",
                       "error_type": type(exc).__name__, "validation_stage": self.validation_stage}
             current = None
+        if action == "relaunch" and acknowledged == 1 and result["dispatch"] == "acknowledged":
+            self.ex.stopped = True
+            result.update(status="blocked", reason="relaunch_partial")
         result.update(resolution=resolution, decision=decision, seconds=time.monotonic() - started,
                       acknowledged_substeps=acknowledged, input_stopped=self.ex.stopped,
                       input_pending=self.pending_input is not None)

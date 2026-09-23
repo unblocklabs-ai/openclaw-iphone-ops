@@ -9,7 +9,8 @@ import zlib
 
 from openclaw_iphone.actions import Condition
 from openclaw_iphone.adaptive import AdaptiveAct, parse_scope, read_input
-from openclaw_iphone.errors import WDAOutcomeUnknown
+from openclaw_iphone.devicectl import Device
+from openclaw_iphone.errors import WDAOutcomeUnknown, WDAUnavailable
 from openclaw_iphone.image_evidence import redact_png
 from openclaw_iphone.jev import Decision, LowConfidenceDecision
 from openclaw_iphone.observations import ObservationRejected, Selector
@@ -44,6 +45,65 @@ def png(width=8, height=16, filter_type=0):
 
 
 class AdaptiveTests(unittest.TestCase):
+    def test_relaunch_uses_scoped_app_only_evidence_without_source(self):
+        actor, wda = make()
+        wda.source.side_effect = WDAUnavailable("broken AX")
+        result = actor.act({"op": "act", "action": "relaunch", "instruction": "Restart current app"})
+        self.assertEqual((result["dispatch"], result["verification"], result["acknowledged_substeps"]),
+                         ("acknowledged", "unknown", 2))
+        self.assertIsNone(result["observation"].elements)
+        self.assertEqual(result["observation"].app, APP)
+        wda.source.assert_not_called()
+        wda.terminate_app.assert_called_once_with(APP)
+        wda.activate_app.assert_called_once_with(APP)
+        actor, wda = make()
+        wda.source.side_effect = WDAUnavailable("broken AX")
+        result = actor.act({"op": "act", "action": "relaunch", "instruction": "Restart current app",
+                            "after": [{"kind": "app", "app": APP}]})
+        self.assertEqual(result["verification"], "satisfied")
+        self.assertIsNone(result["observation"].elements)
+        wda.source.assert_not_called()
+
+    def test_relaunch_rejects_foreign_scope_and_changed_pid_before_termination(self):
+        request = {"op": "act", "action": "relaunch", "instruction": "Restart current app"}
+        actor, wda = make()
+        wda.active_app.return_value = {"bundleId": "other.app", "pid": 1}
+        self.assertEqual(actor.act(request)["dispatch"], "not_sent")
+        wda.terminate_app.assert_not_called()
+        actor, wda = make()
+        wda.active_app.side_effect = [{"bundleId": APP, "pid": 1}, {"bundleId": APP, "pid": 2}]
+        self.assertEqual(actor.act(request)["dispatch"], "not_sent")
+        wda.terminate_app.assert_not_called()
+
+    def test_relaunch_rejects_foreign_snapshot_and_device(self):
+        actor, wda = make()
+        observed = actor.ex.observe(app_only=True)
+        request = {"op": "act", "action": "relaunch", "instruction": "Restart current app", "snapshot_id": "old"}
+        self.assertEqual(actor.act(request)["dispatch"], "not_sent")
+        request["snapshot_id"] = observed.id
+        actor.ex.connection.device = Device("other", "core", "connected", "iPhone", "other-udid")
+        self.assertEqual(actor.act(request)["dispatch"], "not_sent")
+        wda.terminate_app.assert_not_called()
+
+    def test_partial_relaunch_blocks_replay_and_unknown_write_stays_stopped(self):
+        request = {"op": "act", "action": "relaunch", "instruction": "Restart current app"}
+        actor, wda = make()
+        wda.activate_app.side_effect = WDAUnavailable("activation failed")
+        result = actor.act(request)
+        self.assertEqual((result["status"], result["dispatch"], result["reason"],
+                          result["validation_stage"], result["acknowledged_substeps"]),
+                         ("blocked", "acknowledged", "relaunch_partial", "post_terminate_activation", 1))
+        self.assertTrue(result["input_stopped"])
+        self.assertEqual(actor.act(request)["dispatch"], "not_sent")
+        wda.terminate_app.assert_called_once()
+        wda.activate_app.assert_called_once()
+        actor, wda = make()
+        wda.terminate_app.side_effect = WDAOutcomeUnknown("unknown termination")
+        self.assertEqual(actor.act(request)["dispatch"], "unknown")
+        self.assertEqual(actor.act(request)["dispatch"], "not_sent")
+        wda.terminate_app.assert_called_once()
+        wda.activate_app.assert_not_called()
+
     def test_scroll_one_dispatch_and_reusable_full_observation(self):
         actor, wda = scroll_actor()
         before = actor.ex.observe()
@@ -239,6 +299,40 @@ class AdaptiveTests(unittest.TestCase):
             self.assertEqual(actor.act(request)["dispatch"], "not_sent")
             wda.element_action.assert_not_called()
 
+    def test_acknowledged_tap_read_failure_reports_post_action_stage(self):
+        actor, wda = make()
+        actor.ex.observe()
+        wda.source.side_effect = WDAUnavailable("unavailable")
+        result = actor.act({"op": "act", "action": "tap", "instruction": "Next"})
+        self.assertEqual((result["dispatch"], result["reason"], result["validation_stage"],
+                          result["acknowledged_substeps"]),
+                         ("acknowledged", "verification_unavailable", "post_action_verification", 1))
+        wda.element_action.assert_called_once_with("ref", "click")
+
+    def test_acknowledged_tap_predicate_failure_reports_verification_stage(self):
+        actor, wda = make()
+        def find(query, **kwargs):
+            if wda.element_action.called:
+                raise WDAUnavailable("predicate read failed")
+            return ["ref"]
+        wda.find_elements.side_effect = find
+        result = actor.act({"op": "act", "action": "tap", "instruction": "Next", "after": [
+            {"kind": "exists", "app": APP, "target": {"role": "XCUIElementTypeButton", "label": "Finished"}}]})
+        self.assertEqual((result["dispatch"], result["verification"], result["validation_stage"],
+                          result["acknowledged_substeps"]),
+                         ("acknowledged", "unknown", "post_action_verification", 1))
+        wda.element_action.assert_called_once_with("ref", "click")
+
+    def test_acknowledged_clear_failure_reports_clear_verification_stage(self):
+        actor, wda = make(inputs={"text": "/unused"})
+        wda.element_value.side_effect = WDAUnavailable("read failed")
+        with patch("openclaw_iphone.adaptive.read_input", return_value="exact"):
+            result = actor.act({"op": "act", "action": "input", "instruction": "Input",
+                                "text_ref": "text", "mode": "replace"})
+        self.assertEqual((result["dispatch"], result["validation_stage"], result["acknowledged_substeps"]),
+                         ("acknowledged", "post_clear", 1))
+        wda.element_action.assert_called_once_with("ref", "clear")
+
     def test_unknown_write_stops_and_is_not_replayed(self):
         actor, wda = make()
         wda.element_action.side_effect = WDAOutcomeUnknown("sensitive provider body")
@@ -344,6 +438,80 @@ class AdaptiveTests(unittest.TestCase):
             result = actor.act({"op": "act", "action": "input", "instruction": "Input", "text_ref": "text", "strategy": "sequential"})
         self.assertEqual((result["dispatch"], result["acknowledged_substeps"]), ("not_sent", 0))
         wda.type_text.assert_not_called()
+
+    def test_explicit_field_tap_prepares_sequential_input(self):
+        actor, wda = make(inputs={"text": "/unused"})
+        wda.active_element.return_value = "other"
+        with patch("openclaw_iphone.adaptive.read_input", return_value="exact"):
+            unfocused = actor.act({"op": "act", "action": "input", "instruction": "Input",
+                                   "text_ref": "text", "strategy": "sequential"})
+            self.assertEqual((unfocused["dispatch"], unfocused["validation_stage"]), ("not_sent", "input_focus"))
+            wda.type_text.assert_not_called()
+            def focus(reference, operation, **kwargs):
+                if operation == "click":
+                    wda.active_element.return_value = reference
+            wda.element_action.side_effect = focus
+            wda.type_text.side_effect = lambda value, **kwargs: setattr(wda.source, "return_value", source(value=value))
+            tapped = actor.act({"op": "act", "action": "tap", "instruction": "Input",
+                "target": {"role": "XCUIElementTypeTextField", "label": "Input"},
+                "after": [{"kind": "focused", "app": APP,
+                           "target": {"role": "XCUIElementTypeTextField", "label": "Input"}}]})
+            self.assertEqual((tapped["dispatch"], tapped["verification"]), ("acknowledged", "satisfied"))
+            typed = actor.act({"op": "act", "action": "input", "instruction": "Input",
+                               "text_ref": "text", "strategy": "sequential"})
+        self.assertEqual(typed["verification"], "satisfied")
+        wda.type_text.assert_called_once_with("exact", frequency=8)
+        self.assertEqual([call.args[1] for call in wda.element_action.call_args_list], ["click"])
+
+    def test_failed_or_unknown_explicit_focus_click_never_types(self):
+        for failure, dispatch in ((WDAUnavailable("click failed"), "not_sent"),
+                                  (WDAOutcomeUnknown("click unknown"), "unknown")):
+            with self.subTest(dispatch=dispatch):
+                actor, wda = make(inputs={"text": "/unused"})
+                wda.element_action.side_effect = failure
+                result = actor.act({"op": "act", "action": "tap", "instruction": "Input",
+                    "target": {"role": "XCUIElementTypeTextField", "label": "Input"},
+                    "after": [{"kind": "focused", "app": APP,
+                               "target": {"role": "XCUIElementTypeTextField", "label": "Input"}}]})
+                self.assertEqual(result["dispatch"], dispatch)
+                wda.type_text.assert_not_called()
+                if dispatch == "unknown":
+                    self.assertTrue(result["input_stopped"])
+
+    def test_oauth_handoff_scope_and_late_owner_only_reference(self):
+        consent_app = "test.consent"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "synthetic-input.txt"
+            scope = parse_scope({"apps": [APP, consent_app], "operations": ["tap", "input"],
+                                 "inputs": {"account": str(path)}})
+            ex, wda = executor([], xml=source().replace('value=""', ''))
+            actor = AdaptiveAct(ex, scope)
+            with self.assertRaises(ValueError):
+                actor.act({"op": "act", "action": "scroll", "instruction": "Not authorized", "direction": "down"})
+            with self.assertRaises(ValueError):
+                actor.act({"op": "act", "action": "input", "instruction": "Input", "text_ref": "new-reference"})
+            wda.element_action.assert_not_called()
+            def handoff(reference, operation, **kwargs):
+                if operation == "click":
+                    wda.active_app.return_value = {"bundleId": consent_app, "pid": 2}
+            wda.element_action.side_effect = handoff
+            result = actor.act({"op": "act", "action": "tap", "instruction": "Next",
+                                "after": [{"kind": "app", "app": consent_app}]})
+            self.assertEqual((result["dispatch"], result["verification"]), ("acknowledged", "satisfied"))
+            self.assertEqual(result["observation"].app, consent_app)
+            wda.active_app.return_value = {"bundleId": "unexpected.app", "pid": 3}
+            denied = actor.act({"op": "act", "action": "tap", "instruction": "Next"})
+            self.assertEqual(denied["dispatch"], "not_sent")
+            self.assertEqual(wda.element_action.call_count, 1)
+            wda.active_app.return_value = {"bundleId": consent_app, "pid": 2}
+            ex.observe()
+            path.write_text("synthetic-only")
+            path.chmod(0o600)
+            wda.element_value.side_effect = ["", "synthetic-only"]
+            typed = actor.act({"op": "act", "action": "input", "instruction": "Input",
+                               "text_ref": "account"})
+            self.assertEqual((typed["dispatch"], typed["verification"]), ("acknowledged", "satisfied"))
+            wda.element_action.assert_any_call("ref", "value", text="synthetic-only")
 
     def test_input_falls_back_to_native_value_when_xml_omits_it(self):
         actor, wda = make(inputs={"text": "/unused"})

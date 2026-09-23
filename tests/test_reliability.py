@@ -54,6 +54,13 @@ class ReconnectTests(unittest.TestCase):
             self.assertEqual(ctl.list_devices.call_count, 2)
             self.assertIs(ctl.runner.budget, previous)
 
+    def test_read_only_dormant_recheck_keeps_identity_without_unlock_probe(self):
+        ctl, _ = self.client()
+        self.assertEqual(ctl.select_device("physical", read_only=True).udid, "physical")
+        ctl.device_details.assert_called_once_with("core")
+        self.assertEqual(ctl.list_devices.call_count, 2)
+        ctl.require_unlocked.assert_not_called()
+
     def test_never_wakes_name_auto_missing_udid_or_ambiguous_identity(self):
         for kind in ("name", "auto", "missing_udid", "duplicate"):
             ctl, device = self.client()
@@ -427,6 +434,49 @@ class SessionIntegrationTests(unittest.TestCase):
     def spec(self):
         return parse_task({"version": 1, "objective": "Synthetic observation", "grants": [],
                            "success": [{"kind": "app", "app": APP}]})
+
+    def test_ui_observe_skips_acquisition_lock_probes_but_task_stays_gated(self):
+        for lock_response in (b'{"value":true}', b'{"value":null}'):
+            with self.subTest(lock_response=lock_response):
+                ctl, wda = self.transport()
+                ctl.require_unlocked.side_effect = DeviceLocked("CoreDevice locked")
+                original_send = wda._send.side_effect
+                def send(path, **kwargs):
+                    return lock_response if path == "/wda/locked" else original_send(path, **kwargs)
+                wda._send.side_effect = send
+                args = cli.build_parser().parse_args(["ui", "observe"])
+                with tempfile.TemporaryDirectory() as tmp, \
+                     patch("openclaw_iphone.cli.client_from_args", return_value=ctl), \
+                     patch("openclaw_iphone.cli.load_config", return_value=IPhoneConfig({})), \
+                     patch("openclaw_iphone.connection.WDAClient", return_value=wda), \
+                     patch("openclaw_iphone.connection.control_lock", side_effect=lambda _: control_lock(Path(tmp) / "lock")), \
+                     contextlib.redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(cli.handle_ui_observe(args), 0)
+                    self.assertEqual(json.loads(output.getvalue())["app"], APP)
+                    self.assertFalse(any(c.args[0] == "/wda/locked" for c in wda._send.call_args_list))
+                    ctl.require_unlocked.assert_not_called()
+                    with self.assertRaises(DeviceLocked):
+                        with TaskConnection(ctl, lock_path=Path(tmp) / "lock"):
+                            pass
+                ctl.select_device.assert_any_call(None, read_only=True)
+
+    def test_ui_observe_unavailable_source_fails_without_mutation(self):
+        ctl, wda = self.transport()
+        original_send = wda._send.side_effect
+        def send(path, **kwargs):
+            if path.startswith("/source?"):
+                raise WDAUnavailable("source unavailable")
+            return original_send(path, **kwargs)
+        wda._send.side_effect = send
+        args = cli.build_parser().parse_args(["ui", "observe"])
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch("openclaw_iphone.cli.client_from_args", return_value=ctl), \
+             patch("openclaw_iphone.cli.load_config", return_value=IPhoneConfig({})), \
+             patch("openclaw_iphone.connection.WDAClient", return_value=wda), \
+             patch("openclaw_iphone.connection.control_lock", side_effect=lambda _: control_lock(Path(tmp) / "lock")):
+            with self.assertRaises(WDAUnavailable):
+                cli.handle_ui_observe(args)
+        self.assertFalse(any(c.args[0].endswith("/actions") for c in wda._send.call_args_list))
 
     def test_unknown_cleanup_does_not_mask_unknown_action_outcome(self):
         wda = WDAClient(url="http://wda.test")
