@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import os
+import json
 from pathlib import Path
 import plistlib
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -14,9 +16,41 @@ REPO = Path(__file__).resolve().parents[1]
 
 class LaunchdInstallerTests(unittest.TestCase):
     def test_wda_wrapper_allows_supported_python_override(self) -> None:
-        wrapper = (REPO / "snippets/launchd/openclaw-iphone-wda-run.sh").read_text(encoding="utf-8")
-        self.assertIn('IPHONE_PYTHON="${OPENCLAW_IPHONE_PYTHON:-python3}"', wrapper)
-        self.assertIn('"$IPHONE_PYTHON" -m openclaw_iphone wda run', wrapper)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            interpreter = root / "python with spaces"
+            interpreter.write_text(
+                f"#!{sys.executable}\n"
+                "import json, os, sys\n"
+                "from pathlib import Path\n"
+                "with Path(os.environ['IPHONE_AUDIT_CALLS']).open('a') as stream:\n"
+                "    stream.write(json.dumps({'argv': sys.argv[1:], 'cwd': os.getcwd(),\n"
+                "        'source': os.environ.get('SCRIPT_REPO_DIR'),\n"
+                "        'pythonpath': os.environ.get('PYTHONPATH')}) + '\\n')\n"
+                "if sys.argv[1:] == ['-']:\n"
+                "    sys.stdin.read()\n"
+                "    print(os.environ['IPHONE_AUDIT_REPO'])\n"
+                "    sys.exit(0)\n"
+                "sys.exit(37)\n", encoding="utf-8")
+            interpreter.chmod(0o700)
+            configured = root / "configured repo"
+            configured.mkdir()
+            for selected_repo in (configured, REPO):
+                with self.subTest(repo=selected_repo):
+                    calls = root / ("configured.jsonl" if selected_repo == configured else "fallback.jsonl")
+                    env = dict(os.environ, OPENCLAW_IPHONE_PYTHON=str(interpreter),
+                               IPHONE_AUDIT_CALLS=str(calls),
+                               IPHONE_AUDIT_REPO=str(configured) if selected_repo == configured else "",
+                               PYTHONPATH="existing-path")
+                    result = subprocess.run(["sh", str(REPO / "snippets/launchd/openclaw-iphone-wda-run.sh")],
+                                            cwd=root, env=env, capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 37, result.stderr)
+                    probe, execution = [json.loads(line) for line in calls.read_text().splitlines()]
+                    self.assertEqual(probe["argv"], ["-"])
+                    self.assertEqual(probe["source"], str(REPO))
+                    self.assertEqual(execution["argv"], ["-m", "openclaw_iphone", "wda", "run", "--allow-provisioning-updates"])
+                    self.assertEqual(execution["cwd"], str(selected_repo))
+                    self.assertEqual(execution["pythonpath"], f"{selected_repo}/src:existing-path")
 
     def run_installer(self, script: str, *, home: Path, config: Path, interval: str | None = None) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()

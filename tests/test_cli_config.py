@@ -78,34 +78,6 @@ class LockFailingWDA(FakeWDA):
 
 
 class CLIConfigTests(unittest.TestCase):
-    def test_runtime_provenance_reports_configured_paths_without_process_claims(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "repo"
-            source = root / "src/openclaw_iphone/cli.py"
-            source.parent.mkdir(parents=True)
-            source.write_text("# synthetic\n", encoding="utf-8")
-            wda = root / "WebDriverAgent"
-            wda.mkdir()
-            plist = Path(tmp) / "com.openclaw.iphone-wda-run.plist"
-            wrapper = root / "snippets/launchd/openclaw-iphone-wda-run.sh"
-            wrapper.parent.mkdir(parents=True)
-            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
-            with plist.open("wb") as stream:
-                plistlib.dump({
-                    "ProgramArguments": [str(wrapper)],
-                    "WorkingDirectory": str(root),
-                }, stream)
-            result = cli.runtime_provenance(
-                IPhoneConfig({
-                    "OPENCLAW_IPHONE_REPO_DIR": str(root),
-                    "OPENCLAW_IPHONE_WDA_PATH": str(wda),
-                }), source_file=source, launchd_plist=plist,
-            )
-        self.assertEqual(result["source-repo"], "match")
-        self.assertEqual(result["wda-path"], "present")
-        self.assertIn("(match)", result["launchd-wrapper"])
-        self.assertIn("(match)", result["launchd-working-directory"])
-
     def test_wda_backed_commands_accept_device_override(self) -> None:
         parser = cli.build_parser()
 
@@ -408,14 +380,50 @@ class CLIConfigTests(unittest.TestCase):
             timeout=30,
         )
 
-        with mock.patch.dict("os.environ", {}, clear=True):
-            with mock.patch("openclaw_iphone.cli.client_from_args", return_value=fake_device):
-                with mock.patch("openclaw_iphone.cli.WDAClient", return_value=fake_wda):
-                    with mock.patch("openclaw_iphone.cli.load_config", return_value=IPhoneConfig({})):
-                        with contextlib.redirect_stdout(io.StringIO()):
-                            result = cli.handle_doctor(args)
-
-        self.assertEqual(result, 0)
+        repo = Path(cli.__file__).resolve().parents[2]
+        for case in ("match", "different", "missing", "unreadable", "not-configured", "missing-wda"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                home = Path(tmp).resolve()
+                configured = home / "other-repo" if case == "different" else repo
+                wda = home / "WebDriverAgent"
+                if case != "missing-wda":
+                    wda.mkdir()
+                plist = home / "Library/LaunchAgents/com.openclaw.iphone-wda-run.plist"
+                plist.parent.mkdir(parents=True)
+                if case == "unreadable":
+                    plist.write_bytes(b"invalid plist")
+                elif case != "missing":
+                    with plist.open("wb") as stream:
+                        plistlib.dump({"ProgramArguments": [str(repo / "snippets/launchd/openclaw-iphone-wda-run.sh")],
+                                      "WorkingDirectory": str(repo), "UnrelatedSecret": "PRIVATE-PLIST"}, stream)
+                config = IPhoneConfig({} if case == "not-configured" else {
+                    "OPENCLAW_IPHONE_REPO_DIR": str(configured), "OPENCLAW_IPHONE_WDA_PATH": str(wda)})
+                output = io.StringIO()
+                with mock.patch.dict("os.environ", {}, clear=True), \
+                     mock.patch("openclaw_iphone.cli.Path.home", return_value=home), \
+                     mock.patch("openclaw_iphone.cli.client_from_args", return_value=fake_device), \
+                     mock.patch("openclaw_iphone.cli.WDAClient", return_value=fake_wda), \
+                     mock.patch("openclaw_iphone.cli.load_config", return_value=config), \
+                     mock.patch("subprocess.run", side_effect=AssertionError("doctor must not probe processes")), \
+                     contextlib.redirect_stdout(output):
+                    self.assertEqual(cli.handle_doctor(args), 0)
+                text = output.getvalue()
+                self.assertIn("result: ok", text)
+                self.assertIn("runtime-source: " + str(Path(cli.__file__).resolve()), text)
+                self.assertIn("source-repo: " + ("not-configured" if case == "not-configured" else
+                              "different" if case == "different" else "match"), text)
+                self.assertIn("wda-path: " + ("absent" if case == "not-configured" else
+                              "missing" if case == "missing-wda" else "present"), text)
+                if case in {"missing", "unreadable"}:
+                    self.assertIn("launchd-wrapper: absent", text)
+                    self.assertIn("launchd-plist: " + ("absent" if case == "missing" else str(plist) + " (unreadable)"), text)
+                else:
+                    relation = "configured" if case == "not-configured" else "different" if case == "different" else "match"
+                    self.assertIn(f"launchd-wrapper: {repo}/snippets/launchd/openclaw-iphone-wda-run.sh ({relation})", text)
+                    self.assertIn(f"launchd-working-directory: {repo} ({relation})", text)
+                self.assertNotIn("PRIVATE-PLIST", text)
+                self.assertNotIn("runtime-pid:", text)
+                self.assertNotIn("running-process:", text)
 
     def test_doctor_reports_attention_required_for_unknown_lock_state(self) -> None:
         fake_device = FakeDeviceCtl(lock_state_payload={"result": {"passcodeRequired": "unknown"}})

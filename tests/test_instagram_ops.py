@@ -373,8 +373,9 @@ class InstagramOpsTests(unittest.TestCase):
                 super().open_url(url)
                 if "tag?name=" in url:
                     self.source_text = """<XCUIElementTypeApplication bundleId="com.burbn.instagram" name="Instagram" label="Instagram">
-                      <XCUIElementTypeCell name="media-discovery-cell" label="Video by prenatal.creator media-discovery-cell" visible="true" x="0" y="161" width="215" height="286" />
-                      <XCUIElementTypeCell name="media-discovery-cell" label="Video by nausea.mama media-discovery-cell" visible="true" x="215" y="161" width="215" height="286" />
+                      <XCUIElementTypeCell name="media-discovery-cell" label="Video by aaa.unrelated media-discovery-cell" visible="true" x="0" y="448" width="215" height="286" />
+                      <XCUIElementTypeCell name="media-discovery-cell" label="Video by prenatal.creator Pregnancy media-discovery-cell" visible="true" x="0" y="161" width="215" height="286" />
+                      <XCUIElementTypeCell name="media-discovery-cell" label="Video by nausea.mama Pregnancy media-discovery-cell" visible="true" x="215" y="161" width="215" height="286" />
                     </XCUIElementTypeApplication>"""
                 elif "prenatal.creator" in url:
                     self.source_text = """<XCUIElementTypeApplication bundleId="com.burbn.instagram" name="Instagram" label="Instagram">
@@ -398,7 +399,7 @@ class InstagramOpsTests(unittest.TestCase):
                 client,  # type: ignore[arg-type]
                 output_dir=tmp,
                 scenarios=("pregnancy journey",),
-                max_candidates_per_scenario=2,
+                max_candidates_per_scenario=3,
                 source_deadline_seconds=30,
                 verify_top=2,
                 shortlist_size=1,
@@ -406,22 +407,27 @@ class InstagramOpsTests(unittest.TestCase):
 
             payload = json.loads(result.manifest.read_text(encoding="utf-8"))
             self.assertTrue(result.report.exists())
-            self.assertEqual(payload["summary"]["triage_candidates_found"], 2)
+            self.assertEqual(payload["summary"]["triage_candidates_found"], 3)
             self.assertEqual(payload["summary"]["verified_count"], 2)
             self.assertEqual(payload["summary"]["shortlist_count"], 1)
             self.assertEqual(payload["shortlisted_verified_creators"][0]["deep_link_verified"], True)
             self.assertEqual(payload["shortlisted_verified_creators"][0]["handle"], "prenatal.creator")
             deep_links = [call[1][0] for call in client.calls if "user?username=" in call[1][0]]
-            self.assertEqual(len(deep_links), 2)
+            self.assertEqual(deep_links, ["instagram://user?username=nausea.mama", "instagram://user?username=prenatal.creator"])
+            self.assertEqual([candidate["handle"] for candidate in payload["ranked_triage_candidates"]],
+                             ["nausea.mama", "prenatal.creator", "aaa.unrelated"])
+            self.assertEqual([candidate["handle"] for candidate in payload["unresolved_candidates_needing_manual_review"]],
+                             ["aaa.unrelated"])
 
     def test_benchmark_ranking_quality_compares_top_and_lower_ranked_samples(self) -> None:
         class RankingWDA(FakeWDA):
             def open_url(self, url: str) -> None:
                 super().open_url(url)
                 if "tag?name=" in url:
+                    self.comparison_credible = "trimesterpregnancy" in url
                     self.source_text = """<XCUIElementTypeApplication bundleId="com.burbn.instagram" name="Instagram" label="Instagram">
-                      <XCUIElementTypeCell name="media-discovery-cell" label="Video by prenatal.creator media-discovery-cell" visible="true" x="0" y="161" width="215" height="286" />
-                      <XCUIElementTypeCell name="media-discovery-cell" label="Video by nausea.mama media-discovery-cell" visible="true" x="215" y="161" width="215" height="286" />
+                      <XCUIElementTypeCell name="media-discovery-cell" label="Video by prenatal.creator Pregnancy media-discovery-cell" visible="true" x="0" y="161" width="215" height="286" />
+                      <XCUIElementTypeCell name="media-discovery-cell" label="Video by nausea.mama Pregnancy media-discovery-cell" visible="true" x="215" y="161" width="215" height="286" />
                       <XCUIElementTypeCell name="media-discovery-cell" label="Video by lower.rank media-discovery-cell" visible="true" x="0" y="448" width="215" height="286" />
                     </XCUIElementTypeApplication>"""
                 elif "prenatal.creator" in url:
@@ -441,13 +447,17 @@ class InstagramOpsTests(unittest.TestCase):
                       <XCUIElementTypeStaticText name="lower.rank" label="lower.rank" visible="true" x="52" y="29" width="118" height="104" />
                       <XCUIElementTypeButton name="user-detail-header-followers" value="55 thousand followers" visible="true" x="203" y="141" width="109" height="70" />
                     </XCUIElementTypeApplication>"""
+                    if self.comparison_credible:
+                        self.source_text = self.source_text.replace('</XCUIElementTypeApplication>',
+                            '<XCUIElementTypeLink name="user-detail-header-info-label" label="Pregnancy notes" '
+                            'visible="true" x="16" y="213" width="398" height="60" /></XCUIElementTypeApplication>')
 
         client = RankingWDA("")
         with tempfile.TemporaryDirectory() as tmp, patch("openclaw_iphone.instagram_ops.time.sleep", return_value=None):
             result = benchmark_ranking_quality(
                 client,  # type: ignore[arg-type]
                 output_dir=tmp,
-                themes=("pregnancy journey",),
+                themes=("pregnancy journey", "first trimester pregnancy nausea"),
                 candidates_per_theme=3,
                 verify_top=2,
                 comparison_size=1,
@@ -456,14 +466,28 @@ class InstagramOpsTests(unittest.TestCase):
 
             payload = json.loads(result.manifest.read_text(encoding="utf-8"))
             self.assertTrue(result.report.exists())
-            run = payload["runs"][0]
-            self.assertEqual(run["top_verified_count"], 2)
-            self.assertEqual(run["comparison_verified_count"], 1)
-            self.assertIn("top_precision", run)
-            self.assertIn("comparison_precision", run)
-            self.assertIn("failure_modes", run)
-            self.assertEqual(payload["summary"]["runs"], 1)
-            self.assertIn("failure_modes", payload["summary"])
+            self.assertEqual(len(payload["runs"]), 2)
+            for run, comparison_precision, failures in zip(payload["runs"], (0.0, 1.0), (
+                    ["top_yield_below_target"], ["top_yield_below_target", "top_precision_not_above_comparison"])):
+                self.assertEqual((run["top_verified_count"], run["top_credible_count"], run["top_precision"]), (2, 2, 1.0))
+                self.assertEqual((run["comparison_verified_count"], run["comparison_credible_count"], run["comparison_precision"]),
+                                 (1, int(comparison_precision), comparison_precision))
+                self.assertEqual(run["failure_modes"], failures)
+                self.assertFalse(run["passed_yield_target"])
+                self.assertEqual([candidate["handle"] for candidate in run["top_verified"]], ["nausea.mama", "prenatal.creator"])
+                self.assertEqual([candidate["handle"] for candidate in run["comparison_verified"]], ["lower.rank"])
+            summary = payload["summary"]
+            self.assertEqual({key: summary[key] for key in (
+                "runs", "top_verified_count", "top_credible_count", "top_precision", "comparison_verified_count",
+                "comparison_credible_count", "comparison_precision", "ranking_lift_vs_comparison", "failure_modes",
+                "runs_with_at_least_5_credible_top_leads", "pass_rate", "target_passed")}, {
+                "runs": 2, "top_verified_count": 4, "top_credible_count": 4, "top_precision": 1.0,
+                "comparison_verified_count": 2, "comparison_credible_count": 1, "comparison_precision": 0.5,
+                "ranking_lift_vs_comparison": 0.5, "failure_modes": {"top_yield_below_target": 2, "top_precision_not_above_comparison": 1},
+                "runs_with_at_least_5_credible_top_leads": 0, "pass_rate": 0.0, "target_passed": False})
+            self.assertEqual([call[1][0] for call in client.calls if "user?username=" in call[1][0]], [
+                "instagram://user?username=nausea.mama", "instagram://user?username=prenatal.creator",
+                "instagram://user?username=lower.rank"] * 2)
 
 
 if __name__ == "__main__":

@@ -46,15 +46,20 @@ class PlannerDiagnosticsTests(unittest.TestCase):
         return {"status": "observed"}
 
     def test_invalid_request_still_has_diagnostics_without_echo(self):
-        session, _ = self.session(Mock())
-        replies = []
-        self.assertEqual(serve(session, iter([b'{"op":"observe","op":"PRIVATE"}']), replies.append), 1)
-        self.assertEqual(len(replies), 1)
-        self.assertEqual(replies[0]["reason"], "invalid_request")
-        self.assertEqual(replies[0]["request_sequence"], 1)
-        self.assertEqual(replies[0]["timing"]["transport_event_start"], 0)
-        self.assertNotIn("PRIVATE", str(replies))
-        session.request.assert_not_called()
+        for raw in (b'{"op":"observe","op":"PRIVATE"}', b'{"op":"shell","command":"PRIVATE"}',
+                    b'{"op":"observe","op":"close"}', b'{"op":["PRIVATE"]}'):
+            with self.subTest(raw=raw):
+                probe = TransportProbe()
+                session = PlannerSession(probe.ex, TaskSpec("Validate protocol", (), ()))
+                replies = []
+                self.assertEqual(serve(session, iter([raw]), replies.append), 1)
+                self.assertEqual(len(replies), 1)
+                self.assertEqual({key: replies[0][key] for key in ("status", "reason", "request_sequence")},
+                                 {"status": "blocked", "reason": "invalid_request", "request_sequence": 1})
+                self.assertEqual(replies[0]["timing"]["transport_event_start"], 0)
+                self.assertIn("handling_seconds", replies[0]["timing"])
+                self.assertNotIn("PRIVATE", str(replies))
+                self.assertEqual(probe.calls, [])  # Malformed/forbidden commands cannot read or mutate.
 
     def test_rejections_are_content_free_and_do_not_invent_dispatch_state(self):
         for supplied, expected in (("snapshot_expired", "snapshot_expired"),

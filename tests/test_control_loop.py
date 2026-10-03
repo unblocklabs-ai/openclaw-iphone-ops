@@ -39,6 +39,8 @@ class TransportProbe:
         self.value, self.button = "", "Next"
         self.app, self.pid = APP, 1
         self.calls = []
+        self.requests = []
+        self.value_reads = []
         self.locators = []
         self.missing_value = missing_value
         self.screen_error = False
@@ -53,6 +55,7 @@ class TransportProbe:
 
     def send(self, path, *, method, payload, timeout):
         self.calls.append((method, path, timeout))
+        self.requests.append((method, path, payload))
         if path.startswith("/source?"):
             if self.screen_error:
                 raise WDAUnavailable("synthetic AX failure")
@@ -65,11 +68,17 @@ class TransportProbe:
             query = payload["value"]
             elements = snapshot(self.xml()).elements
             if payload["using"] == "predicate string":
-                from openclaw_iphone.observations import Selector
-                selected = [e for e in elements if e.visible is True and
-                    (e.locator() == ("predicate string", query) or any(
-                        Selector(e.role, name=name, label=label).locator() == ("predicate string", query)
-                        for name in (None, e.name or None) for label in (None, e.label or None)))]
+                # Only this fixture's equality conjunctions are supported. Do not
+                # use the production locator builder as the matching oracle.
+                terms = [term.split(" == ", 1) for term in query.split(" AND ")]
+                selected = []
+                for element in elements:
+                    attributes = {"type": element.role, "name": element.name, "label": element.label,
+                                  "visible": int(element.visible is True), "enabled": int(element.enabled is True)}
+                    if element.bounds:
+                        attributes.update(zip(("rect.x", "rect.y", "rect.width", "rect.height"), element.bounds))
+                    if all(attributes[key] == json.loads(value) for key, value in terms):
+                        selected.append(element)
             elif query.startswith("//XCUIElementTypeTextField[@visible="):
                 selected = [e for e in elements if e.matches(FIELD)]
             else:
@@ -78,7 +87,9 @@ class TransportProbe:
             value = [{"ELEMENT": "ref" if e.role != "XCUIElementTypeKey" else f"key{e.name}"} for e in selected]
         elif path.endswith("/attribute/hittable"): value = True
         elif path.endswith("/element/active"): value = {"ELEMENT": "ref"}
-        elif path.endswith("/attribute/value"): value = self.value
+        elif path.endswith("/attribute/value"):
+            value = self.value
+            self.value_reads.append((path, value))
         elif path.endswith("/attribute/placeholderValue"): value = "Input"
         elif path.endswith("/window/size"): value = {"width": 400, "height": 800}
         elif path == "/screenshot": return png()
@@ -94,6 +105,8 @@ class TransportProbe:
     def warm(self):
         self.ex.observe()
         self.calls.clear()
+        self.requests.clear()
+        self.value_reads.clear()
 
 
 class ControlLoopTests(unittest.TestCase):
@@ -123,7 +136,7 @@ class ControlLoopTests(unittest.TestCase):
         with patch("openclaw_iphone.adaptive.read_input", return_value="121212"):
             result = p.actor.act({"op": "act", "action": "input", "instruction": "Input", "text_ref": "text"})
         self.assertEqual(result["verification"], "satisfied")
-        self.assertEqual(result["readback"]["observed_characters"], 6)
+        self.assertEqual((result["readback"]["matches"], result["readback"]["observed_characters"]), (True, 6))
         self.assertEqual([path.split("?", 1)[0] for _, path, _ in p.calls[-2:]], ["/source", "/wda/activeAppInfo"])
         p.calls.clear()
         self.assertEqual(p.actor.act({"op": "act", "action": "tap", "instruction": "Next"})["dispatch"], "acknowledged")
@@ -136,9 +149,14 @@ class ControlLoopTests(unittest.TestCase):
         with patch("openclaw_iphone.adaptive.read_input", return_value="121212"):
             result = p.actor.act({"op": "act", "action": "input", "instruction": "Input", "text_ref": "text"})
         self.assertEqual(result["verification"], "satisfied")
+        self.assertEqual((result["readback"]["matches"], result["readback"]["observed_characters"]), (True, 6))
         self.assertEqual(sum(path.startswith("/source?") for _, path, _ in p.calls), 1)
         self.assertEqual(sum(path.endswith("/elements") for _, path, _ in p.calls), 1)
         self.assertEqual(sum(path.endswith("/attribute/value") for _, path, _ in p.calls), 2)
+        self.assertEqual(p.value_reads, [("/session/audit/element/ref/attribute/value", ""),
+                                        ("/session/audit/element/ref/attribute/value", "121212")])
+        self.assertEqual([request for request in p.requests if request[1].endswith("/value") and request[0] == "POST"],
+                         [("POST", "/session/audit/element/ref/value", {"value": ["121212"]})])
 
     def test_tree_mismatch_keeps_input_pending_until_read_only_reconcile(self):
         p = TransportProbe()
@@ -154,11 +172,18 @@ class ControlLoopTests(unittest.TestCase):
         self.assertEqual((result["dispatch"], result["verification"], result["input_pending"]),
                          ("acknowledged", "unsatisfied", True))
         self.assertEqual(result["readback"]["observed_characters"], 3)
+        self.assertFalse(result["readback"]["matches"])
+        self.assertFalse(p.ex.stopped)
         self.assertEqual(sum(path.endswith("/attribute/value") for _, path, _ in p.calls), 2)
-        self.assertEqual(p.actor.act({"op": "act", "action": "tap", "instruction": "Next"})["dispatch"], "not_sent")
+        calls_before = list(p.calls)
+        blocked = p.actor.act({"op": "act", "action": "tap", "instruction": "Next"})
+        self.assertEqual((blocked["dispatch"], blocked["reason"]), ("not_sent", "input_requires_reconciliation"))
+        self.assertEqual(p.calls, calls_before)
         p.value = "121212"
         p.calls.clear()
-        self.assertEqual(p.actor.reconcile()["verification"], "satisfied")
+        result = p.actor.reconcile()
+        self.assertEqual(result["verification"], "satisfied")
+        self.assertEqual(p.value_reads[-1], ("/session/audit/element/ref/attribute/value", "121212"))
         self.assertIsNone(p.actor.pending_input)
         self.assertEqual(sum(path.endswith("/value") and method == "POST" for method, path, _ in p.calls), 0)
 
@@ -309,6 +334,8 @@ class ControlLoopTests(unittest.TestCase):
             with self.subTest(operation=operation):
                 grant = Grant(operation, APP, "Input", FIELD, text_id="text")
                 p = TransportProbe((grant,))
+                if operation == "replace":
+                    p.value = "old"
                 offer, = p.ex.offers(p.ex.observe())
                 p.calls.clear()
                 result = p.ex.execute(offer.id)
@@ -316,6 +343,14 @@ class ControlLoopTests(unittest.TestCase):
                 self.assertEqual(len(p.calls), count)
                 self.assertEqual(sum(path.startswith("/source?") for _, path, _ in p.calls), 1)
                 self.assertIsNotNone(p.ex.latest.elements)
+                if operation == "replace":
+                    self.assertEqual(result.acknowledged_substeps, 2)
+                    self.assertEqual([request for request in p.requests if "/element/ref/" in request[1]], [
+                        ("POST", "/session/audit/element/ref/clear", {}),
+                        ("GET", "/session/audit/element/ref/attribute/value", None),
+                        ("POST", "/session/audit/element/ref/value", {"value": ["121212"]})])
+                    self.assertEqual(p.value_reads, [("/session/audit/element/ref/attribute/value", "")])
+                    self.assertEqual(p.ex.latest.unique(FIELD).value, "121212")
                 self.assertEqual(p.ex.execute(offer.id).dispatch, "not_sent")
 
     def test_two_steps_reuse_post_observation_and_done_reuses_success(self):

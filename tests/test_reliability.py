@@ -332,17 +332,6 @@ class PlannerTests(unittest.TestCase):
         session, _ = self.make()
         self.assertEqual(session.request({"op": "close"})["verification"], "unknown")
 
-    def test_stream_rejects_commands_duplicate_keys_and_never_echoes_input(self):
-        for raw in (b'{"op":"shell","command":"SECRET"}', b'{"op":"observe","op":"close"}', b'{"op":[]}'):
-            session, wda = self.make()
-            replies = []
-            self.assertEqual(serve(session, iter([raw]), replies.append), 1)
-            self.assertEqual(len(replies), 1)
-            self.assertEqual({key: replies[0][key] for key in ("status", "reason", "request_sequence")},
-                             {"status": "blocked", "reason": "invalid_request", "request_sequence": 1})
-            self.assertIn("handling_seconds", replies[0]["timing"])
-            wda.source.assert_not_called()
-
     def test_idle_partial_line_and_action_request_limits(self):
         reader, writer = os.pipe()
         try:
@@ -481,17 +470,6 @@ class SessionIntegrationTests(unittest.TestCase):
             with self.assertRaises(WDAUnavailable):
                 cli.handle_ui_observe(args)
         self.assertFalse(any(c.args[0].endswith("/actions") for c in wda._send.call_args_list))
-
-    def test_unknown_cleanup_does_not_mask_unknown_action_outcome(self):
-        wda = WDAClient(url="http://wda.test")
-        wda._create_session = Mock(return_value="one")
-        wda._delete_session = Mock(side_effect=WDAOutcomeUnknown("cleanup transport failed"))
-        wda._json_post = Mock(return_value={"value": None})
-        with self.assertRaises(WDAOutcomeUnknown) as action:
-            with wda.session():
-                raise WDAOutcomeUnknown("action transport failed")
-        self.assertEqual(str(action.exception), "action transport failed")
-        self.assertTrue(wda._session.cleanup_failed)
 
     def test_three_observations_share_setup_session_and_cleanup(self):
         counts = []
