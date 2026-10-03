@@ -708,8 +708,7 @@ def handle_doctor(args: argparse.Namespace) -> int:
     return 0 if healthy else 1
 
 
-def runtime_provenance(config: IPhoneConfig, *, source_file: Path | None = None,
-                       launchd_plist: Path | None = None) -> dict[str, str]:
+def runtime_provenance(config: IPhoneConfig) -> dict[str, str]:
     """Report source/config/runner paths without claiming process provenance.
 
     A doctor invocation may use an editable checkout while launchd runs an
@@ -717,12 +716,12 @@ def runtime_provenance(config: IPhoneConfig, *, source_file: Path | None = None,
     paths and plist metadata only; it never reads a running process command
     line or prints plist contents that could contain unrelated settings.
     """
-    source = (source_file or Path(__file__)).resolve()
+    source = Path(__file__).resolve()
     configured_repo = config.get("OPENCLAW_IPHONE_REPO_DIR")
     repo_path = Path(configured_repo).expanduser().resolve() if configured_repo else None
     configured_wda = config.get("OPENCLAW_IPHONE_WDA_PATH")
     wda_path = Path(configured_wda).expanduser().resolve() if configured_wda else None
-    plist_path = launchd_plist or (Path.home() / "Library/LaunchAgents/com.openclaw.iphone-wda-run.plist")
+    plist_path = Path.home() / "Library/LaunchAgents/com.openclaw.iphone-wda-run.plist"
 
     def relation(path: Path | None, root: Path | None) -> str:
         if path is None:

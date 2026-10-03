@@ -5,9 +5,11 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from openclaw_iphone.errors import WDASetupError, WDAUnavailable, WDAUnsupportedCommand
 from openclaw_iphone.observations import parse_observation
+from openclaw_iphone.ui import UIController
 from openclaw_iphone.wda import WDAClient, WDARunConfig, build_xcodebuild_command, find_xcode_container, parse_ready
 
 
@@ -32,15 +34,14 @@ class RecordingWDAClient(WDAClient):
     def locked(self) -> bool:
         return False
 
-    def _json_post(self, path: str, payload: dict) -> dict:
-        self.posts.append((path, payload))
-        if path == "/session":
-            return {"sessionId": "session-123", "value": {}}
-        return {"value": None}
-
-    def _request(self, path: str, *, method: str = "GET", payload: dict | None = None) -> bytes:
-        self.requests.append((method, path, payload))
-        return b'{"value": null}'
+    def _send(self, path: str, *, method: str, payload: dict | None, timeout: float) -> bytes:
+        if method == "POST":
+            self.posts.append((path, payload))
+            if path == "/session":
+                return b'{"sessionId":"session-123","value":{}}'
+        else:
+            self.requests.append((method, path, payload))
+        return b'{"value":null}'
 
 
 class SelectiveFailingBackWDAClient(RecordingWDAClient):
@@ -188,7 +189,7 @@ class WDATests(unittest.TestCase):
     def test_tap_posts_w3c_touch_action_and_deletes_session(self) -> None:
         client = RecordingWDAClient()
 
-        client.tap(12.5, 44)
+        self.assertIsNone(UIController(client).tap(12.5, 44))
 
         self.assertEqual(client.posts[0], ("/session", {"capabilities": {"alwaysMatch": {}, "firstMatch": [{}]}}))
         self.assertEqual(
@@ -217,7 +218,10 @@ class WDATests(unittest.TestCase):
     def test_type_text_posts_w3c_key_actions_and_deletes_session(self) -> None:
         client = RecordingWDAClient()
 
-        client.type_text("hi")
+        with patch("openclaw_iphone.wda.time.monotonic", return_value=10), \
+             patch("openclaw_iphone.wda.time.sleep") as sleep:
+            self.assertIsNone(UIController(client).type_text("hé🙂", frequency=15))
+        self.assertEqual([call.args for call in sleep.call_args_list], [(1 / 15,), (1 / 15,)])
 
         self.assertEqual(client.posts[0], ("/session", {"capabilities": {"alwaysMatch": {}, "firstMatch": [{}]}}))
         self.assertEqual(
@@ -239,8 +243,10 @@ class WDATests(unittest.TestCase):
             ),
         )
         self.assertEqual(client.posts[3][1]["actions"][0]["actions"], [
-            {"type": "keyDown", "value": "i"}, {"type": "keyUp", "value": "i"}])
-        self.assertEqual(len(client.posts), 4)
+            {"type": "keyDown", "value": "é"}, {"type": "keyUp", "value": "é"}])
+        self.assertEqual(client.posts[4][1]["actions"][0]["actions"], [
+            {"type": "keyDown", "value": "🙂"}, {"type": "keyUp", "value": "🙂"}])
+        self.assertEqual(len(client.posts), 5)
         self.assertEqual(client.requests, [("DELETE", "/session/session-123", None)])
 
     def test_clear_text_clears_only_active_element(self) -> None:
@@ -255,16 +261,18 @@ class WDATests(unittest.TestCase):
     def test_press_button_posts_name_and_duration(self) -> None:
         client = RecordingWDAClient()
 
-        client.press_button("home", duration=0.2)
+        self.assertIsNone(UIController(client).press_button("home", duration=0.2))
 
         self.assertEqual(client.posts[2], ("/session/session-123/wda/pressButton", {"name": "home", "duration": 0.2}))
+        self.assertEqual(client.requests, [("DELETE", "/session/session-123", None)])
 
     def test_back_posts_wda_back(self) -> None:
         client = RecordingWDAClient()
 
-        client.back()
+        self.assertIsNone(UIController(client).back())
 
         self.assertEqual(client.posts, [("/wda/back", {})])
+        self.assertEqual(client.requests, [])  # No fallback/source or session after direct success.
 
     def test_back_falls_back_to_session_back(self) -> None:
         client = SelectiveFailingBackWDAClient(fail_wda_back=True, fail_session_back=False)
@@ -301,7 +309,7 @@ class WDATests(unittest.TestCase):
     def test_drag_posts_w3c_touch_action_and_deletes_session(self) -> None:
         client = RecordingWDAClient()
 
-        client.drag(10, 20, 30, 40, duration=0.4)
+        self.assertIsNone(UIController(client).drag(10, 20, 30, 40, duration=0.4))
 
         self.assertEqual(client.posts[0], ("/session", {"capabilities": {"alwaysMatch": {}, "firstMatch": [{}]}}))
         self.assertEqual(

@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock
 
-from openclaw_iphone.devicectl import App, Device, DeviceCtl, _app_from_json, _device_from_json, find_list, resolve_app, url_host
+from openclaw_iphone.devicectl import App, Device, DeviceCtl, _app_from_json, _device_from_json, find_list, url_host
 from openclaw_iphone.errors import AppNotFound, DeviceLocked
 
 
@@ -84,12 +84,16 @@ class DeviceCtlJsonTests(unittest.TestCase):
     def test_resolve_app_preserves_bundle_name_and_substring_precedence(self) -> None:
         apps = [App("Instagram", "com.burbn.instagram"), App("Instagram", "example.duplicate"),
                 App("Other", "example.instagrampreview")]
-        self.assertEqual(resolve_app(apps, "com.burbn.instagram", "phone"), apps[0])
+        client = DeviceCtl()
+        client.list_apps = Mock(return_value=(apps, Path("unused")))
+        self.assertEqual(client.find_app("phone", "com.burbn.instagram"), apps[0])
         with self.assertRaisesRegex(AppNotFound, "matched multiple apps"):
-            resolve_app(apps, "Instagram", "phone")
-        self.assertEqual(resolve_app(apps, "preview", "phone"), apps[2])
+            client.find_app("phone", "Instagram")
+        self.assertEqual(client.find_app("phone", "preview"), apps[2])
         with self.assertRaisesRegex(AppNotFound, "matched multiple apps"):
-            resolve_app(apps, "insta", "phone")
+            client.find_app("phone", "insta")
+        for call in client.list_apps.call_args_list:
+            self.assertEqual(call.args, ("phone",))
 
     def test_url_host_wraps_ipv6_for_urls(self) -> None:
         self.assertEqual(url_host("fdaa:8372:5daf::1"), "[fdaa:8372:5daf::1]")

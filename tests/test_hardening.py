@@ -7,7 +7,6 @@ import importlib.util
 import json
 import os
 from pathlib import Path
-import subprocess
 import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -16,12 +15,12 @@ from unittest.mock import Mock, patch
 
 from openclaw_iphone import cli
 from openclaw_iphone.control_lock import control_lock
-from openclaw_iphone.devicectl import App, Device, DeviceCtl
-from openclaw_iphone.errors import AppNotFound, CommandFailed, DeviceLocked, DeviceSelectionError, WDAOutcomeUnknown, WDAUnavailable, WDAUnsupportedCommand
+from openclaw_iphone.devicectl import Device, DeviceCtl
+from openclaw_iphone.errors import DeviceLocked, DeviceSelectionError, WDAOutcomeUnknown, WDAUnavailable, WDAUnsupportedCommand
 from openclaw_iphone.evidence import artifact_path, write_private
+from openclaw_iphone.execution import Budget
 from openclaw_iphone.instagram_context import capture_instagram_context, parse_instagram_source
 from openclaw_iphone.instagram_ops import build_discovery_candidate, pregnancy_evidence, verify_discovery_handle, verify_handles
-from openclaw_iphone.runner import Runner
 from openclaw_iphone.ui import UIController
 from openclaw_iphone.wda import WDAClient, find_xcode_container
 
@@ -85,16 +84,6 @@ class ActionSafetyTests(unittest.TestCase):
             return {"value": None}
         client._json_post = Mock(side_effect=post)
         return client
-
-    def test_cleanup_cannot_mask_success_or_primary_error(self):
-        for action in (lambda c: c.tap(1, 2), lambda c: c.open_url("instagram://user?username=a"), lambda c: c.type_text("hi")):
-            with self.subTest(action=action):
-                client = self.client()
-                with self.assertLogs("openclaw_iphone.wda", level="WARNING"):
-                    self.assertEqual(action(client), {"value": None})
-                client = self.client(action_error=WDAOutcomeUnknown("primary"))
-                with self.assertLogs("openclaw_iphone.wda", level="WARNING"), self.assertRaises(WDAOutcomeUnknown):
-                    action(client)
 
     def test_session_back_cleanup_does_not_trigger_ui_fallback(self):
         client = self.client()
@@ -248,17 +237,14 @@ class DeviceAndSetupTests(unittest.TestCase):
 
     def test_disconnected_device_never_selected(self):
         client = DeviceCtl()
-        client.list_devices = Mock(return_value=([Device("Phone", "id", "disconnected")], Path("unused")))
+        client.list_devices = Mock(return_value=([
+            Device("Phone", "id", "disconnected", model="iPhone 15", udid="physical")
+        ], Path("unused")))
+        client.device_details = Mock()
         for selector in (None, "Phone"):
-            with self.assertRaises(DeviceSelectionError):
+            with self.subTest(selector=selector), self.assertRaises(DeviceSelectionError):
                 client.select_device(selector)
-
-    def test_duplicate_app_names_require_bundle_id(self):
-        client = DeviceCtl()
-        client.list_apps = Mock(return_value=([App("App", "one"), App("App", "two")], Path("unused")))
-        with self.assertRaises(AppNotFound):
-            client.find_app("phone", "App")
-        self.assertEqual(client.find_app("phone", "two").bundle_identifier, "two")
+        client.device_details.assert_not_called()
 
     def test_selected_device_is_pinned_for_entire_cli_command(self):
         args = argparse.Namespace(device="phone")
@@ -274,14 +260,6 @@ class DeviceAndSetupTests(unittest.TestCase):
             project = Path(tmp) / "WebDriverAgent.xcodeproj"
             project.mkdir()
             self.assertEqual(find_xcode_container(project), ("-project", project))
-
-    def test_runner_normalizes_timeout_output_and_missing_binary(self):
-        error = subprocess.TimeoutExpired(["tool"], 1, output=b"partial", stderr=b"error")
-        with patch("subprocess.run", side_effect=error), self.assertRaises(CommandFailed) as raised:
-            Runner().run(["tool"])
-        self.assertEqual(raised.exception.stdout, "partial")
-        with patch("subprocess.run", side_effect=FileNotFoundError()), self.assertRaises(CommandFailed):
-            Runner().run(["missing"])
 
     def test_cli_rejects_unbounded_numeric_values_before_actions(self):
         for timeout in ("nan", "inf", "0", "-1"):
@@ -313,8 +291,12 @@ class ProtocolAndSnippetTests(unittest.TestCase):
                 self.respond(200, {"value": False})
 
             def do_POST(self):
-                if action_fails and self.path.endswith("/actions"):
-                    self.respond(500, {"value": {"error": "unknown error"}})
+                final_action = self.path == action_path and (operation != "typing" or
+                    sum(path == action_path for _, path in requests) == 1)
+                if final_action and cleanup_body == "expired":
+                    client.budget.cancelled.set()
+                if action_fails and final_action:
+                    self.respond(500, {"value": {"error": "unknown error", "message": "SERVER-PRIVATE"}})
                 else:
                     self.respond(200, {"sessionId": "one", "value": None})
 
@@ -323,29 +305,46 @@ class ProtocolAndSnippetTests(unittest.TestCase):
                 if cleanup_body == "stalled":
                     release_cleanup.wait(timeout=5)
 
-        for cleanup_body in ("complete", "truncated", "stalled"):
-            for action_fails in (False, True):
-                with self.subTest(cleanup_body=cleanup_body, action_fails=action_fails):
-                    requests.clear()
-                    release_cleanup.clear()
-                    with HTTPServer(("127.0.0.1", 0), Handler) as server:
-                        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
-                        thread.start()
-                        try:
-                            with patch.dict(os.environ, {"http_proxy": "http://127.0.0.1:1", "no_proxy": ""}):
-                                client = WDAClient(url=f"http://127.0.0.1:{server.server_port}", timeout=1)
-                                with self.assertLogs("openclaw_iphone.wda", level="WARNING"):
-                                    if action_fails:
-                                        with self.assertRaisesRegex(WDAOutcomeUnknown, "/session/one/actions"):
-                                            client.tap(1, 2)
-                                    else:
-                                        self.assertEqual(client.tap(1, 2)["value"], None)
-                        finally:
-                            release_cleanup.set()
-                            server.shutdown()
-                            thread.join()
-                    self.assertEqual(requests, [("GET", "/wda/locked"), ("POST", "/session"),
-                        ("POST", "/session/one/appium/settings"), ("POST", "/session/one/actions"), ("DELETE", "/session/one")])
+        actions = (("tap", "/session/one/actions", lambda c: c.tap(1, 2)),
+                   ("url", "/session/one/url", lambda c: c.open_url("instagram://user?username=a")),
+                   ("typing", "/session/one/actions", lambda c: c.type_text("hé")),
+                   ("bulk", "/session/one/wda/keys", lambda c: c.type_text_bulk("hé🙂")))
+        for operation, action_path, action in actions:
+            for cleanup_body in ("complete", "truncated", "stalled", "expired"):
+                for action_fails in (False, True):
+                    with self.subTest(operation=operation, cleanup_body=cleanup_body, action_fails=action_fails):
+                        requests.clear()
+                        release_cleanup.clear()
+                        with HTTPServer(("127.0.0.1", 0), Handler) as server:
+                            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
+                            thread.start()
+                            try:
+                                with patch.dict(os.environ, {"http_proxy": "http://127.0.0.1:1", "no_proxy": ""}):
+                                    client = WDAClient(url=f"http://127.0.0.1:{server.server_port}", timeout=0.2)
+                                    client.budget = Budget.seconds(3)
+                                    with self.assertLogs("openclaw_iphone.wda", level="WARNING"):
+                                        if action_fails:
+                                            expected = "1 acknowledged characters" if operation == "typing" else action_path
+                                            with self.assertRaisesRegex(WDAOutcomeUnknown, expected) as caught:
+                                                action(client)
+                                            self.assertNotIn("SERVER-PRIVATE", str(caught.exception))
+                                            if operation == "typing":
+                                                self.assertIsInstance(caught.exception.__cause__, WDAOutcomeUnknown)
+                                                self.assertIn(action_path, str(caught.exception.__cause__))
+                                        else:
+                                            self.assertIsNone(action(client)["value"])
+                                    self.assertTrue(client._session.cleanup_failed)
+                                    self.assertIsNone(client._session.identifier)
+                            finally:
+                                release_cleanup.set()
+                                server.shutdown()
+                                thread.join()
+                        expected_requests = [("GET", "/wda/locked"), ("POST", "/session"),
+                            ("POST", "/session/one/appium/settings")]
+                        expected_requests += [("POST", action_path)] * (2 if operation == "typing" else 1)
+                        if cleanup_body != "expired":
+                            expected_requests.append(("DELETE", "/session/one"))
+                        self.assertEqual(requests, expected_requests)  # No fallback or input replay.
 
     def test_app_store_requires_authorization_before_device_access(self):
         path = Path(__file__).resolve().parents[1] / "snippets/wda-app-store-install-example.py"

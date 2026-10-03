@@ -30,9 +30,6 @@ class FakeClient:
     def tap(self, x: float, y: float) -> None:
         self.calls.append(("tap", (x, y), {}))
 
-    def type_text(self, text: str, *, frequency: int | None = None) -> None:
-        self.calls.append(("type_text", (text,), {"frequency": frequency}))
-
     def clear_text(self) -> None:
         self.calls.append(("clear_text", (), {}))
 
@@ -47,12 +44,6 @@ class FakeClient:
 
     def element_action(self, reference, action):
         self.calls.append(("element_action", (reference, action), {}))
-
-    def press_button(self, name: str, *, duration: float | None = None) -> None:
-        self.calls.append(("press_button", (name,), {"duration": duration}))
-
-    def back(self) -> None:
-        self.calls.append(("back", (), {}))
 
     def drag(self, from_x: float, from_y: float, to_x: float, to_y: float, *, duration: float = 0.1) -> None:
         self.calls.append(("drag", (from_x, from_y, to_x, to_y), {"duration": duration}))
@@ -90,28 +81,6 @@ class UITests(unittest.TestCase):
             self.assertTrue(result.name.endswith("-wda-source.xml"))
             self.assertTrue(result.parent.name.startswith("openclaw-iphone-ops-"))
             self.assertEqual(result.read_text(encoding="utf-8"), "<App />")
-
-    def test_tap_delegates_to_client(self) -> None:
-        client = FakeClient()
-
-        UIController(client).tap(12, 34)  # type: ignore[arg-type]
-
-        self.assertEqual(client.calls, [("tap", (12, 34), {})])
-
-    def test_type_text_delegates_to_client(self) -> None:
-        client = FakeClient()
-
-        UIController(client).type_text("hello", frequency=15)  # type: ignore[arg-type]
-
-        self.assertEqual(client.calls, [("type_text", ("hello",), {"frequency": 15})])
-
-    def test_clear_field_delegates_to_focused_client_when_no_clear_button_exists(self) -> None:
-        client = FakeClient()
-
-        result = UIController(client).clear_field()  # type: ignore[arg-type]
-
-        self.assertIsNone(result)
-        self.assertEqual(client.calls, [("clear_text", (), {})])
 
     def test_clear_field_does_not_tap_unrelated_clear_button(self) -> None:
         source = """<XCUIElementTypeApplication>
@@ -164,27 +133,6 @@ class UITests(unittest.TestCase):
         self.assertEqual(element.type, "XCUIElementTypeTextView")
         client.source.assert_called_once()
         self.assertEqual(client.calls, [("element_action", ("field", "clear"), {})])
-
-    def test_press_button_delegates_to_client(self) -> None:
-        client = FakeClient()
-
-        UIController(client).press_button("home", duration=0.2)  # type: ignore[arg-type]
-
-        self.assertEqual(client.calls, [("press_button", ("home",), {"duration": 0.2})])
-
-    def test_drag_delegates_to_client(self) -> None:
-        client = FakeClient()
-
-        UIController(client).drag(1, 2, 3, 4, duration=0.3)  # type: ignore[arg-type]
-
-        self.assertEqual(client.calls, [("drag", (1, 2, 3, 4), {"duration": 0.3})])
-
-    def test_back_delegates_to_client(self) -> None:
-        client = FakeClient()
-
-        UIController(client).back()  # type: ignore[arg-type]
-
-        self.assertEqual(client.calls, [("back", (), {})])
 
     def test_back_falls_back_to_visible_back_button(self) -> None:
         source = """<XCUIElementTypeApplication>

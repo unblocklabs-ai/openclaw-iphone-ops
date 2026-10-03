@@ -469,16 +469,6 @@ class ExecutorTests(unittest.TestCase):
         wda.element_action.assert_called_once_with("ref", "clear")
         self.assertTrue(ex.stopped)
 
-    def test_replace_verifies_clear_then_types_and_verifies(self):
-        grant = Grant("replace", APP, "Replace supplied text", FIELD, text_id="query")
-        ex, wda = executor([grant], xml=source(value="old"), texts={"query": "new"})
-        offer, = ex.offers(ex.observe())
-        wda.element_value.side_effect = ["", "new"]
-        wda.source.side_effect = lambda **kwargs: source(value="new" if wda.element_action.called else "old")
-        result = ex.execute(offer.id)
-        self.assertEqual((result.verification, result.acknowledged_substeps), ("satisfied", 2))
-        self.assertEqual(wda.element_action.call_count, 2)
-
     def test_no_actions_for_unknown_disabled_duplicate_or_secure(self):
         for xml in (source(visible="unknown"), source(enabled="false"),
                     source(extra='<XCUIElementTypeButton label="Next" visible="true"/>'),

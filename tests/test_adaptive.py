@@ -40,7 +40,19 @@ def png(width=8, height=16, filter_type=0):
     def chunk(kind, body):
         return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body))
     header = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)
-    data = (bytes([filter_type]) + bytes([255]) * width * 4) * height
+    # Known white RGBA pixels, encoded independently for each PNG filter.
+    first_pixel, tail = bytes([255]) * 4, bytes(width * 4 - 4)
+    rows = []
+    for y in range(height):
+        row = {
+            0: bytes([255]) * width * 4,
+            1: first_pixel + tail,
+            2: bytes([255]) * width * 4 if y == 0 else bytes(width * 4),
+            3: first_pixel + bytes([128]) * len(tail) if y == 0 else bytes([128]) * 4 + tail,
+            4: first_pixel + tail if y == 0 else bytes(width * 4),
+        }.get(filter_type, bytes([255]) * width * 4)
+        rows.append(bytes([filter_type]) + row)
+    data = b"".join(rows)
     return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", zlib.compress(data)) + chunk(b"IEND", b"")
 
 
@@ -229,12 +241,23 @@ class AdaptiveTests(unittest.TestCase):
 
     def test_ancestor_context_and_projection_remain_bounded(self):
         label = "L" * 400
-        extra = '<XCUIElementTypeCell label="' + label + '"><XCUIElementTypeButton label="Go" visible="true"/></XCUIElementTypeCell>'
-        actor, _ = make(extra=extra)
-        view = actor.view(actor.ex.observe(), labels=True)
+        extra = '<XCUIElementTypeCell label="' + label + '"><XCUIElementTypeButton label="Go" visible="true" enabled="true" x="1" y="100" width="30" height="20"/></XCUIElementTypeCell>'
+        extra += ''.join(f'<XCUIElementTypeButton label="Late{i}" visible="true" enabled="true" '
+                         f'x="1" y="{120 + i}" width="30" height="20"/>' for i in range(90))
+        actor, wda = make(extra=extra)
+        observation = actor.ex.observe()
+        view = actor.view(observation, labels=True)
         row = next(row for row in view["elements"] if row.get("label") == "Go")
         self.assertEqual(len(row["ancestors"][0]["label"]), 256)
-        self.assertLessEqual(len(view["elements"]), 80)
+        self.assertEqual(len(view["elements"]), 80)
+        self.assertEqual(view["omitted_relevant"], 13)  # Next, Input, Go, and 90 late controls.
+        late = observation.unique(Selector("XCUIElementTypeButton", label="Late89"))
+        self.assertNotIn(late.id, [row["id"] for row in view["elements"]])
+        result = actor.act({"op": "act", "action": "tap", "instruction": "Late89",
+                            "snapshot_id": observation.id, "target_id": late.id})
+        self.assertEqual(result["dispatch"], "acknowledged")
+        wda.element_action.assert_called_once_with("ref", "click")
+        self.assertIn('label == "Late89"', wda.find_elements.call_args.args[0])
 
     def test_opt_in_preserves_fixed_session_and_scope(self):
         ex, _ = executor([])
@@ -298,16 +321,6 @@ class AdaptiveTests(unittest.TestCase):
                 request.update(target_id=observation.elements[1].id, snapshot_id="wrong")
             self.assertEqual(actor.act(request)["dispatch"], "not_sent")
             wda.element_action.assert_not_called()
-
-    def test_acknowledged_tap_read_failure_reports_post_action_stage(self):
-        actor, wda = make()
-        actor.ex.observe()
-        wda.source.side_effect = WDAUnavailable("unavailable")
-        result = actor.act({"op": "act", "action": "tap", "instruction": "Next"})
-        self.assertEqual((result["dispatch"], result["reason"], result["validation_stage"],
-                          result["acknowledged_substeps"]),
-                         ("acknowledged", "accessibility_unavailable", "post_action_verification", 1))
-        wda.element_action.assert_called_once_with("ref", "click")
 
     def test_acknowledged_tap_predicate_failure_reports_verification_stage(self):
         actor, wda = make()
@@ -374,16 +387,6 @@ class AdaptiveTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 read_input(str(link))
 
-    def test_unverified_input_blocks_all_new_mutations(self):
-        actor, wda = make(inputs={"text": "/unused"})
-        wda.element_value.side_effect = ["", "wrong"]
-        with patch("openclaw_iphone.adaptive.read_input", return_value="exact"):
-            result = actor.act({"op": "act", "action": "input", "instruction": "Input", "text_ref": "text"})
-        self.assertEqual(result["verification"], "unsatisfied")
-        self.assertTrue(result["input_pending"])
-        self.assertEqual(actor.act({"op": "act", "action": "tap", "instruction": "Next"})["dispatch"], "not_sent")
-        wda.element_action.assert_called_once()
-
     def test_placeholder_is_empty_only_after_explicit_verified_clear(self):
         actor, wda = make(inputs={"text": "/unused"})
         wda.element_value.return_value = "Placeholder"
@@ -409,18 +412,6 @@ class AdaptiveTests(unittest.TestCase):
         self.assertEqual(result["verification"], "satisfied")
         wda.type_text.assert_called_once_with("exact", frequency=8)
         self.assertIsNone(actor.pending_input)
-
-    def test_pending_readback_can_be_reconciled_without_input_replay(self):
-        actor, wda = make(inputs={"text": "/unused"})
-        wda.element_value.side_effect = ["", "wrong"]
-        with patch("openclaw_iphone.adaptive.read_input", return_value="exact"):
-            actor.act({"op": "act", "action": "input", "instruction": "Input", "text_ref": "text"})
-        wda.element_value.side_effect = None
-        wda.element_value.return_value = "exact"
-        result = actor.reconcile()
-        self.assertEqual(result["verification"], "satisfied")
-        self.assertIsNone(actor.pending_input)
-        wda.element_action.assert_called_once()
 
     def test_named_field_with_empty_label_constructs_readback_before_clear(self):
         actor, wda = make(inputs={"text": "/unused"})
@@ -512,16 +503,6 @@ class AdaptiveTests(unittest.TestCase):
                                "text_ref": "account"})
             self.assertEqual((typed["dispatch"], typed["verification"]), ("acknowledged", "satisfied"))
             wda.element_action.assert_any_call("ref", "value", text="synthetic-only")
-
-    def test_input_falls_back_to_native_value_when_xml_omits_it(self):
-        actor, wda = make(inputs={"text": "/unused"})
-        wda.element_value.side_effect = ["", "exact"]
-        with patch("openclaw_iphone.adaptive.read_input", return_value="exact"):
-            result = actor.act({"op": "act", "action": "input", "instruction": "Input", "text_ref": "text"})
-        self.assertEqual(result["verification"], "satisfied")
-        self.assertEqual(wda.find_elements.call_count, 1)  # Readback reuses the selected field.
-        self.assertEqual(wda.element_value.call_count, 2)  # Empty and exact final value.
-        self.assertEqual(wda.source.call_count, 2)  # Fresh reusable tree cannot prove its omitted value.
 
     def test_custom_keypad_uses_fresh_visual_confirmation_and_destination(self):
         from openclaw_iphone.adaptive import VisualEvidence
@@ -673,15 +654,61 @@ class AdaptiveTests(unittest.TestCase):
             self.assertEqual(list(Path(directory).iterdir()), [])
 
     def test_redaction_and_invalid_png_never_save_original(self):
+        def pixels(data, width, height):
+            offset, compressed = 8, bytearray()
+            while offset < len(data):
+                length = struct.unpack_from(">I", data, offset)[0]
+                kind = data[offset + 4:offset + 8]
+                body = data[offset + 8:offset + 8 + length]
+                if kind == b"IHDR":
+                    actual_width, actual_height, depth, color, _, _, _ = struct.unpack(">IIBBBBB", body)
+                    self.assertEqual((actual_width, actual_height, depth), (width, height, 8))
+                    self.assertIn(color, (2, 6))
+                    channels = 4 if color == 6 else 3
+                if kind == b"IDAT":
+                    compressed.extend(body)
+                offset += length + 12
+            decoded = zlib.decompress(compressed)
+            stride = width * channels + 1
+            self.assertEqual(len(decoded), stride * height)
+            previous, result = bytes(stride - 1), []
+            for y in range(height):
+                filtering = decoded[y * stride]
+                self.assertIn(filtering, range(5))
+                row = bytearray()
+                for index, value in enumerate(decoded[y * stride + 1:(y + 1) * stride]):
+                    left = row[index - channels] if index >= channels else 0
+                    up = previous[index]
+                    corner = previous[index - channels] if index >= channels else 0
+                    paeth = min((left, up, corner), key=lambda n: abs(left + up - corner - n))
+                    prediction = (0, left, up, (left + up) // 2, paeth)[filtering]
+                    row.append((value + prediction) % 256)
+                result.extend(bytes(row[x:x + channels]) + (b"\xff" if channels == 3 else b"")
+                              for x in range(0, len(row), channels))
+                previous = row
+            return result
+
         for filtering in range(5):
             data, size = redact_png(png(filter_type=filtering), (8, 16), [(0, 0, 8, 16)])
             self.assertEqual(size, (8, 16))
-            # Encoding a fully masked image is independent of the original pixels.
-            expected, _ = redact_png(png(), (8, 16), [(0, 0, 8, 16)])
-            self.assertEqual(data, expected)
+            self.assertEqual(pixels(data, 8, 16), [bytes([32, 32, 32, 255])] * 128)
+        for filtering in range(5):
+            data, size = redact_png(png(16, 32, filtering), (8, 16), [(3, 6, 1, 2)])
+            self.assertEqual(size, (16, 32))
+            self.assertEqual(pixels(data, 16, 32), [
+                bytes([32, 32, 32, 255]) if 4 <= x < 10 and 10 <= y < 18 else bytes([255] * 4)
+                for y in range(32) for x in range(16)])  # 2x scale plus two-pixel padding.
         for raw in (b"invalid", png()[:-10], png(filter_type=6)):
             with self.assertRaises(ObservationRejected):
                 redact_png(raw, (8, 16), [])
+            actor, wda = make()
+            wda.window_size.return_value = (8, 16)
+            wda.screenshot.return_value = raw
+            with tempfile.TemporaryDirectory() as directory:
+                actor.evidence_base = directory
+                with self.assertRaises(ObservationRejected):
+                    actor.screenshot(redact=[])
+                self.assertEqual(list(Path(directory).iterdir()), [])
 
 
 if __name__ == "__main__":

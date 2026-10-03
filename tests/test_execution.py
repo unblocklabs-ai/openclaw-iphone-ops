@@ -60,16 +60,6 @@ class TransportTests(unittest.TestCase):
         client._delete_session.assert_called_once_with("one")
         client._json_post.assert_any_call("/session/one/wda/keys", {"value": ["hé🙂"]})
 
-    def test_bulk_unknown_never_falls_back_and_cleanup_keeps_primary(self):
-        client = self.client()
-        client._json_post.side_effect = [{"value": None}, WDAOutcomeUnknown("primary")]
-        client._delete_session.side_effect = TaskStopped("expired")
-        with self.assertLogs("openclaw_iphone.wda"), self.assertRaisesRegex(WDAOutcomeUnknown, "primary"):
-            client.type_text_bulk("private")
-        client._json_post.assert_called_with("/session/one/wda/keys", {"value": ["private"]})
-        self.assertEqual(client._json_post.call_count, 2)
-        self.assertTrue(client._session.cleanup_failed)
-
     def test_cancel_between_characters_reports_partial_typing_and_never_replays(self):
         client = self.client()
         client.budget = Budget.seconds(3)
