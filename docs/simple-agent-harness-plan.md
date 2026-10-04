@@ -1,6 +1,6 @@
 # Simple iPhone agent harness
 
-Status: approved; local implementation, unreleased. Replaces the task/planner API.
+Status: implemented in v0.6.0. Replaces the task/planner API.
 
 ## Principle
 

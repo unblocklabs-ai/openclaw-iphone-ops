@@ -4,9 +4,9 @@ A small Python controller for a dedicated USB-connected physical iPhone.
 The agent plans and judges results; this package owns the phone connection and
 executes direct WebDriverAgent controls. No second model or runtime dependencies.
 
-**Unreleased interface change:** this checkout replaces `task`, `ui`, and
-`instagram` commands with `session`. Published v0.5.3 still has the old API;
-the version metadata has not been bumped or republished.
+**Breaking change in v0.6.0:** `session` replaces the `task`, `ui`, and
+`instagram` commands. Earlier versions use the retired API;
+see [migration notes](docs/session.md#migration).
 
 ## Use this checkout
 
@@ -66,10 +66,9 @@ Close the session before separate mutating commands.
 
 ## Distribution
 
-This is a CLI/skills bundle, not a native OpenClaw plugin. The existing published
-package is installable with `npm install -g @unblocklabs/openclaw-iphone-ops@0.5.3`,
-but **does not include this unreleased session interface**. A future release
-ships the CLI, skills, docs and snippets; register its `skills/` directory with
+This is a CLI/skills bundle, not a native OpenClaw plugin. Install v0.6.0 with
+`npm install -g @unblocklabs/openclaw-iphone-ops@0.6.0`.
+The package ships the CLI, skills, docs and snippets; register its `skills/` directory with
 the agent explicitly. The launcher supports `OPENCLAW_IPHONE_PYTHON` to select
 an absolute Python interpreter. Configuration/evidence belong outside the package.
 No installation sets up Xcode, WDA, signing or launchd services automatically.

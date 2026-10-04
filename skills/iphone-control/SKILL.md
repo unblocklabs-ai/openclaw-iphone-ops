@@ -6,8 +6,8 @@ description: Control or diagnose a USB-connected physical iPhone through one per
 # iPhone control
 
 Use the installed `openclaw-iphone`; check `--help` before assuming the host has
-the new `session` interface. This checkout's interface is unreleased; older
-v0.5.3 installs use the retired API. From this checkout, substitute
+the `session` interface (v0.6.0 or newer). Older installs use the retired API.
+From a source checkout, substitute
 `PYTHONPATH=src python3 -m openclaw_iphone`.
 
 Read [the session protocol](../../docs/session.md), then retain **one** `session`

@@ -5,7 +5,7 @@
 ## Change and proof
 
 Local checkpoint: `4cc5dcc` (direct session simplification). The subsequent
-screen-projection implementation is unreleased. This repository is still a
+screen-projection implementation was tested before inclusion in v0.6.0. This repository is still a
 thin controller: no model, planner, daemon, completion gate or write replay.
 
 Observations now project content and controls into a compact hierarchy with

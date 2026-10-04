@@ -1,8 +1,8 @@
 # Direct iPhone session (protocol 2)
 
-Start `openclaw-iphone session --device PHYSICAL_UDID`. In this unreleased
-checkout, use `PYTHONPATH=src python3 -m openclaw_iphone` instead of the installed
-CLI. Add `--allow-images` only when screenshot disclosure is appropriate.
+Requires v0.6.0 or newer. Start `openclaw-iphone session --device PHYSICAL_UDID`.
+From a source checkout, use `PYTHONPATH=src python3 -m openclaw_iphone` instead
+of the installed CLI. Add `--allow-images` only when screenshot disclosure is appropriate.
 Capture may contain private messages, credentials, or account information.
 
 The process emits `ready`, accepts newline-terminated JSON requests, returns one
