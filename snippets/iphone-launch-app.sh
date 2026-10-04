@@ -13,6 +13,6 @@ fi
 cd "$REPO_DIR"
 export PYTHONPATH="$REPO_DIR/src${PYTHONPATH:+:$PYTHONPATH}"
 if [ -n "${DEVICE_ID:-}" ]; then
-  exec python3 -m openclaw_iphone apps launch --device "$DEVICE_ID" "$BUNDLE_ID"
+  exec "${OPENCLAW_IPHONE_PYTHON:-python3}" -m openclaw_iphone apps launch --device "$DEVICE_ID" "$BUNDLE_ID"
 fi
-exec python3 -m openclaw_iphone apps launch "$BUNDLE_ID"
+exec "${OPENCLAW_IPHONE_PYTHON:-python3}" -m openclaw_iphone apps launch "$BUNDLE_ID"

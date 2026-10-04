@@ -22,7 +22,9 @@ def resolve_developer_dir(explicit: str | None = None) -> str | None:
             raise WDASetupError(f"Explicit developer directory does not contain devicectl: {explicit}")
         return explicit
     if os.environ.get("DEVELOPER_DIR"):
-        candidates.append(os.environ["DEVELOPER_DIR"])
+        configured = os.environ["DEVELOPER_DIR"]
+        if Path(configured, "usr/bin/devicectl").is_file():
+            return configured
 
     selected = selected_developer_dir()
     if selected:

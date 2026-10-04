@@ -4,9 +4,8 @@ The physical phone is the target. Simulator results do not establish App Store,
 Apple ID, USB or physical-device behavior.
 
 CoreDevice selects the phone by physical UDID and supplies the USB tunnel URL.
-A signed WebDriverAgentRunner stays running under the existing Xcode/launchd
-service. [One session](session.md) owns the control lock and reuses WDA. No new
-daemon or alternate phone backend is introduced.
+A signed WebDriverAgentRunner stays running under Xcode/launchd.
+[One session](session.md) owns the control lock and reuses WDA.
 
 WDA checks screen lock at the mutation boundary. Read-only acquisition and
 capture do not need an unlocked screen. A clear/type compound input shares one
@@ -17,7 +16,7 @@ replayed. Cleanup has its own bounded deadline, and cleanup failure does not
 change acknowledged input. Session close is lifecycle completion, not task proof.
 
 Configure Auto-Lock to Never only when device policy permits. An explicit
-`wda unlock --verify` or the existing watchdog can recover a screen lock only
+`wda unlock --verify` or the optional watchdog can recover a screen lock only
 when iOS does not require passcode, Face ID or another secure confirmation.
 Those hardware/security requirements cannot be removed by simplifying the harness.
 

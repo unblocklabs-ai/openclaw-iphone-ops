@@ -1,6 +1,7 @@
 # Direct iPhone session (protocol 2)
 
-Requires v0.6.0 or newer. Start `openclaw-iphone session --device PHYSICAL_UDID`.
+Start `openclaw-iphone session --device PHYSICAL_UDID`.
+Read `ready.capabilities` for supported optional operations.
 From a source checkout, use `PYTHONPATH=src python3 -m openclaw_iphone` instead
 of the installed CLI. Add `--allow-images` only when screenshot disclosure is appropriate.
 Capture may contain private messages, credentials, or account information.
@@ -23,10 +24,14 @@ Hold onto the process across the workflow. Don't recreate it after each step.
 {"op":"swipe","from_x":200,"from_y":700,"to_x":200,"to_y":250,"duration":0.2}
 {"op":"type","text":"hello","mode":"insert"}
 {"op":"type","text_ref":"/absolute/private/input.txt","mode":"replace","strategy":"native"}
+{"op":"type","text_ref":"/absolute/private/input.txt","mode":"replace","verify":true}
+{"op":"pick","target":{"role":"XCUIElementTypePickerWheel","label":"Month"},"value":"October"}
+{"op":"pick","target":"RETURNED_WHEEL_ID","value":"October","order":"next","max_steps":12,"seconds":5}
 {"op":"type","text":"hello","target":{"role":"XCUIElementTypeTextField","label":"Search"},"strategy":"sequential"}
 {"op":"press","button":"home"}
 {"op":"press","button":"enter"}
 {"op":"launch","bundle_id":"com.apple.mobilesafari","observe":"image"}
+{"op":"launch","bundle_id":"com.apple.mobilesafari","wait_seconds":2,"observe":"image"}
 {"op":"open_url","url":"https://example.com","observe":"accessibility"}
 {"op":"close"}
 ```
@@ -35,6 +40,8 @@ Hold onto the process across the workflow. Don't recreate it after each step.
   otherwise AX only. Explicit `mode` still selects either independently.
   `image` and coordinate `swipe`/`tap` do
   not require accessibility. `both` reports each component independently.
+  Combined capture is image-first so failed/slow AX cannot starve the image.
+  Each capture has its own timestamp; these are sequential, not atomic.
 - AX shows readable content and controls, including unnamed controls, their
   bounds, enabled/focus/selection state and short snapshot-local IDs. Empty
   layout wrappers and duplicate container text are collapsed. `parent` links
@@ -61,11 +68,37 @@ Hold onto the process across the workflow. Don't recreate it after each step.
   AX observation; they resolve current identity and ancestor context, not stored
   coordinates or value. New observations replace the ID map. Cross-app ID use
   is rejected; ordinary app transitions do not change session permissions.
+  Otherwise indistinguishable IDs use their exact captured hierarchy position,
+  not geometry. A same-app reorder can change positional intent: observe again
+  when the list changes. Named, unique controls still use semantic identity.
+  Ambiguity selects relevant matches and groups from the full snapshot before
+  paging. `candidate_page.next_offset` continues with
+  `{"op":"observe","candidates":true,"offset":NEXT_OFFSET}` without recapture.
 - `type` inserts by default. `replace` explicitly clears first. With no target,
   input goes to the focused field; callers are responsible for focus. Native
   input uses WDA keys or targeted value insertion. Explicit `sequential` uses
   individual key requests, focusing a supplied target first. It never falls
-  back, verifies a value, submits Return, or repeats failed input automatically.
+  back, submits Return, or repeats failed input automatically.
+- `verify: true` is optional and requires `mode: replace`: the expected value
+  is the supplied whole field, not an inferred append/caret position. Local
+  readback returns only `verification: match|mismatch|unknown`. Secure fields,
+  placeholders and unreadable custom fields return unknown. Readback failure
+  never changes acknowledged dispatch and never retypes the input.
+- `pick` requires one explicit native PickerWheel target and exact locale-specific
+  `value`. By default it tries native value selection once and reads back.
+  Optional `order: next|previous` instead performs at most `max_steps` native
+  wheel adjustments (1–50, default 10), checking after each. `offset` is the native
+  wheel offset (greater than 0, at most 0.5, default 0.15), NOT observation paging.
+  `seconds` bounds picker work (greater than 0, at most 30, default 5), also capped
+  by the operation deadline. `effect: match|mismatch|unknown` is separate from
+  dispatch. An already matching wheel sends no input. Unsupported routes are
+  reported; uncertain writes are never replayed or followed by blind swipes.
+  Set dependent day/month/year wheels deliberately; no date/locale guessing.
+- `launch.wait_seconds` optionally checks foreground identity within 0–30 seconds
+  after exactly one launch, then captures requested evidence. It returns
+  `readiness.state: ready|unknown` with checks/time. This proves foreground only,
+  not a fully loaded in-app screen. No blind sleep, repeated launch or global
+  idle gate. Unready/unknown leaves dispatch acknowledged.
 - Text is bounded to 4096 characters without control characters; use `press`
   for control keys. Hardware buttons: `home`, `volumeUp`, `volumeDown`, `siri`.
   Keyboard controls: `enter`, `delete` (backspace), `tab`, `escape`. `back` uses
@@ -91,24 +124,39 @@ Hold onto the process across the workflow. Don't recreate it after each step.
 Inspect before retrying uncertain input. The session never replays writes or
 permanently blocks subsequent deliberate requests. A safe read can reconnect
 and retry once per request on the same pinned physical UDID; another read may
-recover again. It never switches devices, unlocks, restarts WDA or broadens
+recover again. Source-specific deadlines, malformed AX and read protocol errors
+do not recreate the session. Genuine transport/session loss may reconnect. It
+never switches devices, unlocks, restarts WDA or broadens
 app/account permissions automatically. A changed physical identity rejects the
 request without dispatch.
 
 An optional observation failure is reported under the observation component
 (`image_error` / `accessibility_error`); it does not change action dispatch.
+Errors contain safe `category`/`phase`, never raw server or exception messages.
 Malformed JSON, duplicate keys, nonfinite numbers, invalid fields and oversized
 newline-framed requests produce `invalid_request` and leave the session open.
+Incomplete frames produce `framing_error` and end ownership safely.
+
+Every reply includes content-free `timing`: start/end, elapsed, route counts/time
+and reconnects. `session_end` includes final acquisition/request/cleanup totals.
+No payloads, element/session IDs, raw errors, labels or URLs enter telemetry.
+Use these to distinguish device costs from caller decision/approval gaps;
+they do not measure model reasoning. Consume complete replies promptly, avoid
+empty polling, and render returned images directly if the host tool permits it.
 
 ## Ownership, limits and privacy
 
-- One exclusive control lock for the whole session. Existing service wrappers
-  remain unchanged. Other tools outside this package aren't coordinated by it.
+- One exclusive control lock for the whole session. The watchdog and foreground
+  mutation commands use the same lock. Other tools outside this package aren't
+  coordinated by it.
+  A busy session reports advisory owner PID/start/last-activity/request count.
+  Live idle owners are never evicted; process exit releases the OS lock.
 - `--operation-timeout` defaults to 30 seconds. Global `--timeout` caps individual
   subprocess/WDA calls; `--read-timeout` defaults to 12 seconds. Each operation
   gets a fresh deadline; idle caller deliberation consumes none of it.
 - Gesture/button durations are at most ten seconds; long robot-side input is not
   made cancellable merely by limiting the host's HTTP wait.
+  Swipe duration is movement time (minimum 100ms), with no equal-length hold.
 - Cancellation is process interruption (Ctrl-C/SIGINT), which releases ownership.
   Inspect before retrying any interrupted action.
 - Requests are at most 4 KiB; partial/nonterminated frames expire after five
@@ -124,12 +172,7 @@ newline-framed requests produce `invalid_request` and leave the session open.
   completion. Cleanup failure is an independent warning. Setup, framing,
   interruption, or output failure exits nonzero.
 
-## Migration
-
-Remove task files, grants, goal predicates, Jev settings and `--explore` flags.
-Replace `ui`/`task` commands with the operations above. Instagram-specific
-research/ranking/video commands are retired; app knowledge now lives in the
-Instagram skill and the caller's workflow. No legacy compatibility engine remains.
+## Validation boundaries
 
 Offline loopback tests prove protocol behavior, not physical reliability,
 WebView accessibility, coordinate accuracy, or performance. Use an approved,

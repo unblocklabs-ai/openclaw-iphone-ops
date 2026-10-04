@@ -10,5 +10,5 @@ export PYTHONPATH="$REPO_DIR/src${PYTHONPATH:+:$PYTHONPATH}"
 if [ -n "${WDA_URL:-}" ]; then
   export OPENCLAW_IPHONE_WDA_URL="$WDA_URL"
 fi
-python3 -m openclaw_iphone doctor --check-ui
+"${OPENCLAW_IPHONE_PYTHON:-python3}" -m openclaw_iphone doctor --check-ui
 echo "WDA smoke check completed."

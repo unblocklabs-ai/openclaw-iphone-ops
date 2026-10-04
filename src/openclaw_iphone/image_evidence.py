@@ -76,10 +76,16 @@ def redact_png(raw: bytes, device_size: tuple, regions: list) -> tuple[bytes, tu
         rows.append(row)
         previous = row
     for x, y, w, h in regions:
-        left = max(0, math.floor(x * width / device_size[0]) - 2)
-        top = max(0, math.floor(y * height / device_size[1]) - 2)
-        right = min(width, math.ceil((x + w) * width / device_size[0]) + 2)
-        bottom = min(height, math.ceil((y + h) * height / device_size[1]) + 2)
+        # Clip in device space BEFORE scaling or adding huge finite numbers.
+        # A region beyond the screen is empty, not a post-dispatch overflow.
+        if x >= device_size[0] or y >= device_size[1]:
+            continue
+        right_edge = x + min(w, device_size[0] - x)
+        bottom_edge = y + min(h, device_size[1] - y)
+        left = max(0, math.floor(x / device_size[0] * width) - 2)
+        top = max(0, math.floor(y / device_size[1] * height) - 2)
+        right = min(width, math.ceil(right_edge / device_size[0] * width) + 2)
+        bottom = min(height, math.ceil(bottom_edge / device_size[1] * height) + 2)
         if right <= left or bottom <= top:
             continue
         fill = bytes([32, 32, 32] + ([255] if channels == 4 else [])) * (right - left)

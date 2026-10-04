@@ -26,7 +26,6 @@ class ReconnectTests(unittest.TestCase):
             ctl.runner.budget = previous
             def probe(identifier):
                 self.assertLessEqual(ctl.runner.budget.deadline, previous.deadline)
-                self.assertIs(ctl.runner.budget.cancelled, previous.cancelled)
                 return {"result": {"hardwareProperties": {"udid": "physical"}}}, None
             ctl.device_details.side_effect = probe
             self.assertEqual(ctl.select_device(selector).udid, "physical")

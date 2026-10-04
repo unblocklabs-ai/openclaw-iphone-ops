@@ -11,7 +11,7 @@ resolve_openclaw_device_id() {
   repo_dir="$1"
 
   OPENCLAW_IPHONE_REPO_DIR_FOR_SNIPPET="$repo_dir" \
-    PYTHONPATH="$repo_dir/src${PYTHONPATH:+:$PYTHONPATH}" python3 - <<'PY'
+    PYTHONPATH="$repo_dir/src${PYTHONPATH:+:$PYTHONPATH}" "${OPENCLAW_IPHONE_PYTHON:-python3}" - <<'PY'
 from pathlib import Path
 import os
 

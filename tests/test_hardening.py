@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import tempfile
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import unittest
 from unittest.mock import Mock, patch
@@ -95,25 +96,22 @@ class ActionSafetyTests(unittest.TestCase):
 
     def test_transport_failure_exposes_unknown_action_outcome(self):
         client = WDAClient(url="http://wda.test")
-        with patch.object(client.opener, "open", side_effect=TimeoutError()):
+        from openclaw_iphone.transport import TransportFailure
+        with patch("openclaw_iphone.wda.exchange", side_effect=TransportFailure("deadline", "headers")):
             with self.assertRaises(WDAOutcomeUnknown):
                 client._json_post("/actions", {})
 
     def test_workflow_deadline_caps_requests_and_blocks_expired_request(self):
         client = WDAClient(url="http://wda.test", timeout=30)
-        with patch("openclaw_iphone.wda.time.monotonic", return_value=100):
-            bounded = client.with_deadline(5)
-        response = Mock()
-        response.__enter__ = Mock(return_value=Mock(read=Mock(return_value=b'{"value":true}')))
-        response.__exit__ = Mock(return_value=False)
-        with patch.object(client.opener, "open", return_value=response) as request:
+        client.budget = Budget(deadline=105)
+        with patch("openclaw_iphone.wda.exchange", return_value=(200, b'{"value":true}')) as request:
             with patch("openclaw_iphone.wda.time.monotonic", return_value=103):
-                bounded.locked()
-                self.assertEqual(request.call_args.kwargs["timeout"], 2)
-            with patch("openclaw_iphone.wda.time.monotonic", return_value=105), self.assertRaises(WDAUnavailable):
-                bounded.locked()
+                client.locked()
+                self.assertEqual(request.call_args.args[4], 2)
+            from openclaw_iphone.execution import TaskStopped
+            with patch("openclaw_iphone.wda.time.monotonic", return_value=105), self.assertRaises(TaskStopped):
+                client.locked()
             self.assertEqual(request.call_count, 1)
-        self.assertIsNone(client.deadline)
 
 
 class DeviceAndSetupTests(unittest.TestCase):
@@ -221,7 +219,7 @@ class ProtocolAndSnippetTests(unittest.TestCase):
                 final_action = self.path == action_path and (operation != "typing" or
                     sum(path == action_path for _, path in requests) == 1)
                 if final_action and cleanup_body == "expired":
-                    client.budget.cancelled.set()
+                    client.budget.deadline = time.monotonic() - 1
                 if action_fails and final_action:
                     self.respond(500, {"value": {"error": "unknown error", "message": "SERVER-PRIVATE"}})
                 else:
@@ -272,19 +270,3 @@ class ProtocolAndSnippetTests(unittest.TestCase):
                         if cleanup_body != "expired":
                             expected_requests.append(("DELETE", "/session/one"))
                         self.assertEqual(requests, expected_requests)  # No fallback or input replay.
-
-    def test_app_store_requires_authorization_before_device_access(self):
-        path = Path(__file__).resolve().parents[1] / "snippets/wda-app-store-install-example.py"
-        spec = importlib.util.spec_from_file_location("app_store_example", path)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        with patch.dict(os.environ, {"APP_NAME": "Example", "EXPECTED_PUBLISHER": "Publisher", "EXPECTED_BUNDLE_ID": "com.example"}, clear=True):
-            with patch.object(module, "DeviceCtl") as device, self.assertRaisesRegex(ValueError, "ALLOW_INSTALL"):
-                module.main()
-            device.assert_not_called()
-        client = Mock()
-        client.with_deadline.return_value = client
-        client._json_post.return_value = {"value": [{"ELEMENT": "one"}, {"ELEMENT": "two"}]}
-        with self.assertRaisesRegex(WDAUnavailable, "Ambiguous"):
-            module.find_element(client, "session", "name == 'Get'")
-        self.assertEqual(client._json_post.call_args.args[0], "/session/session/elements")

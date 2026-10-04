@@ -48,27 +48,16 @@ class DeviceCtl:
         self.evidence_base = evidence_base
 
     def list_devices(self) -> tuple[list[Device], Path]:
-        output = artifact_path("devices", base=self.evidence_base)
-        self.runner.run(["xcrun", "devicectl", "list", "devices", "--json-output", str(output)])
-        data = read_json(output)
+        data, output = self._json(["list", "devices"], "devices")
         devices = [_device_from_json(item) for item in find_list(data, "devices")]
         return devices, output
 
     def device_details(self, device_id: str) -> tuple[dict[str, Any], Path]:
-        output = artifact_path("device-details", base=self.evidence_base)
-        self.runner.run(
-            [
-                "xcrun",
-                "devicectl",
-                "device",
-                "info",
-                "details",
-                "--device",
-                device_id,
-                "--json-output",
-                str(output),
-            ]
-        )
+        return self._json(["device", "info", "details", "--device", device_id], "device-details")
+
+    def _json(self, arguments: list[str], name: str) -> tuple[dict[str, Any], Path]:
+        output = artifact_path(name, base=self.evidence_base)
+        self.runner.run(["xcrun", "devicectl", *arguments, "--json-output", str(output)])
         return read_json(output), output
 
     def coredevice_wda_url(self, device_id: str, *, port: int = 8100) -> tuple[str, Path]:
@@ -138,7 +127,6 @@ class DeviceCtl:
         budget = Budget.seconds(min(10, self.runner.timeout))
         if previous is not None:
             budget.deadline = min(budget.deadline, previous.deadline)
-            budget.cancelled = previous.cancelled
         self.runner.budget = budget
         try:
             details, _ = self.device_details(original.identifier)
@@ -158,21 +146,7 @@ class DeviceCtl:
             self.runner.budget = previous
 
     def lock_state(self, device_id: str) -> tuple[dict[str, Any], Path]:
-        output = artifact_path("lock-state", base=self.evidence_base)
-        self.runner.run(
-            [
-                "xcrun",
-                "devicectl",
-                "device",
-                "info",
-                "lockState",
-                "--device",
-                device_id,
-                "--json-output",
-                str(output),
-            ]
-        )
-        return read_json(output), output
+        return self._json(["device", "info", "lockState", "--device", device_id], "lock-state")
 
     def require_unlocked(self, device_id: str) -> Path:
         data, output = self.lock_state(device_id)
@@ -193,10 +167,7 @@ class DeviceCtl:
         )
 
     def list_apps(self, device_id: str, *, include_all: bool = True) -> tuple[list[App], Path]:
-        output = artifact_path("apps", base=self.evidence_base)
         command = [
-            "xcrun",
-            "devicectl",
             "device",
             "info",
             "apps",
@@ -205,9 +176,7 @@ class DeviceCtl:
         ]
         if include_all:
             command.append("--include-all-apps")
-        command.extend(["--json-output", str(output)])
-        self.runner.run(command)
-        data = read_json(output)
+        data, output = self._json(command, "apps")
         apps = [_app_from_json(item) for item in find_list(data, "apps")]
         return apps, output
 

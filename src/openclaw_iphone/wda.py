@@ -2,26 +2,22 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from contextlib import contextmanager
-from copy import copy
 import base64
 import binascii
 import json
-import http.client
 import logging
 import math
 import os
 import re
 from pathlib import Path
-import socket
 import time
 from typing import Any, Iterator
 from xml.etree import ElementTree as ET
-import urllib.error
 import urllib.parse
-import urllib.request
 
-from .errors import DeviceLocked, WDAOutcomeUnknown, WDASetupError, WDAStaleElement, WDAUnavailable, WDAUnsupportedCommand
+from .errors import DeviceLocked, WDAOutcomeUnknown, WDASetupError, WDAStaleElement, WDAUnavailable, WDAUnsupportedCommand, WDAReadUnavailable, WDATransportUnavailable
 from .execution import Budget, Metrics, TaskStopped
+from .transport import exchange, TransportFailure
 from .xcode import resolve_developer_dir
 
 
@@ -36,11 +32,6 @@ class WDAStatus:
     url: str
     payload: dict[str, Any]
     ready: bool | None
-
-    @property
-    def reachable(self) -> bool:
-        return True
-
 
 @dataclass
 class SessionState:
@@ -64,22 +55,10 @@ class WDAClient:
         if not math.isfinite(read_timeout) or read_timeout <= 0:
             raise ValueError("Screen read timeout must be finite and positive.")
         self.read_timeout = read_timeout
-        self.deadline: float | None = None
         self.budget: Budget | None = None
         self.metrics = Metrics()
         self._session = SessionState()
         self._input_checked = False
-        # Device control must not traverse a host HTTP proxy or follow redirects.
-        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
-
-    def with_deadline(self, seconds: float | None) -> WDAClient:
-        client = copy(self)
-        if seconds is not None:
-            if not math.isfinite(seconds) or seconds <= 0:
-                raise ValueError("Workflow deadline must be finite and positive.")
-            deadline = time.monotonic() + seconds
-            client.deadline = min(self.deadline, deadline) if self.deadline is not None else deadline
-        return client
 
     def status(self) -> WDAStatus:
         payload = self._json_request("/status")
@@ -88,7 +67,7 @@ class WDAClient:
     def is_ready(self) -> bool:
         return self.status().ready is True
 
-    def source(self, *, compact: bool = False) -> str:
+    def source(self, *, compact: bool = False, validate: bool = True) -> str:
         path = ("/source?format=xml&excluded_attributes="
                 "accessible,nativeAccessibilityElement,index,placeholderValue,traits,"
                 "nativeFrame,minValue,maxValue,customActions,type") if compact else "/source"
@@ -100,10 +79,13 @@ class WDAClient:
             if isinstance(value, str):
                 body = value.encode("utf-8")
         source = body.decode("utf-8", errors="replace")
-        try:
-            ET.fromstring(source)
-        except ET.ParseError as exc:
-            raise WDAUnavailable("WDA source was not valid accessibility XML.") from exc
+        if len(body) > 2_000_000 or "<!DOCTYPE" in source or "<!ENTITY" in source:
+            raise WDAReadUnavailable("Accessibility source exceeds parsing limits.", category="source_limits", phase="accessibility")
+        if validate:
+            try:
+                ET.fromstring(source)
+            except ET.ParseError as exc:
+                raise WDAReadUnavailable("WDA source was not valid accessibility XML.", category="invalid_xml", phase="accessibility") from exc
         return source
 
     def screenshot(self) -> bytes:
@@ -264,11 +246,6 @@ class WDAClient:
         with self.session() as session_id:
             return element_identifier(self._json_request(f"/session/{session_id}/element/active").get("value"))
 
-    def element_hittable(self, element_id: str) -> bool:
-        with self.session() as session_id:
-            path = f"/session/{session_id}/element/{urllib.parse.quote(element_id, safe='')}/attribute/hittable"
-            return self._json_request(path).get("value") is True
-
     def window_size(self) -> tuple[float, float]:
         with self.session() as session_id:
             value = self._json_request(f"/session/{session_id}/window/size").get("value")
@@ -301,15 +278,20 @@ class WDAClient:
             value = self._json_request(path).get("value")
         return value if isinstance(value, str) and value else None
 
-    def element_scroll(self, element_id: str, direction: str) -> dict[str, Any]:
-        if direction not in {"up", "down"}:
-            raise ValueError("Unsupported scroll direction.")
+    def element_type(self, element_id: str) -> str:
+        with self.session() as session_id:
+            path = f"/session/{session_id}/element/{urllib.parse.quote(element_id, safe='')}/attribute/type"
+            value = self._json_request(path).get("value")
+        if not isinstance(value, str):
+            raise WDAReadUnavailable("Native element type unavailable.")
+        return value
+
+    def picker_step(self, element_id: str, order: str, *, offset: float) -> dict[str, Any]:
         self.require_unlocked()
         with self.session() as session_id:
-            path = f"/session/{session_id}/wda/element/{urllib.parse.quote(element_id, safe='')}/swipe"
-            # Content scrolls opposite the finger. WDA's scroll route holds the
-            # press and can select text; native swipe is one gesture on this element.
-            return self._json_post(path, {"direction": "up" if direction == "down" else "down"})
+            path = f"/session/{session_id}/wda/pickerwheel/{urllib.parse.quote(element_id, safe='')}/select"
+            # One native adjustment, never WDA's unbounded/default 25-attempt loop.
+            return self._json_post(path, {"order": order, "offset": offset, "maxAttempts": 1})
 
     def element_action(self, element_id: str, action: str, *, text: str = "") -> dict[str, Any]:
         """Targeted click, clear or caret-based input; callers own authorization."""
@@ -323,12 +305,8 @@ class WDAClient:
     def clear_text(self) -> dict[str, Any]:
         self.require_unlocked()
         with self.session() as session_id:
-            active = self._json_request(f"/session/{session_id}/element/active")
-            value = active.get("value")
-            element_id = (value.get("element-6066-11e4-a52e-4f735466cecf") or value.get("ELEMENT")) if isinstance(value, dict) else None
-            if not isinstance(element_id, str) or not element_id:
-                raise WDAUnavailable("No active editable element was identified; focus the intended field first.")
-            return self._json_post(f"/session/{session_id}/element/{element_id}/clear", {})
+            element_id = self.active_element()
+            return self._json_post(f"/session/{session_id}/element/{urllib.parse.quote(element_id, safe='')}/clear", {})
 
     def _perform_session_actions(self, actions: list[dict[str, Any]]) -> dict[str, Any]:
         self.require_unlocked()
@@ -408,7 +386,6 @@ class WDAClient:
                     "actions": [
                         {"type": "pointerMove", "duration": 0, "x": from_x, "y": from_y},
                         {"type": "pointerDown", "button": 0},
-                        {"type": "pause", "duration": duration_ms},
                         {"type": "pointerMove", "duration": move_ms, "x": to_x, "y": to_y},
                         {"type": "pointerUp", "button": 0},
                     ],
@@ -420,7 +397,7 @@ class WDAClient:
         body = self._request(path)
         parsed = parse_json_bytes(body)
         if not isinstance(parsed, dict):
-            raise WDAUnavailable(f"WDA {path} response was not a JSON object.")
+            raise WDAReadUnavailable(f"WDA {path} response was not a JSON object.", category="invalid_json", phase="response")
         check_response(parsed, path)
         return parsed
 
@@ -459,7 +436,7 @@ class WDAClient:
         timeout = self._request_timeout()
         if read_only_request(method, path):
             timeout = min(timeout, self.read_timeout)
-        route = re.sub(r"/(session|element)/(?!active(?:/|$))[^/]+", r"/\1/:id", path.split("?", 1)[0])
+        route = re.sub(r"/(session|element|pickerwheel)/(?!active(?:/|$))[^/]+", r"/\1/:id", path.split("?", 1)[0])
         with self.metrics.measure(f"wda {method} {route}"):
             return self._send(path, method=method, payload=payload, timeout=timeout)
 
@@ -467,45 +444,27 @@ class WDAClient:
         timeout = self.timeout
         if self.budget is not None:
             timeout = min(timeout, self.budget.remaining())
-        if self.deadline is not None:
-            remaining = self.deadline - time.monotonic()
-            if remaining <= 0:
-                raise WDAUnavailable("Workflow deadline expired before sending a WDA request.")
-            timeout = min(timeout, remaining)
         return timeout
 
     def _send(self, path: str, *, method: str, payload: dict[str, Any] | None, timeout: float) -> bytes:
-        data = None
-        headers = {}
-        if payload is not None:
-            data = json.dumps(payload).encode("utf-8")
-            headers["Content-Type"] = "application/json"
-        req = urllib.request.Request(f"{self.url}{path}", data=data, headers=headers, method=method)
+        data = json.dumps(payload).encode("utf-8") if payload is not None else None
+        read = read_only_request(method, path)
         try:
-            try:
-                resp = self.opener.open(req, timeout=timeout)
-            except urllib.error.HTTPError as exc:
-                # Error bodies can also time out or end early. Keep their reads
-                # inside the transport guard so cleanup cannot mask the action.
-                try:
-                    body = exc.read()
-                finally:
-                    exc.close()
-                parsed = parse_json_bytes(body)
-                if isinstance(parsed, dict):
-                    check_response(parsed, path, mutating=not read_only_request(method, path))
-                error = WDAUnavailable if read_only_request(method, path) else WDAOutcomeUnknown
-                raise error(f"WDA {method} {path} failed with HTTP {exc.code}. Inspect state before retrying.") from exc
-            with resp as response:
-                return response.read()
-        except (urllib.error.URLError, TimeoutError, socket.timeout, ConnectionError, http.client.HTTPException) as exc:
-            error = WDAUnavailable if read_only_request(method, path) else WDAOutcomeUnknown
-            raise error(f"WDA {method} {path} transport failed. Outcome unknown; inspect state before retrying.") from exc
-
-
-class NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
+            status, body = exchange(self.url, path, method, data, timeout,
+                max_bytes=40_000_000 if path == "/screenshot" else 2_100_000)
+        except TransportFailure as exc:
+            # A source deadline is lane-specific. A refused/reset socket is not.
+            failure = (WDAReadUnavailable if path.startswith("/source") and exc.category != "transport"
+                       else WDATransportUnavailable) if read else WDAOutcomeUnknown
+            raise failure(f"WDA {method} {path} failed; no automatic input replay.",
+                          category=exc.category, phase=exc.phase) from exc
+        if not 200 <= status < 300:
+            parsed = parse_json_bytes(body)
+            if isinstance(parsed, dict):
+                check_response(parsed, path, mutating=not read)
+            failure = WDAReadUnavailable if read else WDAOutcomeUnknown
+            raise failure(f"WDA {method} {path} returned HTTP {status}.", category="http_error", phase="response")
+        return body
 
 
 def read_only_request(method: str, path: str) -> bool:
@@ -527,10 +486,12 @@ def check_response(payload: dict[str, Any], path: str, *, mutating: bool = False
         raise WDAUnsupportedCommand(f"WDA {path}: command unsupported by this runner.")
     if not mutating and (error == "stale element reference" or status == 10):
         raise WDAStaleElement("Native element reference expired; only the read may be repeated.")
+    if not mutating and error == "invalid session id":
+        raise WDATransportUnavailable("Native session expired.", category="session_lost", phase="response")
     if error or status not in (None, 0):
         # Server messages can echo typed text, URLs or accessibility content.
-        failure = WDAOutcomeUnknown if mutating else WDAUnavailable
-        raise failure(f"WDA {path} returned a protocol error. Inspect state before retrying.")
+        failure = WDAOutcomeUnknown if mutating else WDAReadUnavailable
+        raise failure(f"WDA {path} returned a protocol error. Inspect state before retrying.", category="protocol_error", phase="response")
 
 
 @dataclass(frozen=True)

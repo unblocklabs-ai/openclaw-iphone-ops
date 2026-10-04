@@ -5,10 +5,10 @@ description: Control or diagnose a USB-connected physical iPhone through one per
 
 # iPhone control
 
-Use the installed `openclaw-iphone`; check `--help` before assuming the host has
-the `session` interface (v0.6.0 or newer). Older installs use the retired API.
-From a source checkout, substitute
-`PYTHONPATH=src python3 -m openclaw_iphone`.
+Use the installed `openclaw-iphone` and retain one `session` process.
+Read `ready.capabilities` for supported optional features. Use checkout
+commands only for explicitly requested development/testing, never as fallback
+when an installed operator workflow is inconvenient.
 
 Read [the session protocol](../../docs/session.md), then retain **one** `session`
 process and its pipes across requests. The agent chooses actions and judges
@@ -28,9 +28,22 @@ completion. No task file, grants, second model, quota or reconciliation step.
   owner-only `text_ref` files for credentials, never CLI arguments or logs.
 - Use `press`, `launch`, and `open_url` for ordinary transitions. Optional
   `observe` attaches the next view without changing acknowledged dispatch.
+- Where supported, use native `pick` for picker wheels rather than repeated
+  screenshot/swipe decisions. Supply exact locale-specific values; adjust
+  dependent date components deliberately. Native readback is separate from
+  acknowledgement, and bounds stop adjustment—not the agent's whole task.
+- Optional `launch.wait_seconds` checks foreground before capture. Optional
+  `type.verify` compares whole-field replacement privately, returning only
+  match/mismatch/unknown. Neither adds mandatory verification or blind retries.
 - Inspect unknown/partial outcomes before retrying. The session never replays
   writes; uncertainty does not block subsequent deliberate requests.
 - `close`/EOF releases ownership; exit 0 says nothing about task achievement.
+
+Read one complete reply promptly per request; avoid empty polling. Reuse its
+attached view and display image results directly when your tool supports it,
+instead of an extra inspection step. AX and image are independent, timestamped
+captures; select the useful modality. Route timing and safe phases explain
+failures without exposing text. Don't add a planner wrapper.
 
 Do not add status/doctor/screenshot/source chains before every action. Use
 `doctor --check-ui` after connection failures. Read recovery stays pinned to the

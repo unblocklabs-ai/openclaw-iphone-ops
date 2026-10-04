@@ -8,6 +8,6 @@ REPO_DIR="$(resolve_openclaw_repo_dir "$SCRIPT_DIR")"
 cd "$REPO_DIR"
 export PYTHONPATH="$REPO_DIR/src${PYTHONPATH:+:$PYTHONPATH}"
 if [ -n "${DEVICE_ID:-}" ]; then
-  exec python3 -m openclaw_iphone apps list --device "$DEVICE_ID"
+  exec "${OPENCLAW_IPHONE_PYTHON:-python3}" -m openclaw_iphone apps list --device "$DEVICE_ID"
 fi
-exec python3 -m openclaw_iphone apps list
+exec "${OPENCLAW_IPHONE_PYTHON:-python3}" -m openclaw_iphone apps list

@@ -25,6 +25,8 @@ class Connection:
         self.wda: WDAClient | None = None
         self.valid = False
         self.cleanup_failed = False
+        self.reconnects = 0
+        self.owner = None
         self._ownership = ExitStack()
         self._sessions = ExitStack()
         self._entered = False
@@ -33,7 +35,7 @@ class Connection:
         if self._entered:
             raise ValueError("Connections are single-use.")
         self._entered = True
-        self._ownership.enter_context(control_lock(self.lock_path))
+        self.owner = self._ownership.enter_context(control_lock(self.lock_path))
         previous = self.ctl.runner.budget, self.ctl.runner.metrics
         self._ownership.callback(self._restore_runner, *previous)
         self.ctl.runner.metrics = self.metrics
@@ -79,6 +81,7 @@ class Connection:
 
     def require_active(self) -> WDAClient:
         if not self.valid:
+            self.reconnects += 1
             self._close_session()
             if self.device is None:
                 raise WDAUnavailable("No pinned device.")
@@ -86,6 +89,14 @@ class Connection:
         if self.wda is None:
             raise WDAUnavailable("No active WDA session.")
         return self.wda
+
+    def touch(self, *, request: bool = False) -> None:
+        if self.owner:
+            try:
+                self.owner.touch(request=request)
+            except OSError:
+                # Advisory metadata must never hide an input acknowledgement.
+                pass
 
     def invalidate(self) -> None:
         self.valid = False
@@ -95,12 +106,12 @@ class Connection:
             self._sessions.close()
             return
         wda = self.wda
-        previous = wda.deadline, wda.budget
-        wda.deadline, wda.budget = time.monotonic() + 2, None
+        previous = wda.budget
+        wda.budget = Budget.seconds(2)
         try:
             self._sessions.close()
         finally:
-            wda.deadline, wda.budget = previous
+            wda.budget = previous
             self.cleanup_failed |= wda._session.cleanup_failed
 
     def __exit__(self, *args: object) -> None:

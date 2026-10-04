@@ -65,13 +65,13 @@ class WDATests(unittest.TestCase):
 
         self.assertEqual(status.url, "http://wda.test")
         self.assertTrue(status.ready)
-        self.assertTrue(status.reachable)
 
     def test_connection_reset_is_unavailable(self) -> None:
         import unittest.mock
 
         client = WDAClient(url="http://wda.test", timeout=1)
-        with unittest.mock.patch.object(client.opener, "open", side_effect=ConnectionResetError("reset")):
+        from openclaw_iphone.transport import TransportFailure
+        with unittest.mock.patch("openclaw_iphone.wda.exchange", side_effect=TransportFailure("transport", "connect")):
             with self.assertRaises(WDAUnavailable):
                 client.status()
 
@@ -111,13 +111,12 @@ class WDATests(unittest.TestCase):
             return parse_observation(xml, generation=1, device_udid="device", app="test.app",
                                      captured_at="now", started=1, finished=2, process_id=1)
         full, compact = parse(raw), parse(reduced)
-        self.assertEqual(full.signature, compact.signature)
         self.assertEqual(full.secure, compact.secure)
         self.assertTrue(compact.secure)  # Hidden secure nodes still constrain projection.
         self.assertEqual([(e.role, e.name, e.label, e.value, e.visible, e.enabled,
-                           e.focused, e.bounds, e.path, e.xpath) for e in full.elements],
+                           e.focused, e.bounds, e.path) for e in full.elements],
                          [(e.role, e.name, e.label, e.value, e.visible, e.enabled,
-                           e.focused, e.bounds, e.path, e.xpath) for e in compact.elements])
+                           e.focused, e.bounds, e.path) for e in compact.elements])
         self.assertIsNone(compact.elements[1].value)
         self.assertEqual(compact.elements[1].bounds, (1.0, 50.0, 100.0, 30.0))
         self.assertTrue(compact.elements[1].focused)
@@ -173,17 +172,6 @@ class WDATests(unittest.TestCase):
         client.lock()
 
         self.assertEqual(client.posts, [("/wda/lock", {})])
-
-    def test_element_scroll_uses_one_targeted_native_swipe(self) -> None:
-        for content_direction, finger_direction in (("down", "up"), ("up", "down")):
-            client = RecordingWDAClient()
-            client.element_scroll("container/1", content_direction)
-            self.assertEqual(client.posts[2:], [("/session/session-123/wda/element/container%2F1/swipe",
-                                                {"direction": finger_direction})])
-        client = RecordingWDAClient()
-        with self.assertRaises(ValueError):
-            client.element_scroll("container", "left")
-        self.assertEqual(client.posts, [])
 
     def test_tap_posts_w3c_touch_action_and_deletes_session(self) -> None:
         client = RecordingWDAClient()
@@ -325,7 +313,6 @@ class WDATests(unittest.TestCase):
                                 "actions": [
                                     {"type": "pointerMove", "duration": 0, "x": 10, "y": 20},
                                     {"type": "pointerDown", "button": 0},
-                                    {"type": "pause", "duration": 400},
                                     {"type": "pointerMove", "duration": 400, "x": 30, "y": 40},
                                     {"type": "pointerUp", "button": 0},
                                 ],

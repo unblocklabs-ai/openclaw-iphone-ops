@@ -16,7 +16,7 @@ the service. If AX fails, image observation and coordinate controls still work.
 
 Try `wda unlock --verify` explicitly if appropriate. Passcode/Face ID-required
 means human unlock is needed. Do not loop unlock attempts or switch phones.
-The existing watchdog remains recovery-only; it does not send fake keepalive taps.
+The optional watchdog performs lock recovery; it does not send fake keepalive taps.
 
 ## Unknown or partial input
 

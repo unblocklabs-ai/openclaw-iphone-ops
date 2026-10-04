@@ -9,7 +9,7 @@ DEVICE_ID="$(resolve_openclaw_device_id "$REPO_DIR")"
 cd "$REPO_DIR"
 export PYTHONPATH="$REPO_DIR/src${PYTHONPATH:+:$PYTHONPATH}"
 export DEVICE_ID
-exec python3 - <<'PY'
+exec "${OPENCLAW_IPHONE_PYTHON:-python3}" - <<'PY'
 import json
 import os
 from openclaw_iphone.devicectl import DeviceCtl

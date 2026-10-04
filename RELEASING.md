@@ -12,7 +12,7 @@ Ordinary pushes, PRs, drafts, and prereleases do not publish packages.
   jobs. Offline tests do not prove physical-device readiness.
 
 The npm archive uses an explicit allowlist. Local config, evidence, tests,
-release tooling, and historical `build/` notes are excluded. The Python wheel
+release tooling, and `build/` artifacts are excluded. The Python wheel
 contains Python code only; its source distribution includes docs/skills/snippets.
 The repository does not currently grant an open-source license; npm metadata is
 `UNLICENSED`, rather than inventing a license as part of packaging.

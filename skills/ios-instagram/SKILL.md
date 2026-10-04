@@ -19,5 +19,4 @@ or attributing content to a profile you have not actually inspected.
 Feeds, recommendations, login/consent sheets, and WebViews are dynamic. The
 caller decides when more evidence is needed and whether a task is complete.
 Do not automatically clear consent, follow, like, message, post, or change
-accounts. Creator discovery/ranking and video orchestration commands are retired;
-any such research is the caller's workflow, not another controller in this package.
+accounts. Research and content evaluation belong to the caller's workflow.

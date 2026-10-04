@@ -91,19 +91,25 @@ From this repo:
 ```sh
 chmod +x snippets/launchd/openclaw-iphone-wda-run.sh
 chmod +x snippets/launchd/install-wda-run-launchagent.sh
-chmod +x snippets/launchd/openclaw-iphone-watchdog.sh
-chmod +x snippets/launchd/install-watchdog-launchagent.sh
 
 snippets/launchd/install-wda-run-launchagent.sh
-snippets/launchd/install-watchdog-launchagent.sh
 
 launchctl bootout "gui/$(id -u)" ~/Library/LaunchAgents/com.openclaw.iphone-wda-run.plist 2>/dev/null || true
-launchctl bootout "gui/$(id -u)" ~/Library/LaunchAgents/com.openclaw.iphone-watchdog.plist 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.openclaw.iphone-wda-run.plist
-launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.openclaw.iphone-watchdog.plist
 launchctl enable "gui/$(id -u)/com.openclaw.iphone-wda-run"
-launchctl enable "gui/$(id -u)/com.openclaw.iphone-watchdog"
 launchctl kickstart -k "gui/$(id -u)/com.openclaw.iphone-wda-run"
+```
+
+### Optional watchdog
+
+Install only when you want between-session lock recovery. It deliberately skips
+while a persistent session owns the phone, including caller idle time.
+
+```sh
+snippets/launchd/install-watchdog-launchagent.sh
+launchctl bootout "gui/$(id -u)" ~/Library/LaunchAgents/com.openclaw.iphone-watchdog.plist 2>/dev/null || true
+launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.openclaw.iphone-watchdog.plist
+launchctl enable "gui/$(id -u)/com.openclaw.iphone-watchdog"
 ```
 
 The watchdog interval defaults to 120 seconds. Override at install time with
@@ -180,7 +186,7 @@ Once the LaunchAgent is installed, ask OpenClaw to treat WDA as a service:
 
 ```text
 Use the plugged-in physical iPhone via the WDA LaunchAgent from
-the canonical openclaw-iphone checkout and host config at
+the installed openclaw-iphone interface and host config at
 ~/.openclaw/iphone/config.env. Use one direct session; acquisition checks readiness
 and physical device identity. Mutations check screen lock. If acquisition fails, use `doctor --check-ui`,
 then inspect `launchctl print` and

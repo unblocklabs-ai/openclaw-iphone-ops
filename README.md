@@ -4,9 +4,10 @@ A small Python controller for a dedicated USB-connected physical iPhone.
 The agent plans and judges results; this package owns the phone connection and
 executes direct WebDriverAgent controls. No second model or runtime dependencies.
 
-**Breaking change in v0.6.0:** `session` replaces the `task`, `ui`, and
-`instagram` commands. Earlier versions use the retired API;
-see [migration notes](docs/session.md#migration).
+Use one persistent `session` for observation, taps, swipes, typing, picker
+selection and app transitions. Optional private input comparison, foreground
+readiness and route timing help inspect results. The session's
+`ready.capabilities` reports supported optional operations.
 
 ## Use this checkout
 
@@ -43,7 +44,7 @@ follow `next_offset` without recapturing the screen or invalidating earlier IDs.
 
 The session pins one physical phone and holds exclusive control. Timeouts apply
 to operations, not agent deliberation. There are no grants, task files, quotas,
-completion verdicts, automatic readbacks, or reconciliation permissions. Unknown
+completion verdicts, mandatory readbacks, or reconciliation permissions. Unknown
 writes are never replayed automatically. The caller may inspect and choose a
 subsequent action. Optional observation failure does not erase acknowledgment.
 
@@ -55,14 +56,14 @@ PYTHONPATH=src python3 -m openclaw_iphone doctor --check-ui
 PYTHONPATH=src python3 -m openclaw_iphone apps find Safari
 ```
 
-Use diagnosis after a failure, not as a ritual before every action. Existing
-`wda run`, `watchdog once`, app inspection/control, and launchd tooling remain.
+Use diagnosis after a failure, not as a ritual before every action. Use
+`wda run`, `watchdog once`, app inspection/control, and launchd tooling for setup
+and recovery.
 Close the session before separate mutating commands.
 
 - [Service setup](docs/launchagent-service.md)
 - [Mechanics](docs/mechanics.md) and [troubleshooting](docs/troubleshooting.md)
 - [Supervised App Store installation](docs/app-store-installs.md)
-- [Approved simplification plan](docs/simple-agent-harness-plan.md)
 
 ## Distribution
 
@@ -82,5 +83,4 @@ npm run preflight
 Preflight checks shared versions, offline/loopback tests, and the real packed
 npm installation outside the checkout. Physical-device reliability and speed
 still require a matched on-device comparison; these checks do not establish it.
-Historical notes in `build/` describe retired versions, not the current API.
 See [release procedure](RELEASING.md) before publishing a new version.
