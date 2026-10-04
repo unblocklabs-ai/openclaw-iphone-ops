@@ -1,226 +1,47 @@
 # Troubleshooting
 
-## Device Not Found
+## Device or runner unavailable
 
-Use an exact dedicated-phone UDID/CoreDevice identifier in
-`OPENCLAW_IPHONE_DEVICE`. For an exact pin listed disconnected, selection now
-performs one bounded read-only details probe, re-lists the same physical device,
-and checks passcode state. No name-based wake, substitute phone, pairing repair
-or mutation is attempted. If identity cannot be verified or the ten-second
-probe fails, it stops. This may wake a dormant tunnel; it does not promise to
-repair every Apple connection failure.
+Run `openclaw-iphone doctor --check-ui` after a failure. Confirm full Xcode,
+USB pairing/trust, Developer Mode, and the dedicated physical UDID in host
+config. `wda run` must keep the signed XCTest runner alive; a successful build
+alone is not enough. `wda url` diagnoses CoreDevice tunnel discovery.
 
-Check:
+For an exact disconnected pin, CoreDevice may perform a bounded read-only
+details probe and re-list that same phone. It never substitutes another device.
+Sessions can recover safe reads repeatedly, once per read, without restarting
+the service. If AX fails, image observation and coordinate controls still work.
 
-```sh
-xcrun devicectl list devices
-```
+## Locked phone
 
-If no iPhone appears:
+Try `wda unlock --verify` explicitly if appropriate. Passcode/Face ID-required
+means human unlock is needed. Do not loop unlock attempts or switch phones.
+The existing watchdog remains recovery-only; it does not send fake keepalive taps.
 
-- Confirm `xcode-select -p` points to full Xcode, usually
-  `/Applications/Xcode.app/Contents/Developer`, not
-  `/Library/Developer/CommandLineTools`.
-- Confirm USB connection.
-- Confirm the phone trusts the host.
-- Confirm Xcode can see the device.
-- Confirm Developer Mode is enabled.
+## Unknown or partial input
 
-## Phone Locked
+Inspect the actual screen/field. Don't infer input failure from a failed
+screenshot or XML read, and don't replay a password/code automatically.
+The session remains usable for inspection and subsequent deliberate requests.
+Choose explicit `type` replacement or sequential input only as needed.
 
-Prevent this where possible by setting the agent phone to
-`Settings -> Display & Brightness -> Auto-Lock -> Never`.
+## Runner restart
 
-Check:
+Only after authorization, close the session, preserve its dispatch receipt,
+confirm no in-flight writes, and inspect the dedicated runner with
+`launchctl print "gui/$(id -u)/com.openclaw.iphone-wda-run"`. Check its wrapper,
+config, UDID and logs before restarting that runner once. Reacquire a session
+and inspect actual state; don't replay previous input because cleanup failed.
+Other controllers outside this package are not coordinated by its lock.
 
-```sh
-./snippets/iphone-lock-state.sh
-PYTHONPATH=src python3 -m openclaw_iphone doctor
-```
+## Provenance or signing
 
-If locked, try one best-effort WDA unlock:
+`doctor` reports runtime source, configured repo/WDA path and launchd plist
+relationships, not the command currently running. Inspect launchd separately
+before approved installation/restart work. See [service setup](launchagent-service.md).
 
-```sh
-PYTHONPATH=src python3 -m openclaw_iphone wda unlock --verify
-PYTHONPATH=src python3 -m openclaw_iphone watchdog once
-```
-
-WDA unlock can recover only when iOS does not require passcode, Face ID, or
-another secure confirmation. If verification still reports
-`passcode-required: true`, foreground automation is blocked until human unlock.
-Do not loop on unlock attempts.
-
-On unattended hosts, the watchdog LaunchAgent may run this same recovery check
-periodically. It is recovery-only: it does not tap the screen to keep the phone
-awake, because that can corrupt the current foreground workflow.
-
-## WDA Responds But Is Not Ready
-
-Check:
-
-```sh
-PYTHONPATH=src python3 -m openclaw_iphone wda status
-```
-
-If `ready` is false, restart or rebuild the WDA/XCUITest lane. Do not trust old logs.
-
-## WDA Is Ready But Screen Reads Stall
-
-`/status` can remain healthy while accessibility or screenshot retrieval hangs.
-Probe once without saving private screen content:
-
-```sh
-openclaw-iphone doctor --check-ui
-# Tune only for a known slow screen; the default read timeout is 12 seconds.
-openclaw-iphone --read-timeout 15 doctor --check-ui
-```
-
-`screen-read-failed` distinguishes this boundary from readiness. A successful
-source probe does not independently prove screenshot health. Do not keep
-alternating full source/screenshots/status commands or reenter a password after
-a read failure. In a task session, `recover_read` allows one same-device
-reacquisition; it does not restart WDA and never revives stopped input.
-
-If that fails and a runner restart is authorized:
-
-1. Close the task session to release its workflow lock. Preserve its action
-   outcome and acknowledgement count; there must be no in-flight mutation.
-2. Check `launchctl print "gui/$(id -u)/com.openclaw.iphone-wda-run"` and the
-   installed LaunchAgent's wrapper/config path. Confirm it runs this dedicated
-   phone's pin and the intended package, not a stale checkout or another device.
-   Coordinate with other controllers before disrupting the shared runner.
-3. Restart **only that runner**, once:
-   `launchctl kickstart -k "gui/$(id -u)/com.openclaw.iphone-wda-run"`.
-4. Allow a bounded startup interval, then run `doctor --check-ui` again. If
-   startup/signing/trust/lock still blocks, escalate with redacted logs rather
-   than cycling services. Do not restart watchdogs or change security settings.
-5. Start a fresh task and independently inspect the actual UI. Reconcile any
-   previous acknowledged/unknown input before authorizing further actions.
-
-This is explicit operator recovery, not an automated session feature. The
-task lock coordinates this package's workflows, not arbitrary external clients.
-
-## Checkout versus launchd provenance
-
-When a fix appears absent, run `openclaw-iphone doctor` and inspect the
-`runtime-source`, `configured-repo`, `source-repo`, `configured-wda-path`, and
-`launchd-*` lines before restarting anything. They identify the Python source
-and configured runner/plist paths and report `match`, `different`, or `absent`.
-The report does not claim which command is currently running; launchd must be
-reloaded separately after an approved installation change. The WDA launchd
-wrapper honors `OPENCLAW_IPHONE_PYTHON` when a host needs a specific supported
-interpreter.
-
-## Typing Or Custom Verification Field Does Not Read Back
-
-Do not infer that input failed just because its screenshot/source failed.
-`ui type` and low-level bulk typing have no exact final-value guarantee. Use
-runtime `replace` for authorized whole-field entry, or `append` on a verified
-empty field. `keypad` is an explicit digits-only strategy with fresh focus,
-field identity and accessible-key checks, followed by one bounded input batch
-and final-value or destination verification; see
-[task-runtime.md](task-runtime.md#explicit-keypad-input).
-
-The runtime does not automatically reset or retry a partially entered custom
-code. A fixed number of Delete taps plus empty OCR output is not reliable
-empty-field verification. If the field cannot expose a trustworthy value/focus,
-use the explicitly authorized adaptive screenshot-confirmation workflow in
-[planner-session.md](planner-session.md#same-session-vision-and-custom-keypad),
-or stop when the empty/focused state cannot be established. Fixed-grant sessions
-still reject secure screens.
-Never send authentication screenshots/codes to Jev or place them in CLI args.
-
-## WDA Build Succeeds But Test Does Not Stay Running
-
-WDA needs the `WebDriverAgentRunner` scheme to run as an XCTest process. A plain
-build is not enough. Use `Product -> Test` in Xcode or `openclaw-iphone wda run`.
-
-If `xcodebuild test` logs `unable to find utility "devicectl"`, switch the host
-to full Xcode:
-
-```sh
-sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer
-xcode-select -p
-```
-
-If the runner prints `ServerURLHere->http://...:8100<-ServerURLHere`, WDA
-launched. Run `openclaw-iphone wda url` to confirm CoreDevice has a connected
-USB tunnel, then verify `wda status`.
-
-If the runner installs and starts but fails after about 60 seconds with
-`Timed out while enabling automation mode`, signing, trust, and transport are
-already past their gates. Check the phone is unlocked, Developer Mode is
-enabled, no security prompt is visible, and Xcode can run UI tests on the
-device. Record the `.xcresult` path from the log; the failure is at the
-XCTest/iOS automation handshake layer, before WDA starts serving HTTP.
-
-## Codesign Keychain Prompt
-
-If `codesign` or Xcode asks to access the Apple Development private key, enter
-the login keychain password, which can differ from the Mac login password. On
-OpenClaw-managed hosts, check local operator notes or the keychain unlock launch
-agent for the configured login keychain password. Choose Always Allow so future
-non-interactive builds do not block on the GUI prompt.
-
-If a non-interactive run fails with `errSecInternalComponent`, verify the
-private key ACL with a direct codesign smoke test:
-
-```sh
-security find-identity -v -p codesigning
-tmpdir="$(mktemp -d /tmp/openclaw-codesign.XXXXXX)"
-cp /bin/echo "$tmpdir/echo-test"
-codesign --force --sign "<identity-sha>" --timestamp=none "$tmpdir/echo-test"
-rm -rf "$tmpdir"
-```
-
-`errSecInternalComponent` can indicate this execution context cannot use the
-private key; it is not a unique diagnosis. Check the signing output and identity,
-then unlock the login keychain or approve the
-private-key access prompt with Always Allow before retrying WDA.
-
-Do not commit keychain passwords, Apple ID passwords, or certificate private-key
-material to this repo.
-
-## Developer Profile Will Not Verify On The iPhone
-
-If the phone says the Developer App certificate is not trusted, go to
-`Settings -> General -> VPN & Device Management` and trust the developer profile.
-
-If tapping Verify flashes but does not complete:
-
-The following are operator-led recovery options, not permission for an agent to
-delete apps, reboot, or disable network protections without approval:
-
-- Confirm the phone has working internet.
-- Temporarily disable VPN, DNS filtering, firewall profiles, or content blockers.
-- Confirm date/time is automatic.
-- Delete the WDA runner app from the phone.
-- Reboot the phone.
-- Run `WebDriverAgentRunner` again from Xcode or the CLI, then trust the profile.
-
-## App Store Result Ambiguous
-
-Do not tap. Verify exact title and publisher. Search result layouts can place ads or unrelated buttons near the intended app.
-
-## Prompt Visible But Not In Accessibility Source
-
-Capture screenshot proof. If the visible state is unambiguous, use coordinate taps verified against the screenshot.
-
-## Credential Prompt
-
-Use the configured secure credential source if available. Escalate only when:
-
-- The credential is missing.
-- The credential is rejected.
-- The prompt requires passcode, Face ID, or another secure confirmation.
-
-## Clean Blocker Language
-
-Use exact language:
-
-- "Blocked at lock state: the device is locked and needs human unlock."
-- "Blocked at lock state: WDA unlock was attempted, but passcode is still required."
-- "Blocked at signing: the XCUITest runner is not provisioned for this device."
-- "Blocked at UI automation: WDA installs and launches, but Xcode timed out while enabling automation mode."
-- "Blocked at secure confirmation: the prompt requires Face ID/passcode and cannot be completed remotely."
-- "Blocked at credential: the stored Apple ID password was rejected."
+Xcode license, provisioning, keychain/private-key access, developer-profile trust
+and the XCTest automation handshake are genuine platform boundaries. Diagnose
+the exact failing boundary; don't automatically accept licenses, disable security,
+delete runner apps, reboot or change account settings. Keep credentials out of
+logs, command arguments, repository files and screenshots shared elsewhere.

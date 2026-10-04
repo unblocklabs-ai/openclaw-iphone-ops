@@ -1,96 +1,26 @@
 # Mechanics
 
-## Principle
+The physical phone is the target. Simulator results do not establish App Store,
+Apple ID, USB or physical-device behavior.
 
-Treat the connected physical iPhone as the target device. The simulator is only a fallback for simulator-appropriate tasks and cannot prove App Store, Apple ID, or physical-device flows.
+CoreDevice selects the phone by physical UDID and supplies the USB tunnel URL.
+A signed WebDriverAgentRunner stays running under the existing Xcode/launchd
+service. [One session](session.md) owns the control lock and reuses WDA. No new
+daemon or alternate phone backend is introduced.
 
-## Control Layers
+WDA checks screen lock at the mutation boundary. Read-only acquisition and
+capture do not need an unlocked screen. A clear/type compound input shares one
+lock check. Do not layer extra diagnosis/lock probes on every agent action.
 
-### CoreDevice / devicectl
+Safe reads may reacquire the same physical phone; writes are never automatically
+replayed. Cleanup has its own bounded deadline, and cleanup failure does not
+change acknowledged input. Session close is lifecycle completion, not task proof.
 
-Use `xcrun devicectl` first because it is built into Xcode and talks to real devices through CoreDevice.
+Configure Auto-Lock to Never only when device policy permits. An explicit
+`wda unlock --verify` or the existing watchdog can recover a screen lock only
+when iOS does not require passcode, Face ID or another secure confirmation.
+Those hardware/security requirements cannot be removed by simplifying the harness.
 
-Useful capabilities:
-
-- Device discovery
-- Lock-state checks
-- App launch and termination
-- Process inspection
-- Installed-app inspection
-- App install and uninstall when signing and device state allow it
-- Sysdiagnose and trace-adjacent troubleshooting
-
-Scriptable command output should use `--json-output <file>` because `devicectl` documents JSON files as the supported machine-readable interface.
-
-### XCUITest
-
-Use a signed XCUITest runner for real UI work:
-
-- Tapping
-- Typing
-- Scrolling
-- App Store search and navigation
-- Prompt handling when controls are exposed to accessibility
-
-This requires a working Apple Developer signing setup. If signing or provisioning breaks, that is a real setup blocker.
-
-### WebDriverAgent
-
-Use WebDriverAgent when repeated UI control is needed through HTTP.
-
-Prefer one task-scoped session. Acquisition checks the physical device, readiness
-and lock state once; nested primitives reuse the session. One-shot CLI commands
-still create their own sessions and are better suited to manual diagnostics.
-Use `doctor --check-ui` when diagnosing a broken connection, not before each task.
-
-Session cleanup failures
-warn separately and do not change the action outcome. Do not replay actions
-because cleanup failed; inspect state after any ambiguous action failure.
-
-## Lock State Rule
-
-The runtime checks lock state at the mutation boundary; do not add separate CLI
-lock probes before every task action.
-For unattended OpenClaw hosts, prevent lock interruptions by setting
-`Settings -> Display & Brightness -> Auto-Lock -> Never` when device policy
-allows it.
-
-Example:
-
-```sh
-./snippets/iphone-lock-state.sh
-```
-
-If the phone is locked, try `openclaw-iphone wda unlock --verify` once. WDA
-unlock can recover only when iOS does not require passcode, Face ID, or another
-secure confirmation. If verification still reports passcode required, do not
-keep pushing UI commands. Ask for an unlock and report the exact boundary.
-
-## App Control Pattern
-
-1. Discover devices.
-2. Select target device.
-3. Check lock state.
-4. Launch or terminate app with `devicectl`, or begin UI control through XCUITest/WDA.
-5. Capture evidence only for the states that matter.
-6. Verify the final state from a second signal when possible.
-
-## App Store Specifics
-
-App Store search results can include ads, similar apps, and unrelated nearby buttons. Verify the exact app title before tapping `Get`, `Install`, or `Open`.
-
-Confirmation sheets can appear on-screen while missing from the WDA accessibility tree. If the screenshot clearly shows the sheet and source does not expose controls, screenshot-verified coordinate taps are acceptable.
-
-Password prompts are not automatically human blockers. Use the configured local credential source if available. Escalate only if the credential is missing, rejected, or the prompt requires secure confirmation that automation cannot complete.
-
-For first-launch "Sign in with Apple" flows, choose not to share the email address by default unless the task explicitly says otherwise.
-
-## Reporting
-
-When blocked, report the exact failed step and what is needed:
-
-- "The phone is locked; foreground UI automation cannot continue until it is unlocked."
-- "The XCUITest runner is not signed for this device; signing/provisioning needs setup."
-- "The App Store prompt rejected the stored credential; a human needs to verify the Apple ID credential or complete the prompt."
-
-Avoid generic statements like "the iPhone cannot be used" unless device discovery itself fails after focused checks.
+App-specific expectations remain agent knowledge. App Store results may include
+ads and similar titles: inspect the exact title and publisher before an authorized
+install. See [the supervised template](app-store-installs.md).

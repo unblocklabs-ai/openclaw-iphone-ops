@@ -82,25 +82,11 @@ class CLIConfigTests(unittest.TestCase):
         parser = cli.build_parser()
 
         commands = [
-            ["instagram", "capture-context"],
-            ["instagram", "analyze-video", "--video", "file.mp4"],
+            ["session"],
             ["wda", "status"],
             ["wda", "locked"],
             ["wda", "unlock"],
             ["wda", "lock"],
-            ["ui", "screenshot"],
-            ["ui", "source"],
-            ["ui", "elements"],
-            ["ui", "annotated-screenshot"],
-            ["ui", "tap", "--x", "1", "--y", "2"],
-            ["ui", "tap-text", "Search"],
-            ["ui", "wait-text", "Search"],
-            ["ui", "scroll-until-text", "Search"],
-            ["ui", "type", "hello"],
-            ["ui", "clear-field"],
-            ["ui", "drag", "--from-x", "1", "--from-y", "2", "--to-x", "3", "--to-y", "4"],
-            ["ui", "press-button", "home"],
-            ["ui", "back"],
         ]
 
         for command in commands:

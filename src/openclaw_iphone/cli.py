@@ -11,16 +11,14 @@ import time
 
 from . import __version__
 from .config import IPhoneConfig, load_config
+from .connection import Connection
 from .control_lock import control_lock
 from .devicectl import Device, DeviceCtl
 from .evidence import artifact_path, write_private
 from .errors import DeviceLocked, OpenClawIPhoneError, SessionOutputUnavailable, WDAUnavailable
-from .instagram_context import capture_instagram_context
-from .instagram_ops import DEFAULT_ANALYSIS_PROMPT, analyze_video, benchmark_discovery, benchmark_ranking_quality, discover_creators, triage_shortlist, verify_handles
-from .recipes.instagram import smoke as instagram_smoke
-from .ui import UIController
+from .protocol import json_line_emitter, read_requests, serve
+from .session import Session
 from .wda import DEFAULT_SCREEN_READ_TIMEOUT, DEFAULT_WDA_PORT, WDAClient, WDARunConfig, resolve_wda_path, run_wda
-
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
@@ -35,10 +33,8 @@ def main(argv: list[str] | None = None) -> int:
         # Read-only observers and the long-lived runner do not hold this lock.
         mutating = (
             args.command == "watchdog"
-            or args.command == "instagram" and args.instagram_command not in {"capture-context", "analyze-video"}
             or args.command == "apps" and args.apps_command in {"launch", "terminate"}
             or args.command == "wda" and args.wda_command in {"unlock", "lock"}
-            or args.command == "ui" and args.ui_command in {"tap", "tap-text", "type", "clear-field", "drag", "press-button", "back", "scroll-until-text"}
         )
         with control_lock() if mutating else nullcontext():
             return args.handler(args)
@@ -49,7 +45,6 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
-
 def validate_numeric_args(args: argparse.Namespace) -> None:
     for name, value in vars(args).items():
         if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -59,12 +54,10 @@ def validate_numeric_args(args: argparse.Namespace) -> None:
         if ("timeout" in name or "deadline" in name or name in {"interval", "frequency"}) and value <= 0:
             raise ValueError(f"{name.replace('_', '-')} must be positive.")
 
-
 def selected_device(args: argparse.Namespace, client: DeviceCtl, *, config: IPhoneConfig | None = None) -> Device:
     if not hasattr(args, "_selected_device"):
         args._selected_device = client.select_device(device_selector_from_args(args, config=config))
     return args._selected_device
-
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -75,7 +68,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--developer-dir", help="Override DEVELOPER_DIR for Xcode/devicectl.")
     parser.add_argument("--evidence-dir", help="Directory for JSON evidence artifacts.")
     parser.add_argument("--timeout", type=int, default=30, help="External command timeout in seconds.")
-    parser.add_argument("--read-timeout", type=float, default=DEFAULT_SCREEN_READ_TIMEOUT, help="Read-only WDA request timeout (default 12s), also capped by the task deadline.")
+    parser.add_argument("--read-timeout", type=float, default=DEFAULT_SCREEN_READ_TIMEOUT, help="Read-only WDA request timeout (default 12s), capped by each operation deadline.")
 
     subcommands = parser.add_subparsers(dest="command")
 
@@ -117,126 +110,6 @@ def build_parser() -> argparse.ArgumentParser:
     add_device_arg(apps_terminate)
     apps_terminate.add_argument("query")
     apps_terminate.set_defaults(handler=handle_apps_terminate)
-
-    instagram = subcommands.add_parser("instagram", help="Optional Instagram recipe commands.")
-    instagram_subcommands = instagram.add_subparsers(dest="instagram_command")
-    instagram_smoke_parser = instagram_subcommands.add_parser("smoke", help="Verify and launch Instagram.")
-    add_device_arg(instagram_smoke_parser)
-    instagram_smoke_parser.set_defaults(handler=handle_instagram_smoke)
-
-    instagram_context = instagram_subcommands.add_parser(
-        "capture-context",
-        help="Capture current Instagram screen/source and parse visible creator/content metadata.",
-    )
-    add_device_arg(instagram_context)
-    add_wda_url_arg(instagram_context)
-    instagram_context.add_argument("--output-dir", help="Directory for screenshot/source/manifest artifacts.")
-    instagram_context.add_argument("--prefix", default="instagram-context", help="Artifact filename prefix.")
-    instagram_context.set_defaults(handler=handle_instagram_capture_context)
-
-    instagram_verify = instagram_subcommands.add_parser(
-        "verify-handles",
-        help="Best-effort bounded flow to open known Instagram handles and capture profile evidence.",
-    )
-    add_device_arg(instagram_verify)
-    add_wda_url_arg(instagram_verify)
-    instagram_verify.add_argument("handles", nargs="+", help="Instagram handles, with or without @.")
-    instagram_verify.add_argument("--output-dir", help="Directory for per-handle evidence artifacts.")
-    instagram_verify.add_argument("--prefix", default="instagram-verify")
-    instagram_verify.add_argument("--max-steps-per-handle", type=int, default=12)
-    instagram_verify.add_argument("--deadline-seconds", type=float, help="Wall-clock deadline per handle.")
-    instagram_verify.add_argument("--no-launch", action="store_true", help="Do not launch Instagram before verifying.")
-    instagram_verify.set_defaults(handler=handle_instagram_verify_handles)
-
-    instagram_video = instagram_subcommands.add_parser(
-        "analyze-video",
-        help="Capture current Instagram context and hand a supplied video URL/file to video-understand.",
-    )
-    add_device_arg(instagram_video)
-    add_wda_url_arg(instagram_video)
-    instagram_video.add_argument("--video", required=True, help="Direct video URL or local file for video-understand.")
-    instagram_video.add_argument("--prompt", default=DEFAULT_ANALYSIS_PROMPT)
-    instagram_video.add_argument("--output-dir", help="Directory for context and analysis artifacts.")
-    instagram_video.add_argument("--prefix", default="instagram-video-analysis")
-    instagram_video.add_argument("--dry-run", action="store_true", help="Write handoff artifacts without invoking video-understand.")
-    instagram_video.add_argument("--timeout", type=int, default=300)
-    instagram_video.set_defaults(handler=handle_instagram_analyze_video)
-
-    instagram_discover = instagram_subcommands.add_parser(
-        "discover-creators",
-        help="Discover pregnancy/motherhood creator candidates from bounded Instagram source screens.",
-    )
-    add_device_arg(instagram_discover)
-    add_wda_url_arg(instagram_discover)
-    instagram_discover.add_argument("--query", required=True, help="Creator discovery query, for example 'pregnancy journey'.")
-    instagram_discover.add_argument("--max-candidates", type=int, default=10)
-    instagram_discover.add_argument("--deadline-seconds", type=float, default=600)
-    instagram_discover.add_argument("--output-dir", help="Directory for discovery artifacts.")
-    instagram_discover.add_argument("--prefix", default="instagram-discovery")
-    instagram_discover.add_argument("--max-source-scrolls", type=int, default=6)
-    instagram_discover.add_argument("--max-steps", type=int, default=120)
-    instagram_discover.add_argument("--max-steps-per-candidate", type=int, default=10)
-    instagram_discover.add_argument("--per-candidate-deadline-seconds", type=float, default=45)
-    instagram_discover.add_argument("--verification-mode", choices=("profile", "source-only"), default="profile")
-    instagram_discover.add_argument("--source-open-wait-seconds", type=float, default=1.5)
-    instagram_discover.add_argument("--no-launch", action="store_true", help="Do not launch Instagram before discovery.")
-    instagram_discover.set_defaults(handler=handle_instagram_discover_creators)
-
-    instagram_benchmark = instagram_subcommands.add_parser(
-        "benchmark-discovery",
-        help="Run the creator discovery benchmark scenarios and write JSON/markdown reports.",
-    )
-    add_device_arg(instagram_benchmark)
-    add_wda_url_arg(instagram_benchmark)
-    instagram_benchmark.add_argument("--output-dir", help="Directory for benchmark artifacts.")
-    instagram_benchmark.add_argument("--prefix", default="instagram-discovery-benchmark")
-    instagram_benchmark.add_argument("--max-candidates-per-scenario", type=int, default=10)
-    instagram_benchmark.add_argument("--scenario-deadline-seconds", type=float, default=360)
-    instagram_benchmark.add_argument("--max-source-scrolls", type=int, default=6)
-    instagram_benchmark.add_argument("--verification-mode", choices=("profile", "source-only"), default="profile")
-    instagram_benchmark.add_argument("--source-open-wait-seconds", type=float, default=1.5)
-    instagram_benchmark.add_argument("--no-launch", action="store_true", help="Do not launch Instagram before benchmarking.")
-    instagram_benchmark.set_defaults(handler=handle_instagram_benchmark_discovery)
-
-    instagram_triage = instagram_subcommands.add_parser(
-        "triage-shortlist",
-        help="Run fast source-only triage, verify top candidates, and write a shortlist report.",
-    )
-    add_device_arg(instagram_triage)
-    add_wda_url_arg(instagram_triage)
-    instagram_triage.add_argument("--output-dir", help="Directory for triage artifacts.")
-    instagram_triage.add_argument("--prefix", default="instagram-triage-shortlist")
-    instagram_triage.add_argument("--max-candidates-per-scenario", type=int, default=10)
-    instagram_triage.add_argument("--source-deadline-seconds", type=float, default=45)
-    instagram_triage.add_argument("--max-source-scrolls", type=int, default=1)
-    instagram_triage.add_argument("--verify-top", type=int, default=10)
-    instagram_triage.add_argument("--verification-deadline-seconds", type=float, default=180)
-    instagram_triage.add_argument("--per-candidate-deadline-seconds", type=float, default=30)
-    instagram_triage.add_argument("--shortlist-size", type=int, default=5)
-    instagram_triage.add_argument("--source-open-wait-seconds", type=float, default=1.5)
-    instagram_triage.add_argument("--no-launch", action="store_true", help="Do not launch Instagram before triage.")
-    instagram_triage.set_defaults(handler=handle_instagram_triage_shortlist)
-
-    instagram_ranking = instagram_subcommands.add_parser(
-        "benchmark-ranking-quality",
-        help="Benchmark triage ranking quality across varied themes against a lower-ranked comparison sample.",
-    )
-    add_device_arg(instagram_ranking)
-    add_wda_url_arg(instagram_ranking)
-    instagram_ranking.add_argument("--output-dir", help="Directory for ranking benchmark artifacts.")
-    instagram_ranking.add_argument("--prefix", default="instagram-ranking-quality")
-    instagram_ranking.add_argument("--theme", action="append", help="Theme/query to benchmark. Repeat for multiple themes.")
-    instagram_ranking.add_argument("--candidates-per-theme", type=int, default=30)
-    instagram_ranking.add_argument("--verify-top", type=int, default=10)
-    instagram_ranking.add_argument("--comparison-size", type=int, default=5)
-    instagram_ranking.add_argument("--comparison-start-rank", type=int, default=10)
-    instagram_ranking.add_argument("--source-deadline-seconds", type=float, default=60)
-    instagram_ranking.add_argument("--verification-deadline-seconds", type=float, default=180)
-    instagram_ranking.add_argument("--per-candidate-deadline-seconds", type=float, default=30)
-    instagram_ranking.add_argument("--max-source-scrolls", type=int, default=1)
-    instagram_ranking.add_argument("--source-open-wait-seconds", type=float, default=1.5)
-    instagram_ranking.add_argument("--no-launch", action="store_true", help="Do not launch Instagram before benchmarking.")
-    instagram_ranking.set_defaults(handler=handle_instagram_benchmark_ranking_quality)
 
     wda = subcommands.add_parser("wda", help="WebDriverAgent commands.")
     wda_subcommands = wda.add_subparsers(dest="wda_command")
@@ -307,281 +180,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     watchdog_once.set_defaults(handler=handle_watchdog_once)
 
-    ui = subcommands.add_parser("ui", help="UI capture commands backed by WebDriverAgent.")
-    ui_subcommands = ui.add_subparsers(dest="ui_command")
-    ui_observe = ui_subcommands.add_parser("observe", help="One compact, identity-checked accessibility observation; no screenshot.")
-    add_device_arg(ui_observe)
-    ui_observe.add_argument("--include-labels", action="store_true", help="Include local, potentially private UI labels (never field values).")
-    ui_observe.add_argument("--deadline-seconds", type=float, default=30)
-    ui_observe.set_defaults(handler=handle_ui_observe)
-    ui_screenshot = ui_subcommands.add_parser("screenshot", help="Capture a screenshot through WebDriverAgent.")
-    add_device_arg(ui_screenshot)
-    add_wda_url_arg(ui_screenshot)
-    ui_screenshot.add_argument("--output", help="Optional path for the PNG screenshot.")
-    ui_screenshot.set_defaults(handler=handle_ui_screenshot)
-
-    ui_source = ui_subcommands.add_parser("source", help="Capture the accessibility source through WebDriverAgent.")
-    add_device_arg(ui_source)
-    add_wda_url_arg(ui_source)
-    ui_source.add_argument("--output", help="Optional path for the source XML/text.")
-    ui_source.set_defaults(handler=handle_ui_source)
-
-    ui_elements = ui_subcommands.add_parser("elements", help="Save visible accessibility elements as JSON.")
-    add_device_arg(ui_elements)
-    add_wda_url_arg(ui_elements)
-    ui_elements.add_argument("--output", help="Optional path for elements JSON.")
-    ui_elements.add_argument("--all", action="store_true", help="Include elements marked not visible.")
-    ui_elements.set_defaults(handler=handle_ui_elements)
-
-    ui_annotated = ui_subcommands.add_parser("annotated-screenshot", help="Capture screenshot plus element map/HTML overlay.")
-    add_device_arg(ui_annotated)
-    add_wda_url_arg(ui_annotated)
-    ui_annotated.add_argument("--output", help="Optional path for the PNG screenshot.")
-    ui_annotated.add_argument("--all", action="store_true", help="Include elements marked not visible.")
-    ui_annotated.set_defaults(handler=handle_ui_annotated_screenshot)
-
-    ui_tap = ui_subcommands.add_parser("tap", help="Tap absolute screen coordinates through WebDriverAgent.")
-    add_device_arg(ui_tap)
-    add_wda_url_arg(ui_tap)
-    ui_tap.add_argument("--x", type=float, required=True)
-    ui_tap.add_argument("--y", type=float, required=True)
-    ui_tap.set_defaults(handler=handle_ui_tap)
-
-    ui_tap_text = ui_subcommands.add_parser("tap-text", help="Tap the center of a visible element matching text.")
-    add_device_arg(ui_tap_text)
-    add_wda_url_arg(ui_tap_text)
-    ui_tap_text.add_argument("text")
-    ui_tap_text.add_argument("--exact", action="store_true", help="Require exact text/name/label/value match.")
-    ui_tap_text.set_defaults(handler=handle_ui_tap_text)
-
-    ui_wait_text = ui_subcommands.add_parser("wait-text", help="Wait until visible text appears.")
-    add_device_arg(ui_wait_text)
-    add_wda_url_arg(ui_wait_text)
-    ui_wait_text.add_argument("text")
-    ui_wait_text.add_argument("--timeout", type=float, default=10.0)
-    ui_wait_text.add_argument("--interval", type=float, default=0.5)
-    ui_wait_text.add_argument("--exact", action="store_true")
-    ui_wait_text.set_defaults(handler=handle_ui_wait_text)
-
-    ui_scroll_until_text = ui_subcommands.add_parser("scroll-until-text", help="Scroll up until visible text appears.")
-    add_device_arg(ui_scroll_until_text)
-    add_wda_url_arg(ui_scroll_until_text)
-    ui_scroll_until_text.add_argument("text")
-    ui_scroll_until_text.add_argument("--max-scrolls", type=int, default=8)
-    ui_scroll_until_text.add_argument("--exact", action="store_true")
-    ui_scroll_until_text.add_argument("--from-x", type=float, default=200)
-    ui_scroll_until_text.add_argument("--from-y", type=float, default=720)
-    ui_scroll_until_text.add_argument("--to-x", type=float, default=200)
-    ui_scroll_until_text.add_argument("--to-y", type=float, default=260)
-    ui_scroll_until_text.add_argument("--duration", type=float, default=0.2)
-    ui_scroll_until_text.set_defaults(handler=handle_ui_scroll_until_text)
-
-    ui_type = ui_subcommands.add_parser("type", help="Type text into the currently focused field.")
-    add_device_arg(ui_type)
-    add_wda_url_arg(ui_type)
-    ui_type.add_argument("text")
-    ui_type.add_argument("--frequency", type=int, help="Optional WDA typing frequency override.")
-    ui_type.set_defaults(handler=handle_ui_type)
-
-    ui_clear = ui_subcommands.add_parser("clear-field", help="Clear the focused field or a field matched by text.")
-    add_device_arg(ui_clear)
-    add_wda_url_arg(ui_clear)
-    ui_clear.add_argument("text", nargs="?", help="Optional visible text/name/label to tap before clearing.")
-    ui_clear.add_argument("--exact", action="store_true")
-    ui_clear.set_defaults(handler=handle_ui_clear_field)
-
-    ui_drag = ui_subcommands.add_parser("drag", help="Drag between absolute screen coordinates.")
-    add_device_arg(ui_drag)
-    add_wda_url_arg(ui_drag)
-    ui_drag.add_argument("--from-x", type=float, required=True)
-    ui_drag.add_argument("--from-y", type=float, required=True)
-    ui_drag.add_argument("--to-x", type=float, required=True)
-    ui_drag.add_argument("--to-y", type=float, required=True)
-    ui_drag.add_argument("--duration", type=float, default=0.1, help="Press duration before dragging, in seconds.")
-    ui_drag.set_defaults(handler=handle_ui_drag)
-
-    ui_press_button = ui_subcommands.add_parser("press-button", help="Press an iPhone hardware button.")
-    add_device_arg(ui_press_button)
-    add_wda_url_arg(ui_press_button)
-    ui_press_button.add_argument("name", help="Button name, for example home, volumeUp, volumeDown, or siri.")
-    ui_press_button.add_argument("--duration", type=float, help="Optional press duration in seconds.")
-    ui_press_button.set_defaults(handler=handle_ui_press_button)
-
-    ui_back = ui_subcommands.add_parser("back", help="Navigate back through WDA.")
-    add_device_arg(ui_back)
-    add_wda_url_arg(ui_back)
-    ui_back.set_defaults(handler=handle_ui_back)
-
-    task = subcommands.add_parser("task", help="Bounded app-independent workflows; optional Jev decisions.")
-    task_subcommands = task.add_subparsers(dest="task_command")
-    task_run = task_subcommands.add_parser("run", help="Run a trusted, strictly validated task file.")
-    add_device_arg(task_run)
-    task_run.add_argument("--file", type=Path, required=True)
-    task_run.add_argument("--driver", choices=("deterministic", "jev"), default="deterministic")
-    task_run.add_argument("--allow-cloud", action="store_true", help="Approve sending caller-written objective/aliases and minimal action availability to TypeSafe.")
-    task_run.add_argument("--decision-only", action="store_true", help="Observe/select once, without UI mutation (Jev still uses the cloud).")
-    task_run.add_argument("--min-confidence", type=float, default=0.7, help="Jev escalation threshold, not authorization or completion proof.")
-    task_run.add_argument("--json", action="store_true", help="Emit the result as JSON (also the default).")
-    task_run.set_defaults(handler=handle_task_run)
-    task_session = task_subcommands.add_parser("session", help="Keep one bounded task/session open for a planner over stdin/stdout JSON lines.")
-    add_device_arg(task_session)
-    task_session.add_argument("--file", type=Path, required=True, help="Trusted task file; --explore accepts adaptive scope without grants/success.")
-    task_session.add_argument("--explore", action="store_true", help="Use bounded caller-directed adaptive control without fixed grants or task success conditions.")
-    task_session.add_argument("--include-labels", action="store_true", help="Opt into local private UI labels, not cloud disclosure.")
-    task_session.add_argument("--driver", choices=("deterministic", "jev"), default="deterministic")
-    task_session.add_argument("--allow-cloud", action="store_true", help="Approve adaptive instructions and explicit cloud_labels to TypeSafe.")
-    task_session.add_argument("--min-confidence", type=float, default=0.7)
-    task_session.set_defaults(handler=handle_task_session)
-    task_summary = task_subcommands.add_parser("summarize", help="Summarize saved task results offline; does not control a device.")
-    task_summary.add_argument("files", nargs="+", type=Path)
-    task_summary.set_defaults(handler=handle_task_summary)
+    session = subcommands.add_parser("session", help="Direct controls over persistent stdin/stdout JSON lines.")
+    add_device_arg(session)
+    session.add_argument("--operation-timeout", type=float, default=30, help="Per-operation deadline; idle deliberation is unlimited.")
+    session.add_argument("--allow-images", action="store_true", help="Allow potentially private screenshot evidence; no implicit masking.")
+    session.set_defaults(handler=handle_session)
 
     return parser
-
-
-def handle_task_run(args: argparse.Namespace) -> int:
-    # TaskConnection owns the same workflow lock; do not take it twice in main.
-    from .actions import Executor
-    from .connection import TaskConnection
-    from .jev import JevDriver
-    from .tasks import load_task, run_task
-
-    started = time.monotonic()
-    connection = None
-    try:
-        spec = load_task(args.file)
-        if args.driver == "jev" and not args.allow_cloud:
-            raise ValueError("Cloud approval is required.")
-        driver = JevDriver(timeout=args.timeout, min_confidence=args.min_confidence) if args.driver == "jev" else None
-        config = load_config()
-        if config.wda_url:
-            raise ValueError("Task mode requires a resolved CoreDevice endpoint, not a debug override.")
-        connection = TaskConnection(client_from_args(args), device=device_selector_from_args(args, config=config),
-                                    seconds=spec.limits.seconds, read_timeout=args.read_timeout)
-        connection.budget.deadline = started + spec.limits.seconds
-        with connection:
-            executor = Executor(connection, spec.grants, texts=spec.texts,
-                                freshness=spec.limits.freshness, verification_seconds=spec.limits.verification_seconds)
-            result = run_task(executor, spec, driver=driver, decision_only=args.decision_only)
-    except (ValueError, OSError):
-        result = {"status": "blocked", "reason": "invalid_task_or_configuration", "verification": "unknown"}
-    except OpenClawIPhoneError:
-        result = {"status": "blocked", "reason": "task_setup_unavailable", "verification": "unknown"}
-    except KeyboardInterrupt:
-        result = {"status": "escalated", "reason": "interrupted_outcome_unknown", "verification": "unknown"}
-    result["seconds"] = time.monotonic() - started
-    result["driver"] = args.driver
-    result["cleanup"] = "warning" if connection and connection.cleanup_failed else "completed" if connection else "not_started"
-    result["transport"] = connection.metrics.summary() if connection else None
-    try:
-        path = artifact_path("task-result", base=args.evidence_dir)
-        write_private(path, json.dumps(result, indent=2) + "\n")
-        result["evidence"] = str(path)
-    except OSError:
-        result["evidence_warning"] = "result_not_persisted_action_outcome_unchanged"
-    print(json.dumps(result, indent=2))
-    return 0 if result["status"] in {"completed", "decision_only"} else 1
-
-
-def handle_task_session(args: argparse.Namespace) -> int:
-    from .actions import Executor
-    from .connection import TaskConnection
-    from .execution import Budget, TaskStopped
-    from .jev import JevDriver
-    from .planner import PlannerSession, json_line_emitter, read_requests, serve
-    from .tasks import load_task
-
-    started = time.monotonic()
-    connection = None
-    output_failed = False
-    # Setup failures must be visible even before TaskConnection is entered.
-    emit = json_line_emitter(sys.stdout, Budget.seconds(5))
-    driver = None
-    try:
-        spec = load_task(args.file, explore=args.explore)
-        if args.explore and args.driver == "jev":
-            raise ValueError("Exploration does not use a model driver.")
-        if args.driver == "jev" and (not args.allow_cloud or spec.adaptive is None):
-            raise ValueError("Adaptive task and cloud approval are required for session Jev.")
-        driver = JevDriver(timeout=args.timeout, min_confidence=args.min_confidence) if args.driver == "jev" else None
-        config = load_config()
-        if config.wda_url:
-            raise ValueError("Planner sessions require a resolved CoreDevice endpoint.")
-        connection = TaskConnection(client_from_args(args), device=device_selector_from_args(args, config=config),
-                                    seconds=spec.limits.seconds, read_timeout=args.read_timeout)
-        connection.budget.deadline = started + spec.limits.seconds
-        emit = json_line_emitter(sys.stdout, connection.budget)
-        with connection:
-            executor = Executor(connection, spec.grants, texts=spec.texts, freshness=spec.limits.freshness,
-                                verification_seconds=spec.limits.verification_seconds)
-            session = PlannerSession(executor, spec, include_labels=args.include_labels,
-                                     driver=driver, evidence_base=args.evidence_dir)
-            emit({"status": "ready", "protocol": 1, "seconds_remaining": connection.budget.remaining()})
-            code = serve(session, read_requests(sys.stdin.fileno(), connection.budget), emit)
-    except SessionOutputUnavailable:
-        output_failed = True
-        code = 1
-    except TaskStopped:
-        code = 1
-        if emit is not None:
-            try:
-                emit({"status": "blocked", "reason": "deadline_or_limit"})
-            except SessionOutputUnavailable:
-                output_failed = True
-    except (ValueError, OSError, OpenClawIPhoneError):
-        code = 1
-        if emit is not None:
-            try:
-                emit({"status": "blocked", "reason": "session_unavailable_or_invalid_input"})
-            except SessionOutputUnavailable:
-                output_failed = True
-    except KeyboardInterrupt:
-        code = 1
-        if emit is not None:
-            try:
-                emit({"status": "escalated", "reason": "interrupted_outcome_unknown"})
-            except SessionOutputUnavailable:
-                output_failed = True
-    if emit is not None and not output_failed:
-        try:
-            emit({"status": "session_end", "seconds": time.monotonic() - started,
-                  "cleanup": "warning" if connection and connection.cleanup_failed else "completed" if connection else "not_started",
-                  "transport": connection.metrics.summary() if connection else None,
-                  "model": driver.summary() if driver else None})
-        except SessionOutputUnavailable:
-            pass
-    return code
-
-
-def handle_ui_observe(args: argparse.Namespace) -> int:
-    from .actions import Executor
-    from .connection import TaskConnection
-    config = load_config()
-    if config.wda_url:
-        raise ValueError("Compact observation requires a resolved CoreDevice endpoint.")
-    with TaskConnection(client_from_args(args), device=device_selector_from_args(args, config=config),
-                        seconds=args.deadline_seconds, read_timeout=args.read_timeout, read_only=True) as connection:
-        result = Executor(connection, ()).observe().compact(include_labels=args.include_labels)
-    result["cleanup"] = "warning" if connection.cleanup_failed else "completed"
-    print(json.dumps(result, ensure_ascii=True))
-    return 0
-
-
-def handle_task_summary(args: argparse.Namespace) -> int:
-    from .benchmark import summarize
-    from .jev import strict_json
-    runs = []
-    for path in args.files:
-        with path.open("rb") as stream:
-            raw = stream.read(2_000_001)
-        if len(raw) > 2_000_000:
-            raise ValueError("Result file too large.")
-        run = strict_json(raw)
-        if not isinstance(run, dict):
-            raise ValueError("Result must be a JSON object.")
-        runs.append(run)
-    print(json.dumps(summarize(runs), indent=2))
-    return 0
 
 
 def add_device_arg(parser: argparse.ArgumentParser) -> None:
@@ -590,13 +195,11 @@ def add_device_arg(parser: argparse.ArgumentParser) -> None:
         help="Device UDID/identifier/name. Defaults to OPENCLAW_IPHONE_DEVICE or the only connected device.",
     )
 
-
 def add_wda_url_arg(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--url",
         help="Debug override for WebDriverAgent base URL. Defaults to config/env or the USB CoreDevice tunnel URL.",
     )
-
 
 def client_from_args(args: argparse.Namespace) -> DeviceCtl:
     return DeviceCtl(
@@ -605,10 +208,8 @@ def client_from_args(args: argparse.Namespace) -> DeviceCtl:
         timeout=args.timeout,
     )
 
-
 def wda_client_from_args(args: argparse.Namespace) -> WDAClient:
     return WDAClient(url=resolve_wda_url_from_args(args), timeout=args.timeout, read_timeout=getattr(args, "read_timeout", DEFAULT_SCREEN_READ_TIMEOUT))
-
 
 def resolve_wda_url_from_args(args: argparse.Namespace) -> str:
     explicit = getattr(args, "url", None)
@@ -624,7 +225,6 @@ def resolve_wda_url_from_args(args: argparse.Namespace) -> str:
         raise ValueError("WDA URL override does not match the selected device's CoreDevice endpoint; remove the override.")
     return url
 
-
 def device_selector_from_args(args: argparse.Namespace, *, config: IPhoneConfig | None = None) -> str | None:
     explicit = getattr(args, "device", None)
     if explicit:
@@ -633,14 +233,12 @@ def device_selector_from_args(args: argparse.Namespace, *, config: IPhoneConfig 
         config = load_config()
     return config.device
 
-
 def handle_devices_list(args: argparse.Namespace) -> int:
     devices, artifact = client_from_args(args).list_devices()
     for device in devices:
         print(f"{device.name}\t{device.identifier}\t{device.state}\t{device.model}")
     print(f"evidence: {artifact}")
     return 0
-
 
 def handle_doctor(args: argparse.Namespace) -> int:
     config = load_config()
@@ -707,7 +305,6 @@ def handle_doctor(args: argparse.Namespace) -> int:
     print(f"result: {'ok' if healthy else 'attention-required'}")
     return 0 if healthy else 1
 
-
 def runtime_provenance(config: IPhoneConfig) -> dict[str, str]:
     """Report source/config/runner paths without claiming process provenance.
 
@@ -766,7 +363,6 @@ def runtime_provenance(config: IPhoneConfig) -> dict[str, str]:
         result["launchd-working-directory"] = f"{Path(working_directory).expanduser().resolve()} ({relation(Path(working_directory).expanduser().resolve(), repo_path)})"
     return result
 
-
 def handle_apps_list(args: argparse.Namespace) -> int:
     client = client_from_args(args)
     device = selected_device(args, client)
@@ -776,14 +372,12 @@ def handle_apps_list(args: argparse.Namespace) -> int:
     print(f"evidence: {artifact}")
     return 0
 
-
 def handle_apps_find(args: argparse.Namespace) -> int:
     client = client_from_args(args)
     device = selected_device(args, client)
     app = client.find_app(device.identifier, args.query)
     print(f"{app.name}\t{app.bundle_identifier}\t{app.version}\t{app.bundle_version}")
     return 0
-
 
 def handle_apps_launch(args: argparse.Namespace) -> int:
     client = client_from_args(args)
@@ -795,7 +389,6 @@ def handle_apps_launch(args: argparse.Namespace) -> int:
     print(f"launched: {app.name} ({app.bundle_identifier}) on {device.name}")
     return 0
 
-
 def handle_apps_terminate(args: argparse.Namespace) -> int:
     client = client_from_args(args)
     device = selected_device(args, client)
@@ -803,203 +396,6 @@ def handle_apps_terminate(args: argparse.Namespace) -> int:
     wda_client_from_args(args).terminate_app(app.bundle_identifier)
     print(f"terminated: {app.name} ({app.bundle_identifier}) on {device.name}")
     return 0
-
-
-def handle_instagram_smoke(args: argparse.Namespace) -> int:
-    result = instagram_smoke(client_from_args(args), device_selector=device_selector_from_args(args))
-    print(f"device: {result.device.name} ({result.device.identifier})")
-    print(f"instagram: {result.app_name} ({result.bundle_identifier})")
-    print(f"lock-state evidence: {result.lock_state_artifact}")
-    print(f"apps evidence: {result.apps_artifact}")
-    print("result: launched")
-    return 0
-
-
-def handle_instagram_capture_context(args: argparse.Namespace) -> int:
-    capture = capture_instagram_context(
-        wda_client_from_args(args),
-        output_dir=args.output_dir or args.evidence_dir,
-        prefix=args.prefix,
-    )
-    print(f"screenshot: {capture.screenshot}")
-    print(f"source: {capture.source}")
-    print(f"manifest: {capture.manifest}")
-    current_reel = capture.payload.get("current_reel")
-    current_profile = capture.payload.get("current_profile")
-    visible_videos = capture.payload.get("visible_videos") or []
-    if current_reel:
-        print(f"current reel: {current_reel}")
-    if current_profile:
-        print(f"current profile: {current_profile}")
-    if visible_videos:
-        print(f"visible videos: {len(visible_videos)}")
-        for video in visible_videos[:8]:
-            print(f"- {video.get('creator')}\t{video.get('plays')}\t{video.get('rect')}")
-    return 0
-
-
-def handle_instagram_verify_handles(args: argparse.Namespace) -> int:
-    if not args.no_launch:
-        client = client_from_args(args)
-        device = selected_device(args, client)
-        ensure_unlocked_or_attempt_wda(args, client, device.identifier)
-        app = client.find_app(device.identifier, "Instagram")
-        client.launch_app(device.identifier, app.bundle_identifier)
-    result = verify_handles(
-        wda_client_from_args(args),
-        args.handles,
-        output_dir=args.output_dir or args.evidence_dir,
-        prefix=args.prefix,
-        max_steps_per_handle=args.max_steps_per_handle,
-        deadline_seconds=args.deadline_seconds,
-    )
-    print(f"manifest: {result.manifest}")
-    for item in result.payload.get("handles", []):
-        print(f"{item.get('handle')}: {item.get('status')}")
-    return 0 if result.payload.get("handles") and all(item.get("identity_verified") is True for item in result.payload["handles"]) else 1
-
-
-def handle_instagram_analyze_video(args: argparse.Namespace) -> int:
-    result = analyze_video(
-        wda_client_from_args(args),
-        args.video,
-        prompt=args.prompt,
-        output_dir=args.output_dir or args.evidence_dir,
-        prefix=args.prefix,
-        dry_run=args.dry_run,
-        timeout=args.timeout,
-    )
-    print(f"manifest: {result.manifest}")
-    print(f"status: {result.payload.get('status')}")
-    if result.payload.get("blocker"):
-        print(f"blocker: {result.payload.get('blocker')}")
-    return 0 if result.payload.get("status") in {"analyzed", "dry_run"} else 1
-
-
-def handle_instagram_discover_creators(args: argparse.Namespace) -> int:
-    if not args.no_launch:
-        launch_instagram_for_foreground_work(args)
-    result = discover_creators(
-        wda_client_from_args(args),
-        args.query,
-        output_dir=args.output_dir or args.evidence_dir,
-        prefix=args.prefix,
-        max_candidates=args.max_candidates,
-        deadline_seconds=args.deadline_seconds,
-        max_source_scrolls=args.max_source_scrolls,
-        max_steps=args.max_steps,
-        max_steps_per_candidate=args.max_steps_per_candidate,
-        per_candidate_deadline_seconds=args.per_candidate_deadline_seconds,
-        verification_mode=args.verification_mode,
-        source_open_wait_seconds=args.source_open_wait_seconds,
-    )
-    print(f"manifest: {result.manifest}")
-    print(f"report: {result.report}")
-    summary = result.payload.get("summary", {})
-    print(f"candidates found: {summary.get('candidates_found', 0)}")
-    print(f"handles found: {summary.get('handles_found', 0)}")
-    print(f"follower counts found: {summary.get('follower_counts_found', 0)}")
-    print(f"likely under 10k: {summary.get('likely_under_10k_followers', 0)}")
-    print(f"pregnancy/motherhood evidence: {summary.get('pregnancy_motherhood_evidence', 0)}")
-    print(f"recency evidence: {summary.get('recency_evidence', 0)}")
-    print(f"ui steps: {result.payload.get('ui_steps')}")
-    return 0
-
-
-def handle_instagram_benchmark_discovery(args: argparse.Namespace) -> int:
-    if not args.no_launch:
-        launch_instagram_for_foreground_work(args)
-    result = benchmark_discovery(
-        wda_client_from_args(args),
-        output_dir=args.output_dir or args.evidence_dir,
-        prefix=args.prefix,
-        max_candidates_per_scenario=args.max_candidates_per_scenario,
-        scenario_deadline_seconds=args.scenario_deadline_seconds,
-        max_source_scrolls=args.max_source_scrolls,
-        verification_mode=args.verification_mode,
-        source_open_wait_seconds=args.source_open_wait_seconds,
-    )
-    print(f"manifest: {result.manifest}")
-    print(f"report: {result.report}")
-    summary = result.payload.get("summary", {})
-    print(f"candidates found: {summary.get('candidates_found', 0)}")
-    print(f"handles found: {summary.get('handles_found', 0)}")
-    print(f"follower counts found: {summary.get('follower_counts_found', 0)}")
-    print(f"likely under 10k: {summary.get('likely_under_10k_followers', 0)}")
-    print(f"pregnancy/motherhood evidence: {summary.get('pregnancy_motherhood_evidence', 0)}")
-    print(f"recency evidence: {summary.get('recency_evidence', 0)}")
-    print(f"failed/ambiguous screens: {summary.get('failed_ambiguous_screens', 0)}")
-    for target, passed in (result.payload.get("target_results") or {}).items():
-        print(f"{target}: {'PASS' if passed else 'FAIL'}")
-    return 0
-
-
-def handle_instagram_triage_shortlist(args: argparse.Namespace) -> int:
-    if not args.no_launch:
-        launch_instagram_for_foreground_work(args)
-    result = triage_shortlist(
-        wda_client_from_args(args),
-        output_dir=args.output_dir or args.evidence_dir,
-        prefix=args.prefix,
-        max_candidates_per_scenario=args.max_candidates_per_scenario,
-        source_deadline_seconds=args.source_deadline_seconds,
-        max_source_scrolls=args.max_source_scrolls,
-        verify_top=args.verify_top,
-        verification_deadline_seconds=args.verification_deadline_seconds,
-        per_candidate_deadline_seconds=args.per_candidate_deadline_seconds,
-        shortlist_size=args.shortlist_size,
-        source_open_wait_seconds=args.source_open_wait_seconds,
-    )
-    print(f"manifest: {result.manifest}")
-    print(f"report: {result.report}")
-    summary = result.payload.get("summary", {})
-    print(f"triage candidates found: {summary.get('triage_candidates_found', 0)}")
-    print(f"triage unique handles: {summary.get('triage_unique_handles', 0)}")
-    print(f"triage elapsed seconds: {summary.get('triage_elapsed_seconds')}")
-    print(f"verified count: {summary.get('verified_count', 0)}")
-    print(f"verification elapsed seconds: {summary.get('verification_elapsed_seconds')}")
-    print(f"shortlist count: {summary.get('shortlist_count', 0)}")
-    print(f"total elapsed seconds: {summary.get('elapsed_seconds')}")
-    return 0
-
-
-def handle_instagram_benchmark_ranking_quality(args: argparse.Namespace) -> int:
-    if not args.no_launch:
-        launch_instagram_for_foreground_work(args)
-    result = benchmark_ranking_quality(
-        wda_client_from_args(args),
-        output_dir=args.output_dir or args.evidence_dir,
-        prefix=args.prefix,
-        themes=tuple(args.theme) if args.theme else None,  # type: ignore[arg-type]
-        candidates_per_theme=args.candidates_per_theme,
-        verify_top=args.verify_top,
-        comparison_size=args.comparison_size,
-        comparison_start_rank=args.comparison_start_rank,
-        source_deadline_seconds=args.source_deadline_seconds,
-        verification_deadline_seconds=args.verification_deadline_seconds,
-        per_candidate_deadline_seconds=args.per_candidate_deadline_seconds,
-        max_source_scrolls=args.max_source_scrolls,
-        source_open_wait_seconds=args.source_open_wait_seconds,
-    )
-    print(f"manifest: {result.manifest}")
-    print(f"report: {result.report}")
-    summary = result.payload.get("summary", {})
-    print(f"runs: {summary.get('runs', 0)}")
-    print(f"runs with >=5 credible top leads: {summary.get('runs_with_at_least_5_credible_top_leads', 0)}")
-    print(f"pass rate: {summary.get('pass_rate')}")
-    print(f"target passed: {summary.get('target_passed')}")
-    print(f"top precision: {summary.get('top_precision')}")
-    print(f"comparison precision: {summary.get('comparison_precision')}")
-    print(f"ranking lift vs comparison: {summary.get('ranking_lift_vs_comparison')}")
-    return 0
-
-
-def launch_instagram_for_foreground_work(args: argparse.Namespace) -> None:
-    client = client_from_args(args)
-    device = selected_device(args, client)
-    ensure_unlocked_or_attempt_wda(args, client, device.identifier)
-    app = client.find_app(device.identifier, "Instagram")
-    client.launch_app(device.identifier, app.bundle_identifier)
 
 
 def handle_wda_status(args: argparse.Namespace) -> int:
@@ -1014,7 +410,6 @@ def handle_wda_status(args: argparse.Namespace) -> int:
     print(f"evidence: {artifact}")
     return 0 if status.ready is True else 1
 
-
 def handle_wda_url(args: argparse.Namespace) -> int:
     client = client_from_args(args)
     device = selected_device(args, client)
@@ -1024,13 +419,11 @@ def handle_wda_url(args: argparse.Namespace) -> int:
     print(f"evidence: {artifact}")
     return 0
 
-
 def handle_wda_locked(args: argparse.Namespace) -> int:
     locked = wda_client_from_args(args).locked()
     value = "unknown" if locked is None else str(locked).lower()
     print(f"locked: {value}")
     return 0 if locked is not None else 1
-
 
 def handle_wda_unlock(args: argparse.Namespace) -> int:
     if args.verify:
@@ -1063,12 +456,10 @@ def handle_wda_unlock(args: argparse.Namespace) -> int:
     print("result: ok")
     return 0
 
-
 def handle_wda_lock(args: argparse.Namespace) -> int:
     wda_client_from_args(args).lock()
     print("locked: true")
     return 0
-
 
 def handle_watchdog_once(args: argparse.Namespace) -> int:
     try:
@@ -1177,7 +568,6 @@ def handle_watchdog_once(args: argparse.Namespace) -> int:
     print("result: still-locked")
     return 1
 
-
 def handle_wda_run(args: argparse.Namespace) -> int:
     config = load_config()
     wda_path = resolve_wda_path(args.wda_path or config.get("OPENCLAW_IPHONE_WDA_PATH"))
@@ -1207,7 +597,6 @@ def handle_wda_run(args: argparse.Namespace) -> int:
         )
     )
 
-
 def ensure_unlocked_or_attempt_wda(args: argparse.Namespace, client: DeviceCtl, device_id: str) -> None:
     # passcodeRequired=false is not proof the screen is unlocked.
     client.require_unlocked(device_id)
@@ -1220,7 +609,6 @@ def ensure_unlocked_or_attempt_wda(args: argparse.Namespace, client: DeviceCtl, 
     if locked is not False:
         raise DeviceLocked("Screen lock state is locked or unknown after one recovery attempt.")
 
-
 def passcode_required_from_lock_state(data: dict[str, object]) -> bool | None:
     result = data.get("result")
     if not isinstance(result, dict):
@@ -1228,133 +616,31 @@ def passcode_required_from_lock_state(data: dict[str, object]) -> bool | None:
     value = result.get("passcodeRequired")
     return value if isinstance(value, bool) else None
 
-
 def bool_value(value: bool | None) -> str:
     return "unknown" if value is None else str(value).lower()
 
 
-def handle_ui_screenshot(args: argparse.Namespace) -> int:
-    path = UIController(
-        wda_client_from_args(args),
-        evidence_base=args.evidence_dir,
-    ).capture_screenshot(args.output)
-    print(f"screenshot: {path}")
-    return 0
-
-
-def handle_ui_source(args: argparse.Namespace) -> int:
-    path = UIController(
-        wda_client_from_args(args),
-        evidence_base=args.evidence_dir,
-    ).capture_source(args.output)
-    print(f"source: {path}")
-    return 0
-
-
-def handle_ui_elements(args: argparse.Namespace) -> int:
-    path = UIController(
-        wda_client_from_args(args),
-        evidence_base=args.evidence_dir,
-    ).save_elements(args.output, visible_only=not args.all)
-    print(f"elements: {path}")
-    return 0
-
-
-def handle_ui_annotated_screenshot(args: argparse.Namespace) -> int:
-    screenshot, elements, html = UIController(
-        wda_client_from_args(args),
-        evidence_base=args.evidence_dir,
-    ).annotated_screenshot(args.output, visible_only=not args.all)
-    print(f"screenshot: {screenshot}")
-    print(f"elements: {elements}")
-    print(f"annotation: {html}")
-    return 0
-
-
-def handle_ui_tap(args: argparse.Namespace) -> int:
-    UIController(wda_client_from_args(args), evidence_base=args.evidence_dir).tap(args.x, args.y)
-    print(f"tapped: {args.x:g},{args.y:g}")
-    return 0
-
-
-def handle_ui_tap_text(args: argparse.Namespace) -> int:
-    element = UIController(wda_client_from_args(args), evidence_base=args.evidence_dir).tap_text(
-        args.text,
-        exact=args.exact,
-    )
-    print(f"tapped: {element.index}\t{element.type}\t{element.text}")
-    return 0
-
-
-def handle_ui_wait_text(args: argparse.Namespace) -> int:
-    element = UIController(wda_client_from_args(args), evidence_base=args.evidence_dir).wait_text(
-        args.text,
-        timeout=args.timeout,
-        interval=args.interval,
-        exact=args.exact,
-    )
-    print(f"found: {element.index}\t{element.type}\t{element.text}")
-    return 0
-
-
-def handle_ui_scroll_until_text(args: argparse.Namespace) -> int:
-    element = UIController(wda_client_from_args(args), evidence_base=args.evidence_dir).scroll_until_text(
-        args.text,
-        max_scrolls=args.max_scrolls,
-        exact=args.exact,
-        start_x=args.from_x,
-        start_y=args.from_y,
-        end_x=args.to_x,
-        end_y=args.to_y,
-        duration=args.duration,
-    )
-    print(f"found: {element.index}\t{element.type}\t{element.text}")
-    return 0
-
-
-def handle_ui_type(args: argparse.Namespace) -> int:
-    UIController(wda_client_from_args(args), evidence_base=args.evidence_dir).type_text(
-        args.text,
-        frequency=args.frequency,
-    )
-    print(f"typed: {len(args.text)} chars")
-    return 0
-
-
-def handle_ui_clear_field(args: argparse.Namespace) -> int:
-    element = UIController(wda_client_from_args(args), evidence_base=args.evidence_dir).clear_field(
-        args.text,
-        exact=args.exact,
-    )
-    if element is None:
-        print("cleared: focused-field")
-    else:
-        print(f"cleared: {element.index}\t{element.type}\t{element.text}")
-    return 0
-
-
-def handle_ui_drag(args: argparse.Namespace) -> int:
-    UIController(wda_client_from_args(args), evidence_base=args.evidence_dir).drag(
-        args.from_x,
-        args.from_y,
-        args.to_x,
-        args.to_y,
-        duration=args.duration,
-    )
-    print(f"dragged: {args.from_x:g},{args.from_y:g} -> {args.to_x:g},{args.to_y:g}")
-    return 0
-
-
-def handle_ui_press_button(args: argparse.Namespace) -> int:
-    UIController(wda_client_from_args(args), evidence_base=args.evidence_dir).press_button(
-        args.name,
-        duration=args.duration,
-    )
-    print(f"pressed: {args.name}")
-    return 0
-
-
-def handle_ui_back(args: argparse.Namespace) -> int:
-    UIController(wda_client_from_args(args), evidence_base=args.evidence_dir).back()
-    print("back: true")
-    return 0
+def handle_session(args: argparse.Namespace) -> int:
+    emit = json_line_emitter(sys.stdout)
+    connection = None
+    try:
+        config = load_config()
+        if config.wda_url:
+            raise ValueError("Session control requires the selected phone's CoreDevice endpoint; remove the URL override.")
+        connection = Connection(client_from_args(args), device=device_selector_from_args(args, config=config),
+                                seconds=args.operation_timeout, read_timeout=args.read_timeout)
+        with connection:
+            session = Session(connection, allow_images=args.allow_images, evidence_base=args.evidence_dir)
+            emit({"status": "ready", "protocol": 2, "device_udid": connection.device.udid})
+            code = serve(session, read_requests(sys.stdin.fileno()), emit)
+        emit({"status": "session_end", "cleanup": "warning" if connection.cleanup_failed else "completed"})
+        return code
+    except SessionOutputUnavailable:
+        return 1
+    except (ValueError, OSError, OpenClawIPhoneError, KeyboardInterrupt):
+        try:
+            emit({"status": "error", "reason": "session_unavailable_or_interrupted",
+                  "cleanup": "warning" if connection and connection.cleanup_failed else "completed"})
+        except SessionOutputUnavailable:
+            pass
+        return 1

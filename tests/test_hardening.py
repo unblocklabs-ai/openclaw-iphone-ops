@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import argparse
 import contextlib
 import io
@@ -12,25 +11,13 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import unittest
 from unittest.mock import Mock, patch
-
 from openclaw_iphone import cli
 from openclaw_iphone.control_lock import control_lock
 from openclaw_iphone.devicectl import Device, DeviceCtl
 from openclaw_iphone.errors import DeviceLocked, DeviceSelectionError, WDAOutcomeUnknown, WDAUnavailable, WDAUnsupportedCommand
 from openclaw_iphone.evidence import artifact_path, write_private
 from openclaw_iphone.execution import Budget
-from openclaw_iphone.instagram_context import capture_instagram_context, parse_instagram_source
-from openclaw_iphone.instagram_ops import build_discovery_candidate, pregnancy_evidence, verify_discovery_handle, verify_handles
-from openclaw_iphone.ui import UIController
 from openclaw_iphone.wda import WDAClient, find_xcode_container
-
-
-def profile_source(handle: str, *, visible: str = "true", y: int = 29) -> str:
-    return f'''<XCUIElementTypeApplication bundleId="com.burbn.instagram">
-      <XCUIElementTypeStaticText name="{handle}" label="{handle}" visible="{visible}" y="{y}" />
-      <XCUIElementTypeButton name="user-detail-header-followers" value="123 followers" />
-    </XCUIElementTypeApplication>'''
-
 
 class EvidenceTests(unittest.TestCase):
     def test_private_unique_files_even_with_permissive_umask(self):
@@ -57,19 +44,6 @@ class EvidenceTests(unittest.TestCase):
                     write_private(path, "replace")
             self.assertEqual(target.read_text(), "keep")
 
-    def test_context_capture_is_private_and_unique(self):
-        client = Mock()
-        client.source.return_value = profile_source("creator")
-        client.screenshot.return_value = b"png"
-        with tempfile.TemporaryDirectory() as tmp:
-            captures = [capture_instagram_context(client, output_dir=tmp) for _ in range(2)]
-            self.assertNotEqual(captures[0].manifest, captures[1].manifest)
-            for capture in captures:
-                for path in (capture.screenshot, capture.source, capture.manifest):
-                    self.assertEqual(path.stat().st_mode & 0o777, 0o600)
-            for prefix in ("../escape", "/absolute", "", "a/b"):
-                with self.assertRaises(ValueError):
-                    capture_instagram_context(client, output_dir=tmp, prefix=prefix)
 
 
 class ActionSafetyTests(unittest.TestCase):
@@ -89,30 +63,16 @@ class ActionSafetyTests(unittest.TestCase):
         client = self.client()
         client._json_post.side_effect = [WDAUnsupportedCommand("unsupported"), {"value": None}, {"value": None}]
         with self.assertLogs("openclaw_iphone.wda", level="WARNING"):
-            UIController(client).back()
+            client.back()
         self.assertEqual(client._json_post.call_count, 3)
 
     def test_ambiguous_back_failure_never_retries_or_taps(self):
         client = self.client(action_error=WDAOutcomeUnknown("timeout"))
         with self.assertRaises(WDAOutcomeUnknown):
-            UIController(client).back()
+            client.back()
         client._create_session.assert_not_called()
         self.assertEqual(client._json_post.call_count, 1)
 
-    def test_back_rejects_unsafe_or_ambiguous_controls(self):
-        for controls in (
-            '<XCUIElementTypeButton name="Back up now" visible="true" x="1" y="2" width="20" height="20"/>',
-            '<XCUIElementTypeButton name="Close account" visible="true" x="1" y="2" width="20" height="20"/>',
-            '<XCUIElementTypeStaticText name="Back" visible="true" x="1" y="2" width="20" height="20"/>',
-            '<XCUIElementTypeButton name="Back" visible="true" enabled="false" x="1" y="2" width="20" height="20"/>',
-            '<XCUIElementTypeButton name="Back" visible="true" x="1" y="2" width="20" height="20"/>' * 2,
-        ):
-            client = Mock()
-            client.back.side_effect = WDAUnsupportedCommand("missing")
-            client.source.return_value = f"<App>{controls}</App>"
-            with self.subTest(controls=controls), self.assertRaises(WDAUnavailable):
-                UIController(client).back()
-            client.tap.assert_not_called()
 
     def test_locked_or_unknown_screen_blocks_mutations(self):
         for locked in (True, None):
@@ -154,39 +114,6 @@ class ActionSafetyTests(unittest.TestCase):
                 bounded.locked()
             self.assertEqual(request.call_count, 1)
         self.assertIsNone(client.deadline)
-
-
-class IdentityTests(unittest.TestCase):
-    def test_search_query_alone_is_not_personal_topical_evidence(self):
-        self.assertEqual(pregnancy_evidence("pregnancy", {"source_tag": "pregnancy", "source_evidence": [{"label": "Video by unrelated.creator"}]}, {}, {}), [])
-
-    def test_parser_requires_visible_unambiguous_header(self):
-        for visible, y in (("false", 29), ("true", 500)):
-            profile = parse_instagram_source(profile_source("wrong", visible=visible, y=y))["current_profile"]
-            self.assertNotIn("username", profile)
-        source = profile_source("first").replace("</XCUIElementTypeApplication>", '<XCUIElementTypeStaticText name="second" label="second" visible="true" y="30"/></XCUIElementTypeApplication>')
-        self.assertNotIn("username", parse_instagram_source(source)["current_profile"])
-        wrapped = "<AppiumAUT>" + profile_source("creator") + "</AppiumAUT>"
-        self.assertEqual(parse_instagram_source(wrapped)["current_profile"]["username"], "creator")
-
-    def test_wrong_profile_is_reported_and_never_attributed(self):
-        client = Mock()
-        client.with_deadline.return_value = client
-        client.screenshot.return_value = b"png"
-        client.source.return_value = profile_source("wrong.creator")
-        with tempfile.TemporaryDirectory() as tmp, patch("openclaw_iphone.instagram_ops.time.sleep"):
-            result = verify_discovery_handle(client, "wanted.creator", output_dir=tmp, prefix="test", deadline_seconds=5, max_steps=4)
-            handles = verify_handles(client, ["wanted.creator"], output_dir=tmp)
-        self.assertEqual(result["status"], "identity_mismatch")
-        self.assertEqual(handles.payload["handles"][0]["status"], "identity_mismatch")
-        self.assertEqual(result["observed_handle"], "wrong.creator")
-        candidate = build_discovery_candidate("pregnancy", {"handle": "wanted.creator"}, {**result, "profile": {"username": "wrong.creator", "followers": "123", "bio": "pregnancy"}})
-        self.assertFalse(candidate["deep_link_verified"])
-        self.assertIsNone(candidate["follower_count"])
-        self.assertIsNone(candidate["bio"])
-        self.assertEqual(candidate["result_bucket"], "rejected_or_ambiguous")
-        client.tap.assert_not_called()
-        client.type_text.assert_not_called()
 
 
 class DeviceAndSetupTests(unittest.TestCase):
@@ -264,7 +191,7 @@ class DeviceAndSetupTests(unittest.TestCase):
     def test_cli_rejects_unbounded_numeric_values_before_actions(self):
         for timeout in ("nan", "inf", "0", "-1"):
             with contextlib.redirect_stderr(io.StringIO()), patch("openclaw_iphone.cli.wda_client_from_args") as client:
-                self.assertEqual(cli.main(["ui", "wait-text", "Search", "--timeout", timeout]), 1)
+                self.assertEqual(cli.main(["session", "--operation-timeout", timeout]), 1)
                 client.assert_not_called()
 
 
@@ -361,7 +288,3 @@ class ProtocolAndSnippetTests(unittest.TestCase):
         with self.assertRaisesRegex(WDAUnavailable, "Ambiguous"):
             module.find_element(client, "session", "name == 'Get'")
         self.assertEqual(client._json_post.call_args.args[0], "/session/session/elements")
-
-
-if __name__ == "__main__":
-    unittest.main()
