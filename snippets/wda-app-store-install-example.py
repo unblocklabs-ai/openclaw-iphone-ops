@@ -15,7 +15,7 @@ from openclaw_iphone.config import load_config
 from openclaw_iphone.control_lock import control_lock
 from openclaw_iphone.devicectl import DeviceCtl
 from openclaw_iphone.errors import OpenClawIPhoneError, WDAUnavailable
-from openclaw_iphone.ui import UIController
+from openclaw_iphone.evidence import artifact_path, write_private
 from openclaw_iphone.wda import WDAClient
 
 
@@ -68,7 +68,6 @@ def main() -> int:
         raise WDAUnavailable("WDA is not ready.")
     client.require_unlocked()
     device_client.launch_app(device.identifier, "com.apple.AppStore")
-    controller = UIController(client)
 
     with client.session() as session:
         visible = "visible == 1 AND enabled == 1"
@@ -83,7 +82,7 @@ def main() -> int:
         result = find_element(client, session, f"{visible} AND name == {json.dumps(app_name)}", timeout=30)
         tap(client, session, result)
         find_element(client, session, f"{visible} AND name == {json.dumps(publisher)}")
-        controller.annotated_screenshot()
+        write_private(artifact_path("app-store", ".png"), client.screenshot())
         # Recommendations may still be on screen. A human confirms this one
         # install action; never infer the intended app from a generic cloud icon.
         if input("Verify the exact app and publisher on the phone. Type INSTALL to continue: ") != "INSTALL":
@@ -95,7 +94,7 @@ def main() -> int:
     apps, _ = device_client.list_apps(device.identifier, include_all=True)
     if not any(app.bundle_identifier == bundle_id for app in apps):
         raise WDAUnavailable("Open was visible, but the expected bundle is not installed. Success unverified.")
-    controller.annotated_screenshot()
+    write_private(artifact_path("app-store", ".png"), client.screenshot())
     print("Expected bundle is installed. No credential or secure-confirmation automation was attempted.")
     return 0
 

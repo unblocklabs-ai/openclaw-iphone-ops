@@ -181,11 +181,11 @@ Once the LaunchAgent is installed, ask OpenClaw to treat WDA as a service:
 ```text
 Use the plugged-in physical iPhone via the WDA LaunchAgent from
 the canonical openclaw-iphone checkout and host config at
-~/.openclaw/iphone/config.env. Use one task session; acquisition checks readiness,
-device identity and lock state. If acquisition fails, use `doctor --check-ui`,
+~/.openclaw/iphone/config.env. Use one direct session; acquisition checks readiness
+and physical device identity. Mutations check screen lock. If acquisition fails, use `doctor --check-ui`,
 then inspect `launchctl print` and
 `~/Library/Logs/openclaw/iphone-wda-run*.log`. If lock recovery is failing,
 inspect `~/Library/Logs/openclaw/iphone-watchdog*.log`. Restart the relevant
-LaunchAgent only when diagnosis warrants it, then reacquire the task session.
+LaunchAgent only after authorization and diagnosis, then reacquire the session.
 Reuse action results; do not add a status/screenshot/source preflight chain.
 ```

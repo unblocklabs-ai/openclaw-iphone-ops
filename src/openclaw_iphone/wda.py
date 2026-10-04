@@ -173,7 +173,7 @@ class WDAClient:
 
         iOS can drop all but the first text event in a synthesized multi-key
         batch. Keep separate requests for this explicit compatibility strategy;
-        use type_text_bulk for normal fields or tap_sequence for native keypads.
+        use type_text_bulk for normal fields.
         """
         if not text:
             return {"value": None}
@@ -201,37 +201,14 @@ class WDAClient:
                         ],
                     }]})
                 except (WDAUnavailable, DeviceLocked, TaskStopped) as exc:
-                    raise WDAOutcomeUnknown(
+                    failure = WDAOutcomeUnknown(
                         f"Typing stopped after {index} acknowledged characters; the next may have been entered. "
                         "Inspect the field before retrying; do not replay the full text."
-                    ) from exc
+                    )
+                    failure.acknowledged_characters = index
+                    raise failure from exc
             return response
 
-    def tap_sequence(self, points: list[tuple[float, float]]) -> dict[str, Any]:
-        """One bounded keypad gesture; caller validates current layout/focus.
-
-        This is not a multi-screen macro. No observation or retry between keys;
-        the caller must verify the final value or destination.
-        """
-        if not 1 <= len(points) <= 32 or any(
-            len(point) != 2 or any(type(v) not in (int, float) or not math.isfinite(v) or v < 0 for v in point)
-            for point in points
-        ):
-            raise ValueError("Tap sequence requires 1–32 finite nonnegative point pairs.")
-        sources = []
-        for index, (x, y) in enumerate(points):
-            # One touch path per press. Reusing a lifted path makes some WDA
-            # versions synthesize an extra implicit touch at the next move.
-            actions = [{"type": "pause", "duration": index * 125}] if index else []
-            actions.extend([
-                {"type": "pointerMove", "duration": 0, "x": x, "y": y},
-                {"type": "pointerDown", "button": 0},
-                {"type": "pause", "duration": 50},
-                {"type": "pointerUp", "button": 0},
-            ])
-            sources.append({"type": "pointer", "id": f"key{index}",
-                            "parameters": {"pointerType": "touch"}, "actions": actions})
-        return self._perform_session_actions(sources)
 
     def type_text_bulk(self, text: str, *, frequency: int | None = None) -> dict[str, Any]:
         """Append to the focused field. No automatic fallback or replay on failure.

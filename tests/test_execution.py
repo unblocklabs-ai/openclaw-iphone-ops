@@ -1,19 +1,13 @@
 from pathlib import Path
 import io
 import json
-import tempfile
 import unittest
 from unittest.mock import Mock, patch
 from urllib.parse import urlsplit
-
-from openclaw_iphone.connection import TaskConnection
-from openclaw_iphone.control_lock import control_lock
-from openclaw_iphone.devicectl import Device
-from openclaw_iphone.errors import DeviceLocked, DeviceSelectionError, OpenClawIPhoneError, WDAOutcomeUnknown, WDAUnavailable
+from openclaw_iphone.errors import DeviceLocked, WDAOutcomeUnknown, WDAUnavailable
 from openclaw_iphone.execution import Budget, TaskStopped
 from openclaw_iphone.runner import Runner
 from openclaw_iphone.wda import WDAClient
-
 
 class TransportTests(unittest.TestCase):
     def test_bulk_has_constant_request_count_at_http_boundary(self):
@@ -103,77 +97,3 @@ class TransportTests(unittest.TestCase):
         self.assertNotIn("private", summary)
         self.assertNotIn("secret", summary)
         self.assertEqual(client.metrics.counts["wda POST /session/:id/element/:id/value"], 1)
-
-
-class ConnectionTests(unittest.TestCase):
-    def test_read_only_recovery_still_requires_original_physical_udid(self):
-        ctl = Mock()
-        ctl.runner = Runner()
-        ctl.select_device.side_effect = [Device("one", "core", "connected", "iPhone", "one"),
-                                         Device("two", "core", "connected", "iPhone", "two")]
-        ctl.coredevice_wda_url.return_value = ("http://wda.test", None)
-        wda = TransportTests().client()
-        wda.is_ready = Mock(return_value=True)
-        wda.require_unlocked = Mock(side_effect=DeviceLocked("locked"))
-        with tempfile.TemporaryDirectory() as tmp, patch("openclaw_iphone.connection.WDAClient", return_value=wda):
-            with TaskConnection(ctl, lock_path=Path(tmp) / "lock", read_only=True) as task:
-                task.invalidate()
-                with self.assertRaises(DeviceSelectionError):
-                    task.recover_read()
-                self.assertFalse(task.valid)
-        self.assertEqual(ctl.select_device.call_args_list[1].args, ("one",))
-        self.assertEqual(ctl.select_device.call_args_list[1].kwargs, {"read_only": True})
-        ctl.require_unlocked.assert_not_called()
-        wda.require_unlocked.assert_not_called()
-
-    def test_ownership_cached_setup_and_same_udid_recovery(self):
-        ctl = Mock()
-        ctl.runner = Runner()
-        original_metrics = ctl.runner.metrics
-        ctl.select_device.return_value = Device("phone", "core", "connected", "iPhone", "physical")
-        ctl.coredevice_wda_url.return_value = ("http://wda.test", None)
-        wda = TransportTests().client()
-        wda.is_ready = Mock(return_value=True)
-        with tempfile.TemporaryDirectory() as tmp, patch("openclaw_iphone.connection.WDAClient", return_value=wda):
-            lock = Path(tmp) / "control.lock"
-            task = TaskConnection(ctl, seconds=10, lock_path=lock)
-            with task:
-                for _ in range(3):
-                    self.assertIs(task.require_active(), wda)
-                ctl.select_device.assert_called_once()
-                with self.assertRaises(OpenClawIPhoneError), control_lock(lock):
-                    pass
-                task.invalidate()
-                task.recover_read()
-                ctl.select_device.assert_called_with("physical")
-                task.invalidate(uncertain=True)
-                with self.assertRaises(TaskStopped):
-                    task.recover_read()
-                with self.assertRaises(TaskStopped):
-                    task.require_active()
-            with control_lock(lock):
-                pass
-            self.assertIsNone(ctl.runner.budget)
-            self.assertIs(ctl.runner.metrics, original_metrics)
-            with self.assertRaises(TaskStopped):
-                task.__enter__()
-
-    def test_recovery_refuses_changed_physical_device(self):
-        ctl = Mock()
-        ctl.runner = Runner()
-        ctl.select_device.side_effect = [Device("one", "core", "connected", "iPhone", "one"),
-                                         Device("two", "core", "connected", "iPhone", "two")]
-        ctl.coredevice_wda_url.return_value = ("http://wda.test", None)
-        wda = TransportTests().client()
-        wda.is_ready = Mock(return_value=True)
-        with tempfile.TemporaryDirectory() as tmp, patch("openclaw_iphone.connection.WDAClient", return_value=wda):
-            with TaskConnection(ctl, lock_path=Path(tmp) / "lock") as task:
-                task.invalidate()
-                with self.assertRaises(DeviceSelectionError):
-                    task.recover_read()
-                self.assertFalse(task.valid)
-                self.assertEqual(ctl.coredevice_wda_url.call_count, 1)
-
-
-if __name__ == "__main__":
-    unittest.main()
