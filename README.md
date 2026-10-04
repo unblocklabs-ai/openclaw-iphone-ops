@@ -23,7 +23,7 @@ Keep the process and its stdin/stdout pipes open. Send one JSON object per line;
 read each response before making the next decision. For example:
 
 ```json
-{"op":"observe","mode":"both"}
+{"op":"observe"}
 {"op":"tap","target":{"role":"XCUIElementTypeButton","label":"Search"}}
 {"op":"type","text":"a search query"}
 {"op":"press","button":"enter","observe":"image"}
@@ -34,6 +34,12 @@ read each response before making the next decision. For example:
 Coordinates default to device points. Image-pixel coordinates explicitly use
 `"space":"image"`. See [the session protocol](docs/session.md) for units,
 target IDs, input replacement, private input files, masking and failure outcomes.
+
+Observation is a screen, not a native view-tree dump: readable content and
+controls, short IDs, meaningful parent groups, bounds and state. Empty layout
+wrappers stay internal. With image disclosure enabled, the default also returns
+a screenshot. Large screens page automatically within the output budget;
+follow `next_offset` without recapturing the screen or invalidating earlier IDs.
 
 The session pins one physical phone and holds exclusive control. Timeouts apply
 to operations, not agent deliberation. There are no grants, task files, quotas,

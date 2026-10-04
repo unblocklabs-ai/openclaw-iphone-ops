@@ -14,8 +14,12 @@ Read [the session protocol](../../docs/session.md), then retain **one** `session
 process and its pipes across requests. The agent chooses actions and judges
 completion. No task file, grants, second model, quota or reconciliation step.
 
-- Observe AX, image, or both as needed; labels/bounds/hierarchy are available
-  by default, values omitted. Images require explicit `--allow-images`.
+- `observe` returns AX and a screenshot when `--allow-images` is enabled,
+  otherwise AX only. Choose an explicit mode when only one is needed. AX shows
+  text, controls, bounds, state and short IDs; `parent` links meaningful groups,
+  without native layout noise. Text values are omitted. If `next_offset` is
+  present, page that same snapshot with `observe` + `offset`; earlier IDs stay
+  valid. A fresh offset-0 observation replaces the snapshot.
 - Tap a semantic selector/returned ID or coordinates. Coordinate swipes and
   images do not need AX. Device points are default; image pixels explicitly
   use `space: image` and the returned image geometry.

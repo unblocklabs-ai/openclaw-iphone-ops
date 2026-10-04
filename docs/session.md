@@ -31,10 +31,22 @@ Hold onto the process across the workflow. Don't recreate it after each step.
 {"op":"close"}
 ```
 
-- `observe` defaults to accessibility. `image` and coordinate `swipe`/`tap` do
+- `observe` returns a screen: AX plus a screenshot when `--allow-images` is set,
+  otherwise AX only. Explicit `mode` still selects either independently.
+  `image` and coordinate `swipe`/`tap` do
   not require accessibility. `both` reports each component independently.
-- AX responses show 80 visible elements by default. Use `limit` (1–200) and
-  `offset` to page through the tree; `next_offset` tells you where to continue.
+- AX shows readable content and controls, including unnamed controls, their
+  bounds, enabled/focus/selection state and short snapshot-local IDs. Empty
+  layout wrappers and duplicate container text are collapsed. `parent` links
+  preserve meaningful groups (for example, which account owns a button).
+  Full paths and native ancestors stay internal for locating the target.
+- AX pages contain at most 80 screen elements by default (`limit`: 1–200),
+  automatically stopping earlier to fit the output budget. `next_offset` tells
+  you where to continue with `{"op":"observe","offset":NEXT_OFFSET}`.
+  These pages reuse the captured AX snapshot and IDs without another device
+  read; their default is AX only. Parent IDs may refer to earlier pages. A fresh
+  observation at offset 0 replaces the snapshot. Paging is disclosure of a
+  prior screen, not evidence of current state.
 - Actions accept optional `observe: accessibility|image|both`, otherwise no
   automatic capture or verification is performed. `masks` applies to images.
 - Coordinates are device points, unless `space: image` explicitly selects
@@ -44,7 +56,8 @@ Hold onto the process across the workflow. Don't recreate it after each step.
   without changing geometry: the caller remains responsible for visual intent.
 - A target selector uses exact `role`, optional `name`, `label`, and
   `ancestor_label`. Native lookup must resolve exactly one visible enabled
-  element. Ambiguity returns current candidates. Snapshot IDs come from the last
+  element. Ambiguity returns current candidates with their meaningful groups.
+  Snapshot IDs come from the last
   AX observation; they resolve current identity and ancestor context, not stored
   coordinates or value. New observations replace the ID map. Cross-app ID use
   is rejected; ordinary app transitions do not change session permissions.
@@ -60,7 +73,8 @@ Hold onto the process across the workflow. Don't recreate it after each step.
 - `text_ref` is an owner-only regular UTF-8 file owned by the current user,
   read at request time; symlinks and oversized files are rejected. One trailing
   newline is removed. Paths, text, and exception bodies are never echoed.
-  AX values are omitted; secure fields' names/labels are omitted; supplied
+  AX text values are omitted; known Boolean checkbox/switch state is returned as
+  `checked`, and native selection as `selected`. Secure fields' names/labels are omitted; supplied
   input is suppressed in subsequent label projections. Images require separate
   disclosure approval and explicit masks where needed.
 
@@ -99,8 +113,10 @@ newline-framed requests produce `invalid_request` and leave the session open.
   Inspect before retrying any interrupted action.
 - Requests are at most 4 KiB; partial/nonterminated frames expire after five
   seconds. Idle between frames is unlimited. Outputs are bounded to 64 KiB;
-  oversized responses retain the receipt and request a smaller observation
-  `limit`, without closing. Stalled/disconnected output ends ownership without replaying input.
+  oversized responses retain the receipt and a successful image where it fits,
+  without closing. Ordinary AX is byte-paged before reaching this fallback;
+  callers do not need to guess a smaller limit. Stalled/disconnected output
+  ends ownership without replaying input.
 - Evidence is a unique owner-only file/directory. Caller-specified mask rectangles
   are `[x,y,width,height]` in device points. Masking hides only these rectangles,
   not arbitrary secrets; it is not anonymization or permission to share images.

@@ -65,6 +65,10 @@ class Session:
         raise AssertionError("Unreachable read retry state.")
 
     def _accessibility(self, *, limit: int = 80, offset: int = 0) -> dict[str, object]:
+        if offset:
+            if self.snapshot is None:
+                raise ValueError("Observe a screen before paging it.")
+            return self.snapshot.compact(include_labels=True, limit=limit, offset=offset, redact=self._redact)
         def capture(wda: WDAClient) -> Observation:
             started = time.monotonic()
             app = wda.active_app()
@@ -128,6 +132,14 @@ class Session:
             candidates = view["elements"]
             if selector:
                 ids = {e.id for e in self.snapshot.matches(selector)}
+                by_id = {e["id"]: e for e in candidates}
+                for candidate in candidates:
+                    if candidate["id"] not in ids:
+                        continue
+                    parent = candidate.get("parent")
+                    while parent in by_id:
+                        ids.add(parent)
+                        parent = by_id[parent].get("parent")
                 candidates = [e for e in candidates if e["id"] in ids]
             raise TargetUnavailable(candidates)
         return refs[0]
@@ -169,7 +181,8 @@ class Session:
                     "launch": {"bundle_id"}, "open_url": {"url"}}
         if required.get(op, set()) - set(data) or op == "tap" and data.get("target") is None and not {"x", "y"} <= set(data):
             raise ValueError("Missing operation argument.")
-        mode = data.get("mode", "accessibility") if op == "observe" else data.get("observe")
+        default_mode = "both" if self.allow_images and not data.get("offset", 0) else "accessibility"
+        mode = data.get("mode", default_mode) if op == "observe" else data.get("observe")
         if mode is not None and mode not in ("image", "accessibility", "both"):
             raise ValueError("Unknown observation mode.")
         masks = data.get("masks", [])
@@ -179,6 +192,8 @@ class Session:
         limit, offset = data.get("limit", 80), data.get("offset", 0)
         if type(limit) is not int or not 1 <= limit <= 200 or type(offset) is not int or not 0 <= offset <= 2000:
             raise ValueError("Invalid observation page.")
+        if offset and op != "observe":
+            raise ValueError("Only observations can page a captured screen.")
         if mode in ("image", "both") and not self.allow_images:
             raise ValueError("Image disclosure requires --allow-images.")
         if op == "close":

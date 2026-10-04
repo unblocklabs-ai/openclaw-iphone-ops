@@ -65,6 +65,11 @@ class JsonLineEmitter:
             summary = {key: value[key] for key in ("status", "dispatch", "reason", "acknowledged_substeps",
                        "acknowledged_characters", "cleanup", "request_sequence") if key in value}
             summary["output_warning"] = "response_too_large_reduce_observation_limit"
+            observation = value.get("observation")
+            if isinstance(observation, dict) and "image" in observation:
+                preserved = dict(summary, observation={"image": observation["image"], "accessibility_error": "response_too_large"})
+                if len((json.dumps(preserved) + "\n").encode()) <= self.max_bytes:
+                    summary = preserved
             raw = (json.dumps(summary) + "\n").encode()
         budget = Budget.seconds(self.seconds)
         try:

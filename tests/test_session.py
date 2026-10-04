@@ -215,6 +215,67 @@ class SessionTests(unittest.TestCase):
             self.assertFalse(any(path == "/source" for _, path, _ in server.requests))
             self.finish(proc, base)
 
+    def test_default_screen_keeps_context_unnamed_controls_and_image_without_layout_noise(self):
+        with self.running(images=True) as (proc, server, base):
+            attrs = 'visible="true" enabled="true" x="1" y="2" width="4" height="4"'
+            rows = ''.join(f'<XCUIElementTypeCell label="{account}" {attrs}>'
+                f'<XCUIElementTypeOther {attrs}><XCUIElementTypeButton label="Disconnect" {attrs}/>'
+                '</XCUIElementTypeOther></XCUIElementTypeCell>' for account in ('Personal', 'Work'))
+            controls = ''.join(f'<XCUIElementTypeButton label="Option {i}" {attrs}/>' for i in range(35))
+            controls += (f'<XCUIElementTypeButton {attrs}/><XCUIElementTypeTextField focused="true" {attrs}/>'
+                         f'<XCUIElementTypeSwitch label="Airplane" value="1" {attrs}/>'
+                         f'<XCUIElementTypeButton label="Tab" selected="true" {attrs}/>')
+            server.xml = (f'<XCUIElementTypeApplication bundleId="test.app" {attrs}>'
+                + f'<XCUIElementTypeOther {attrs}>' * 38 + rows + controls
+                + '</XCUIElementTypeOther>' * 38 + '</XCUIElementTypeApplication>')
+            result = self.request(proc, {"op": "observe"})
+            view = result["observation"]
+            self.assertTrue(Path(view["image"]["path"]).is_file())
+            elements = view["accessibility"]["elements"]
+            self.assertEqual(len(elements), 43)  # Two groups, two controls, 39 other controls.
+            by_id = {e["id"]: e for e in elements}
+            disconnects = [e for e in elements if e.get("label") == "Disconnect"]
+            self.assertEqual([by_id[e["parent"]]["label"] for e in disconnects], ["Personal", "Work"])
+            self.assertTrue(any(e["role"] == "XCUIElementTypeButton" and not e.get("label") for e in elements))
+            self.assertTrue(any(e["role"] == "XCUIElementTypeTextField" and not e.get("label") for e in elements))
+            self.assertTrue(next(e for e in elements if e.get("label") == "Airplane")["checked"])
+            self.assertTrue(next(e for e in elements if e.get("label") == "Tab")["selected"])
+            self.assertTrue(next(e for e in elements if e["role"] == "XCUIElementTypeTextField")["focused"])
+            self.assertLess(len(json.dumps(result).encode()), 16_384)
+            self.assertEqual(self.request(proc, {"op": "tap", "target": disconnects[1]["id"]})["dispatch"], "acknowledged")
+            server.elements = ["one", "two"]
+            ambiguous = self.request(proc, {"op": "tap", "target": {"role": "XCUIElementTypeButton", "label": "Disconnect"}})
+            self.assertEqual(ambiguous["dispatch"], "not_sent")
+            by_id = {e["id"]: e for e in ambiguous["candidates"]}
+            self.assertEqual([by_id[e["parent"]]["label"] for e in ambiguous["candidates"] if e.get("label") == "Disconnect"], ["Personal", "Work"])
+            self.finish(proc, base)
+
+    def test_screen_pages_fit_output_and_keep_snapshot_ids_without_another_capture(self):
+        with self.running(images=True) as (proc, server, base):
+            attrs = 'visible="true" enabled="true" x="1" y="2" width="4" height="4"'
+            labels = [f'{i} ' + '\U0001f680' * 240 for i in range(160)]
+            server.xml = f'<XCUIElementTypeApplication bundleId="test.app" {attrs}>' + ''.join(
+                f'<XCUIElementTypeButton label="{label}" {attrs}/>' for label in labels) + '</XCUIElementTypeApplication>'
+            first = self.request(proc, {"op": "observe", "limit": 200})
+            self.assertTrue(Path(first["observation"]["image"]["path"]).is_file())
+            page = first["observation"]["accessibility"]
+            snapshot_id = page["snapshot_id"]
+            first_id = page["elements"][0]["id"]
+            seen = []
+            server.xml = XML  # Paging must describe the captured screen, not this new one.
+            while True:
+                self.assertEqual(page["snapshot_id"], snapshot_id)
+                self.assertLess(len(json.dumps(page, ensure_ascii=True).encode()), 60_000)
+                seen.extend(e["label"] for e in page["elements"])
+                if page["next_offset"] is None:
+                    break
+                page = self.request(proc, {"op": "observe", "offset": page["next_offset"], "limit": 200})["observation"]["accessibility"]
+            self.assertEqual(seen, labels)
+            self.assertEqual(sum(route == "/source" for _, route, _ in server.requests), 1)
+            self.assertEqual(sum(route == "/screenshot" for _, route, _ in server.requests), 1)
+            self.assertEqual(self.request(proc, {"op": "tap", "target": first_id})["dispatch"], "acknowledged")
+            self.finish(proc, base)
+
     def test_repeated_read_recovery_stays_pinned_and_refuses_replacement(self):
         with self.running() as (proc, server, base):
             for _ in range(3):
@@ -368,6 +429,11 @@ class ProtocolTests(unittest.TestCase):
             result = json.loads(raw)
             self.assertEqual((result["dispatch"], result["acknowledged_substeps"]), ("acknowledged", 1))
             self.assertNotIn("private", result)
+            JsonLineEmitter(writer, max_bytes=512)({"status": "action", "dispatch": "acknowledged",
+                "observation": {"accessibility": {"private": "x" * 1000}, "image": {"path": "/private/screen.png"}}})
+            result = json.loads(os.read(reader, 1024))
+            self.assertEqual(result["observation"]["image"]["path"], "/private/screen.png")
+            self.assertNotIn("private", result["observation"].get("accessibility", {}))
             JsonLineEmitter(writer)({"status": "still_usable"})
             self.assertEqual(json.loads(os.read(reader, 1024))["status"], "still_usable")
         finally:
