@@ -103,7 +103,8 @@ Hold onto the process across the workflow. Don't recreate it after each step.
   identified group, and coordinates year, month, then day. It checks the whole
   final date because later wheels may clamp earlier components. Recognizable
   English named/abbreviated months and native Year/Month/Day labels identify
-  components without assuming their screen order. Numeric formats preserve
+  components without assuming their screen order. Native birthday wheels with
+  an omitted year (`----`) accept the supplied year. Numeric formats preserve
   digit style, leading-zero conventions and native unit text. If component
   identity is ambiguous, supply `components` mapping
   `year`, `month`, `day` to the usual targets; the group target is then optional.

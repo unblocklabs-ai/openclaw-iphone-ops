@@ -156,7 +156,8 @@ def date_components(wda: WDAClient, ref: str | None, components: dict | None,
     refs = {}
     for wheel, value in values.items():
         number = number_value(value)
-        if number is not None and number > 31:
+        # Native birthday wheels use ---- for an omitted year.
+        if value == "----" or number is not None and number > 31:
             part = "year"
         elif number is None and month_number(value, month_values) is not None:
             part = "month"
@@ -194,7 +195,7 @@ def set_date(wda: WDAClient, refs: dict[str, str], current: dict[str, str], desi
         month = calendar.month_abbr[desired.month]
     else:
         raise InputUnavailable("date_month_values_required")
-    values = {"year": format_number(desired.year, current["year"]), "month": month,
+    values = {"year": str(desired.year) if current["year"] == "----" else format_number(desired.year, current["year"]), "month": month,
               "day": format_number(desired.day, current["day"])}
     secrets.update(values.values())
     def direction(part: str, value: str) -> str:

@@ -82,6 +82,7 @@ class PhoneServer(ThreadingHTTPServer):
         self.transition_to = "test.app"
         self.fail_picker_readback = False
         self.native_date = date(2023, 3, 31)
+        self.year_omitted = False
         self.date_max = None
         self.date_min = None
         self.month_values = list(calendar.month_name)[1:]
@@ -97,10 +98,14 @@ class PhoneServer(ThreadingHTTPServer):
         self.fail_read_after = set()
 
     def wheel_value(self, part):
+        if part == "year" and self.year_omitted:
+            return "----"
         value = getattr(self.native_date, part)
         return self.month_values[value - 1] if part == "month" else str(value) + self.number_suffixes[part]
 
     def adjust_date(self, part, value):
+        if part == "year":
+            self.year_omitted = False
         values = {part: getattr(self.native_date, part) for part in ("year", "month", "day")}
         values[part] = self.month_values.index(value) + 1 if part == "month" else int(value.removesuffix(self.number_suffixes[part]))
         values["day"] = min(values["day"], calendar.monthrange(values["year"], values["month"])[1])
@@ -456,6 +461,11 @@ class SessionTests(unittest.TestCase):
             result = self.request(proc, {"op": "set", "target": target, "value": "2024-02-29"})
             self.assertEqual((result["dispatch"], result["effect"], result["acknowledged_substeps"]),
                              ("not_sent", "match", 0))
+            # Native Contacts represents a birthday without a year as ----.
+            server.year_omitted = True
+            result = self.request(proc, {"op": "set", "target": target, "value": "1990-10-14"})
+            self.assertEqual((server.native_date, result.get("effect")), (date(1990, 10, 14), "match"))
+            self.assertFalse(server.year_omitted)
             server.date_max = date(2024, 2, 28)
             server.native_date = date(2023, 3, 31)
             result = self.request(proc, {"op": "set", "target": target, "value": "2024-02-29"})
