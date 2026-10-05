@@ -28,12 +28,12 @@ except ValueError:
 if interval < 1:
     print("OPENCLAW_IPHONE_WATCHDOG_INTERVAL must be a positive integer.", file=sys.stderr)
     raise SystemExit(2)
-if interval > 86400:
-    print("OPENCLAW_IPHONE_WATCHDOG_INTERVAL must be between 1 and 86400 seconds.", file=sys.stderr)
+try:
+    install_launchagent(script_repo, Path(os.environ["TEMPLATE"]), Path(os.environ["TARGET"]),
+                        "openclaw-iphone-watchdog.sh", interval=interval)
+except OverflowError:
+    print("OPENCLAW_IPHONE_WATCHDOG_INTERVAL does not fit a plist integer.", file=sys.stderr)
     raise SystemExit(2)
-
-install_launchagent(script_repo, Path(os.environ["TEMPLATE"]), Path(os.environ["TARGET"]),
-                    "openclaw-iphone-watchdog.sh", interval=interval)
 PY
 
 plutil -lint "$TARGET"

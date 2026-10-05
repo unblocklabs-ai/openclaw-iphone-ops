@@ -6,16 +6,10 @@ from unittest.mock import patch
 
 from openclaw_iphone.devicectl import DeviceCtl
 from openclaw_iphone.errors import CommandFailed
-from openclaw_iphone.runner import Runner, shell_quote
+from openclaw_iphone.runner import Runner
 
 
 class RunnerTests(unittest.TestCase):
-    def test_shell_quote_leaves_safe_values_unquoted(self) -> None:
-        self.assertEqual(shell_quote("com.burbn.instagram"), "com.burbn.instagram")
-
-    def test_shell_quote_quotes_spaces(self) -> None:
-        self.assertEqual(shell_quote("Pearl's iPhone"), "'Pearl'\"'\"'s iPhone'")
-
     def test_coredevice_timeout_reports_fixed_phase_without_private_arguments(self) -> None:
         command = ["xcrun", "devicectl", "device", "info", "details", "--device", "private-id", "--json-output", "/private/path"]
         for args in (command, ["tool"]):

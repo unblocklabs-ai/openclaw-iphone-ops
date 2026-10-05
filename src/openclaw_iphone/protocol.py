@@ -33,30 +33,35 @@ def strict_json(raw: bytes | str) -> object:
 
 
 def read_requests(fd: int, *, frame_timeout: float = 5) -> Iterator[bytes]:
-    pending = b""
+    pending = bytearray()
     started = None
     oversized = False
     while True:
-        if started is not None and time.monotonic() - started >= frame_timeout:
+        timeout = None if started is None else frame_timeout - (time.monotonic() - started)
+        if timeout is not None and timeout <= 0:
             raise FramingError("Incomplete request frame timed out.")
-        ready, _, _ = select.select([fd], [], [], 0.2)
+        ready, _, _ = select.select([fd], [], [], timeout)
         if not ready:
-            continue
-        chunk = os.read(fd, 4096)
+            raise FramingError("Incomplete request frame timed out.")
+        chunk = os.read(fd, 65_536)
         if not chunk:
             if pending or oversized:
                 raise FramingError("Request needs a terminating newline.")
             return
-        for byte in chunk:
-            if started is None:
+        parts = chunk.split(b"\n")
+        for index, part in enumerate(parts):
+            if part and started is None:
                 started = time.monotonic()
-            if byte == 10:
-                yield b"" if oversized else pending
-                pending, oversized, started = b"", False, None
-            elif not oversized:
-                pending += bytes([byte])
-                if len(pending) > 4096:
-                    pending, oversized = b"", True
+            if not oversized:
+                if len(pending) + len(part) > 65_536:
+                    pending.clear()
+                    oversized = True
+                else:
+                    pending.extend(part)
+            if index < len(parts) - 1:
+                yield b"" if oversized else bytes(pending)
+                pending.clear()
+                oversized, started = False, None
 
 
 class JsonLineEmitter:

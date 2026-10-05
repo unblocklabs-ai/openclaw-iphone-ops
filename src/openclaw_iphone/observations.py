@@ -50,9 +50,9 @@ class Selector:
     def __post_init__(self) -> None:
         if not re.fullmatch(r"XCUIElementType[A-Za-z]+", self.role):
             raise ValueError("Selector requires an exact XCUIElementType role.")
-        if any(value is not None and (not isinstance(value, str) or not value or len(value) > 256)
+        if any(value is not None and (not isinstance(value, str) or not value)
                for value in (self.name, self.label, self.ancestor_label)):
-            raise ValueError("Selector labels must be short non-empty strings.")
+            raise ValueError("Selector labels must be non-empty strings.")
 
     def xpath(self) -> str:
         """Live predicate lookup, not a durable action reference."""
@@ -193,8 +193,6 @@ class Observation:
         non-secure screen can contain private messages or credentials.
         Display truncation never changes the full source/targets.
         """
-        if not 1 <= limit <= 200:
-            raise ValueError("Compact observation limit must be from 1 to 200.")
         projection = self.projection
         if ids is not None:
             ids = set(ids)
@@ -205,7 +203,7 @@ class Observation:
                     ids.add(parent)
                     parent = parent_by_id.get(parent)
             projection = tuple((e, p) for e, p in projection if e.id in ids)
-        screen = []
+        rows, size = [], 0
         for element, parent in projection[offset:offset + limit]:
             label = redact(element.label or "")[:256]
             row = {"id": element.id, "role": element.role, "enabled": element.enabled,
@@ -223,11 +221,7 @@ class Observation:
                     row["label"] = label
                 if element.name and element.name != element.label:
                     row["name"] = redact(element.name)[:256]
-            screen.append(row)
-        # Leave room for the envelope, image metadata and action receipts. A page
-        # boundary is determined here, not by throwing away the emitter's output.
-        rows, size = [], 0
-        for row in screen:
+            # Leave room for the envelope, image metadata and action receipts.
             row_size = len(json.dumps(row, ensure_ascii=True, separators=(",", ":")).encode()) + 1
             if size + row_size > 48_000:
                 break
@@ -269,7 +263,7 @@ def parse_observation(source: str, *, generation: int, device_udid: str,
 
     def walk(node: ET.Element, path: str, ancestors: tuple, depth: int) -> None:
         nonlocal secure
-        if depth > 60 or len(elements) >= 2000:
+        if depth > 60:
             raise ObservationRejected("Accessibility tree exceeds limits; nothing was truncated into an actionable snapshot.")
         role = node.tag
         if not re.fullmatch(r"XCUIElementType[A-Za-z]+", role):

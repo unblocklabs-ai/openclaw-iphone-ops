@@ -22,7 +22,8 @@ completion. No task file, grants, second model, quota or reconciliation step.
   valid. A fresh offset-0 observation replaces the snapshot.
 - Tap a semantic selector/returned ID or coordinates. Coordinate swipes and
   images do not need AX. Device points are default; image pixels explicitly
-  use `space: image` and the returned image geometry.
+  use `space: image`. Conversion fetches dimensions once per image; recapture
+  after rotation or layout changes.
 - Use `set` with a complete `value` for text, picker options and Boolean states.
   Text replaces; an empty string clears. Native input handles keyboard focus;
   no letter-by-letter agent calls are needed. Literal newlines require TextView.
@@ -33,15 +34,16 @@ completion. No task file, grants, second model, quota or reconciliation step.
   `observe` attaches the next view without changing acknowledged dispatch.
 - Set a wheel-style Gregorian date in one request: `set`, picker target,
   `kind: date`, and `value: YYYY-MM-DD`. The controller identifies supported
-  components and handles dependencies and final readback. Ambiguous identity
+  components and handles dependencies. `verify: true` optionally reads the final
+  date; otherwise native acknowledgement is not proof of the final value. Ambiguous identity
   uses explicit `components`; localized months use `month_values` in calendar
   order. Do not assume screen order or non-Gregorian conversion. For an ordinary
-  wheel, `set` uses an exact native option and handles adjustments internally;
+  wheel, `set` sends an exact native option once without hidden adjustments;
   `pick` exposes explicit low-level control when needed. Boolean `set` avoids
   toggling a correct state. Readback uncertainty is not input failure or a
   permanent stop; ordinary controls remain available.
 - Optional `launch.wait_seconds` checks foreground before capture. Optional
-  `set.verify`/`type.verify` compare whole-field replacement privately, returning only
+  `set.verify` reads back the requested value; `type.verify` compares whole-field replacement privately, returning only
   match/mismatch/unknown. Neither adds mandatory verification or blind retries.
 - Inspect unknown/partial outcomes before retrying. The session never replays
   writes; uncertainty does not block subsequent deliberate requests.

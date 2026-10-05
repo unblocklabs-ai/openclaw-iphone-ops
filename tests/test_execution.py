@@ -1,11 +1,8 @@
-from pathlib import Path
-import io
 import json
 import unittest
 import time
 from unittest.mock import Mock, patch
-from urllib.parse import urlsplit
-from openclaw_iphone.errors import DeviceLocked, WDAOutcomeUnknown, WDAUnavailable
+from openclaw_iphone.errors import WDAOutcomeUnknown, WDAUnavailable
 from openclaw_iphone.execution import Budget, TaskStopped
 from openclaw_iphone.runner import Runner
 from openclaw_iphone.wda import WDAClient
@@ -17,11 +14,11 @@ class TransportTests(unittest.TestCase):
             routes = []
             def respond(url, path, method, body, timeout, *, max_bytes):
                 routes.append((method, path))
-                payload = {"sessionId": "one", "value": {}} if path == "/session" else {"value": False if path == "/wda/locked" else None}
+                payload = {"sessionId": "one", "value": {}} if path == "/session" else {"value": None}
                 return 200, json.dumps(payload).encode()
             with patch("openclaw_iphone.wda.exchange", side_effect=respond):
                 client.type_text_bulk(text)
-            self.assertEqual(routes, [("GET", "/wda/locked"), ("POST", "/session"),
+            self.assertEqual(routes, [("POST", "/session"),
                                       ("POST", "/session/one/appium/settings"),
                                       ("POST", "/session/one/wda/keys"), ("DELETE", "/session/one")])
 
@@ -35,7 +32,6 @@ class TransportTests(unittest.TestCase):
 
     def client(self):
         client = WDAClient(url="http://wda.test")
-        client.locked = Mock(return_value=False)
         client._create_session = Mock(return_value="one")
         client._delete_session = Mock()
         client._json_post = Mock(return_value={"value": None})
@@ -63,14 +59,6 @@ class TransportTests(unittest.TestCase):
         with self.assertRaisesRegex(WDAOutcomeUnknown, "1 acknowledged characters"):
             client.type_text("ab", frequency=100)
         self.assertEqual(client._json_post.call_count, 2)
-
-    def test_typing_checks_lock_before_session_creation(self):
-        for method in ("type_text", "type_text_bulk"):
-            client = self.client()
-            client.locked.return_value = None
-            with self.assertRaises(DeviceLocked):
-                getattr(client, method)("text")
-            client._create_session.assert_not_called()
 
     def test_expired_budget_starts_no_network_or_subprocess_and_no_count(self):
         budget = Budget.seconds(10)

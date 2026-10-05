@@ -7,9 +7,9 @@ CoreDevice selects the phone by physical UDID and supplies the USB tunnel URL.
 A signed WebDriverAgentRunner stays running under Xcode/launchd.
 [One session](session.md) owns the control lock and reuses WDA.
 
-WDA checks screen lock at the mutation boundary. Read-only acquisition and
-capture do not need an unlocked screen. A clear/type compound input shares one
-lock check. Do not layer extra diagnosis/lock probes on every agent action.
+Controls dispatch without lock-status preflights. Use explicit lock/unlock/status
+commands for diagnosis or recovery, not as a ritual before input. Plain screenshots
+read only the image; device dimensions are fetched for masking or coordinate conversion.
 
 Safe reads may reacquire the same physical phone; writes are never automatically
 replayed. Cleanup has its own bounded deadline, and cleanup failure does not

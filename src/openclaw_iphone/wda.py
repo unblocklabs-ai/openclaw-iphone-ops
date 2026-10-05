@@ -15,7 +15,7 @@ from typing import Any, Iterator
 from xml.etree import ElementTree as ET
 import urllib.parse
 
-from .errors import DeviceLocked, WDAOutcomeUnknown, WDASetupError, WDAStaleElement, WDAUnavailable, WDAUnsupportedCommand, WDAReadUnavailable, WDATransportUnavailable
+from .errors import WDAOutcomeUnknown, WDASetupError, WDAStaleElement, WDAUnavailable, WDAUnsupportedCommand, WDAReadUnavailable, WDATransportUnavailable
 from .execution import Budget, Metrics, TaskStopped
 from .transport import exchange, TransportFailure
 from .xcode import resolve_developer_dir
@@ -24,7 +24,6 @@ from .xcode import resolve_developer_dir
 DEFAULT_WDA_PORT = 8100
 DEFAULT_WDA_SCHEME = "WebDriverAgentRunner"
 DEFAULT_WDA_CONFIGURATION = "Debug"
-DEFAULT_SCREEN_READ_TIMEOUT = 12.0
 
 
 @dataclass(frozen=True)
@@ -39,9 +38,17 @@ class SessionState:
     cleanup_failed: bool = False
 
 
+@dataclass(frozen=True)
+class NativeElement:
+    ref: str
+    role: str | None
+    label: str | None
+    value: str | None
+
+
 class WDAClient:
     def __init__(self, *, url: str | None = None, timeout: int = 30,
-                 read_timeout: float = DEFAULT_SCREEN_READ_TIMEOUT) -> None:
+                 read_timeout: float | None = None) -> None:
         if url is None and not os.environ.get("OPENCLAW_IPHONE_WDA_URL"):
             raise WDASetupError(
                 "No WebDriverAgent URL was provided. Use the CLI so it can resolve the "
@@ -52,20 +59,16 @@ class WDAClient:
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("WDA timeout must be finite and positive.")
         self.timeout = timeout
-        if not math.isfinite(read_timeout) or read_timeout <= 0:
+        if read_timeout is not None and (not math.isfinite(read_timeout) or read_timeout <= 0):
             raise ValueError("Screen read timeout must be finite and positive.")
         self.read_timeout = read_timeout
         self.budget: Budget | None = None
         self.metrics = Metrics()
         self._session = SessionState()
-        self._input_checked = False
 
     def status(self) -> WDAStatus:
         payload = self._json_request("/status")
         return WDAStatus(url=self.url, payload=payload, ready=parse_ready(payload))
-
-    def is_ready(self) -> bool:
-        return self.status().ready is True
 
     def source(self, *, compact: bool = False, validate: bool = True) -> str:
         path = ("/source?format=xml&excluded_attributes="
@@ -115,21 +118,6 @@ class WDAClient:
     def unlock(self) -> dict[str, Any]:
         return self._json_post("/wda/unlock", {})
 
-    def require_unlocked(self) -> None:
-        if not self._input_checked and self.locked() is not False:
-            raise DeviceLocked("WDA screen lock state is locked or unknown; verify unlock before UI actions.")
-
-    @contextmanager
-    def input_transaction(self) -> Iterator[None]:
-        """One lock check for a synchronous clear/read/type operation, not a task."""
-        self.require_unlocked()
-        previous = self._input_checked
-        self._input_checked = True
-        try:
-            yield
-        finally:
-            self._input_checked = previous
-
     def lock(self) -> dict[str, Any]:
         return self._json_post("/wda/lock", {})
 
@@ -161,14 +149,11 @@ class WDAClient:
             return {"value": None}
         if frequency is not None and (type(frequency) is not int or frequency <= 0):
             raise ValueError("Typing frequency must be a positive integer.")
-        self.require_unlocked()
         with self.session() as session_id:
             response: dict[str, Any] = {"value": None}
             last_sent = 0.0
             for index, char in enumerate(text):
                 try:
-                    if index and index % 32 == 0:
-                        self.require_unlocked()
                     if index and frequency:
                         delay = max(0, 1 / frequency - (time.monotonic() - last_sent))
                         delay = min(delay, self._request_timeout())
@@ -182,7 +167,7 @@ class WDAClient:
                             {"type": "keyDown", "value": char}, {"type": "keyUp", "value": char},
                         ],
                     }]})
-                except (WDAUnavailable, DeviceLocked, TaskStopped) as exc:
+                except (WDAUnavailable, TaskStopped) as exc:
                     failure = WDAOutcomeUnknown(
                         f"Typing stopped after {index} acknowledged characters; the next may have been entered. "
                         "Inspect the field before retrying; do not replay the full text."
@@ -195,14 +180,13 @@ class WDAClient:
     def type_text_bulk(self, text: str, *, frequency: int | None = None) -> dict[str, Any]:
         """Append to the focused field. No automatic fallback or replay on failure.
 
-        The caller must verify focus and read back the value. A failed request
+        The caller owns focus and optional readback. A failed request
         may have entered any prefix, including the entire string.
         """
         if not text:
             return {"value": None}
         if frequency is not None and (type(frequency) is not int or frequency <= 0):
             raise ValueError("Typing frequency must be a positive integer.")
-        self.require_unlocked()
         with self.session() as session_id:
             payload: dict[str, Any] = {"value": [text]}
             if frequency is not None:
@@ -215,33 +199,24 @@ class WDAClient:
             raise WDAUnavailable("Foreground app identity is unavailable.")
         return value
 
-    def app_state(self, bundle_id: str) -> int:
-        """Known-app state without activeAppInfo's accessibility identifier read."""
-        with self.session() as session_id:
-            value = self._json_post(f"/session/{session_id}/wda/apps/state", {"bundleId": bundle_id}).get("value")
-        if type(value) is not int or value not in range(5):
-            raise WDAUnavailable("Application state is unavailable.")
-        return value
-
     def activate_app(self, bundle_id: str) -> dict[str, Any]:
-        self.require_unlocked()
         with self.session() as session_id:
             return self._json_post(f"/session/{session_id}/wda/apps/activate", {"bundleId": bundle_id})
 
-    def find_elements(self, query: str, *, using: str = "xpath", element_id: str | None = None) -> list[str]:
+    def find_elements(self, query: str, *, using: str = "xpath", element_id: str | None = None) -> list[NativeElement]:
         """Read-only query (WDA uses POST); no implicit retries."""
         if using not in {"xpath", "predicate string", "class chain", "accessibility id"}:
             raise ValueError("Unsupported native locator strategy.")
         with self.session() as session_id:
             scope = f"/element/{urllib.parse.quote(element_id, safe='')}" if element_id else ""
-            try:
-                value = self._json_post(f"/session/{session_id}{scope}/elements", {"using": using, "value": query}).get("value")
-            except WDAOutcomeUnknown as exc:
-                # POST /elements is a read, unlike POST /element/.../click.
-                raise WDAUnavailable("WDA element query unavailable; no input dispatched.") from exc
+            value = self._json_post(f"/session/{session_id}{scope}/elements", {"using": using, "value": query}).get("value")
         if not isinstance(value, list):
             raise WDAUnavailable("Invalid WDA element query response.")
-        return [element_identifier(item) for item in value]
+        return [NativeElement(element_identifier(item),
+                              item.get("type") if isinstance(item.get("type"), str) else None,
+                              item.get("label") if isinstance(item.get("label"), str) else None,
+                              item.get("attribute/value") if isinstance(item.get("attribute/value"), str) else None)
+                for item in value]
 
     def active_element(self) -> str:
         with self.session() as session_id:
@@ -287,16 +262,7 @@ class WDAClient:
             raise WDAReadUnavailable("Native element type unavailable.")
         return value
 
-    def element_label(self, element_id: str) -> str | None:
-        with self.session() as session_id:
-            path = f"/session/{session_id}/element/{urllib.parse.quote(element_id, safe='')}/attribute/label"
-            value = self._json_request(path).get("value")
-        if value is not None and not isinstance(value, str):
-            raise WDAReadUnavailable("Native component label unavailable.")
-        return value
-
     def picker_step(self, element_id: str, order: str, *, offset: float) -> dict[str, Any]:
-        self.require_unlocked()
         with self.session() as session_id:
             path = f"/session/{session_id}/wda/pickerwheel/{urllib.parse.quote(element_id, safe='')}/select"
             # One native adjustment, never WDA's unbounded/default 25-attempt loop.
@@ -306,23 +272,17 @@ class WDAClient:
         """Targeted click, clear or caret-based input; callers own authorization."""
         if action not in {"click", "clear", "value"}:
             raise ValueError("Unsupported element action.")
-        self.require_unlocked()
         with self.session() as session_id:
             path = f"/session/{session_id}/element/{urllib.parse.quote(element_id, safe='')}/{action}"
             return self._json_post(path, {"value": [text]} if action == "value" else {})
 
     def clear_text(self) -> dict[str, Any]:
-        self.require_unlocked()
         with self.session() as session_id:
             element_id = self.active_element()
             return self._json_post(f"/session/{session_id}/element/{urllib.parse.quote(element_id, safe='')}/clear", {})
 
     def _perform_session_actions(self, actions: list[dict[str, Any]]) -> dict[str, Any]:
-        self.require_unlocked()
         with self.session() as session_id:
-            duration = max(sum(item.get("duration", 0) for item in source["actions"]) for source in actions) / 1000
-            if duration >= self._request_timeout():
-                raise TaskStopped("Input sequence cannot fit the remaining request deadline; not dispatched.")
             return self._json_post(f"/session/{session_id}/actions", {"actions": actions})
 
     @contextmanager
@@ -339,6 +299,8 @@ class WDAClient:
             # postconditions; do not also wait for the entire app to be idle.
             self._json_post(f"/session/{session_id}/appium/settings", {"settings": {
                 "waitForIdleTimeout": 0, "animationCoolOffTimeout": 0,
+                "shouldUseCompactResponses": False,
+                "elementResponseAttributes": "type,label,attribute/value",
             }})
             yield session_id
         finally:
@@ -353,7 +315,6 @@ class WDAClient:
                 )
 
     def press_button(self, name: str, *, duration: float | None = None) -> dict[str, Any]:
-        self.require_unlocked()
         payload: dict[str, Any] = {"name": name}
         if duration is not None:
             payload["duration"] = duration
@@ -361,7 +322,6 @@ class WDAClient:
             return self._json_post(f"/session/{session_id}/wda/pressButton", payload)
 
     def back(self) -> dict[str, Any]:
-        self.require_unlocked()
         try:
             return self._json_post("/wda/back", {})
         except WDAUnsupportedCommand:
@@ -374,12 +334,10 @@ class WDAClient:
                 raise WDAUnsupportedCommand("WDA back is unavailable on this runner.") from exc
 
     def open_url(self, url: str) -> dict[str, Any]:
-        self.require_unlocked()
         with self.session() as session_id:
             return self._json_post(f"/session/{session_id}/url", {"url": url})
 
     def terminate_app(self, bundle_id: str) -> dict[str, Any]:
-        self.require_unlocked()
         with self.session() as session_id:
             return self._json_post(f"/session/{session_id}/wda/apps/terminate", {"bundleId": bundle_id})
 
@@ -443,7 +401,7 @@ class WDAClient:
 
     def _request(self, path: str, *, method: str = "GET", payload: dict[str, Any] | None = None) -> bytes:
         timeout = self._request_timeout()
-        if read_only_request(method, path):
+        if self.read_timeout is not None and read_only_request(method, path):
             timeout = min(timeout, self.read_timeout)
         route = re.sub(r"/(session|element|pickerwheel)/(?!active(?:/|$))[^/]+", r"/\1/:id", path.split("?", 1)[0])
         with self.metrics.measure(f"wda {method} {route}"):
@@ -477,7 +435,7 @@ class WDAClient:
 
 
 def read_only_request(method: str, path: str) -> bool:
-    return method == "GET" or method == "POST" and path.endswith(("/elements", "/wda/apps/state"))
+    return method == "GET" or method == "POST" and path.endswith("/elements")
 
 
 def element_identifier(value: object) -> str:

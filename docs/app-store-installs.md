@@ -11,7 +11,7 @@
 ## Flow
 
 1. Start one installed `openclaw-iphone session` for the dedicated phone.
-2. Acquisition establishes identity/readiness; input checks lock state.
+2. Acquisition establishes the phone connection.
 3. Launch `com.apple.AppStore`, optionally waiting for foreground identity.
 4. Search for the requested app.
 5. Verify the exact target app title and publisher when visible.
@@ -28,18 +28,12 @@ Never infer the intended app from a generic cloud/Get icon or automate paid
 buttons, credentials or secure confirmation. This is a supervised workflow,
 not a validated unattended installer.
 
-## Default Prompt Choices
-
-- If App Store asks to save the password for free items, choose `Not Now` unless the task explicitly says to save it.
-- If first launch asks whether to share email through Sign in with Apple, choose not to share the email address unless the task explicitly says otherwise.
-
 ## Proof Rules
 
 Do not claim install success from only a visible `Open` button. Also verify installed-app state through `devicectl`.
 
 Minimum evidence for repeat installs:
 
-- Live automation check at start
 - Exact target-result proof before install tap
 - Final success or blocker screen
 - Fresh installed-app proof

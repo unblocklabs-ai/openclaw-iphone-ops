@@ -1,6 +1,6 @@
 {
   "name": "@unblocklabs/openclaw-iphone-ops",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Python CLI and agent skills for controlling a dedicated USB-connected iPhone from macOS.",
   "license": "UNLICENSED",
   "repository": {
@@ -18,8 +18,6 @@
     "src/openclaw_iphone/**/*.py",
     "skills/*/SKILL.md",
     "skills/*/agents/openai.yaml",
-    "snippets/*.sh",
-    "snippets/*.py",
     "snippets/launchd/*.sh",
     "snippets/launchd/*.plist.template",
     "docs/session.md",

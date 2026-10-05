@@ -54,7 +54,7 @@ Hold onto the process across the workflow. Don't recreate it after each step.
   layout wrappers and duplicate container text are collapsed. `parent` links
   preserve meaningful groups (for example, which account owns a button).
   Full paths and native ancestors stay internal for locating the target.
-- AX pages contain at most 80 screen elements by default (`limit`: 1–200),
+- AX pages contain at most 80 screen elements by default (`limit`: positive integer),
   automatically stopping earlier to fit the output budget. `next_offset` tells
   you where to continue with `{"op":"observe","offset":NEXT_OFFSET}`.
   These pages reuse the captured AX snapshot and IDs without another device
@@ -66,9 +66,10 @@ Hold onto the process across the workflow. Don't recreate it after each step.
   task verification belongs to the caller. `masks` applies to images.
 - Coordinates are device points, unless `space: image` explicitly selects
   pixels in the most recent successfully captured image. Returned image
-  metadata includes both sizes. Image coordinates are reusable, not consumable
-  tokens; changed window geometry rejects only that request. Screens may move
-  without changing geometry: the caller remains responsible for visual intent.
+  metadata includes pixel size; `device_size` is null unless masking needed it.
+  Conversion fetches device dimensions on first use and reuses them for that
+  image. Capture a new image after rotation or layout changes. There is no
+  geometry probe before each tap; the caller owns visual intent.
 - A target selector uses exact `role`, optional `name`, `label`, and
   `ancestor_label`. Native lookup must resolve exactly one visible enabled
   element. Ambiguity returns current candidates with their meaningful groups.
@@ -100,8 +101,12 @@ Hold onto the process across the workflow. Don't recreate it after each step.
   `effect: match|mismatch|unknown` is separate from delivery. Unverified text and
   secure/unreadable values return unknown, not a failed action.
 - Date `set` takes a Gregorian `YYYY-MM-DD` value, scopes discovery to the
-  identified group, and coordinates year, month, then day. It checks the whole
-  final date because later wheels may clamp earlier components. Recognizable
+  identified group, and coordinates year, month, then day. One grouped native
+  lookup supplies the wheel identities and values; three native selections
+  set the date. Optional `verify: true` adds one grouped read of the complete
+  result; otherwise `effect: unknown` leaves verification to the caller. There is no
+  per-wheel polling, host-side swipe correction or input replay. Already-correct
+  dates send no input. Later wheels may clamp earlier components. Recognizable
   English named/abbreviated months and native Year/Month/Day labels identify
   components without assuming their screen order. Native birthday wheels with
   an omitted year (`----`) accept the supplied year. Numeric formats preserve
@@ -112,17 +117,19 @@ Hold onto the process across the workflow. Don't recreate it after each step.
   calendar order. This is wheel-style Gregorian entry, not arbitrary calendar,
   compact/inline picker navigation or non-Gregorian conversion. Unsupported
   identity/format returns a specific reason without input or session termination.
-- Wheel `set` selects the native value once, reads back, then adjusts internally
-  if the acknowledged selection differs or the direct route is explicitly
-  unsupported. Adjustment ends on a match, a repeated/no-change value, or the
-  existing operation budget. There is no separate `set` completion timer or
-  blind sleep. Unknown writes or unreadable adjustment state are not replayed.
-  A mismatch or partial result leaves ordinary controls available.
+- Wheel `set` selects the native value once. Optional `verify: true` reads back;
+  otherwise the effect is unknown. No automatic adjustment or fallback follows
+  a mismatch, unsupported route or uncertain write. Use explicit `pick` for
+  bounded wheel adjustments when needed.
 - Boolean `set` uses readable native switch/checkbox/radio/toggle state. Already
-  matching means no input; otherwise it clicks once and reads back. Unknown
+  matching means no input; otherwise it clicks once. Optional `verify: true`
+  reads back; otherwise the effect is unknown. Unknown
   initial state sends no guessed toggle. An app may not permit a state change;
   the result reports mismatch/unknown rather than repeatedly clicking.
-- `verify: true` is optional and requires `mode: replace`: the expected value
+- Inputs dispatch directly without a lock-status preflight. Use explicit
+  lock/unlock/status commands for diagnosis or recovery; native failures are
+  reported without replaying input.
+- For `type`, optional `verify: true` requires `mode: replace`: the expected value
   is the supplied whole field, not an inferred append/caret position. Local
   readback returns only `verification: match|mismatch|unknown`. Secure fields,
   placeholders and unreadable custom fields return unknown. Readback failure
@@ -130,19 +137,20 @@ Hold onto the process across the workflow. Don't recreate it after each step.
 - `pick` requires one explicit native PickerWheel target and exact locale-specific
   `value`. By default it tries native value selection once and reads back.
   Optional `order: next|previous` instead performs at most `max_steps` native
-  wheel adjustments (1–50, default 10), checking after each. `offset` is the native
+  wheel adjustments (`max_steps`: positive integer, default 10), checking after each. `offset` is the native
   wheel offset (greater than 0, at most 0.5, default 0.15), NOT observation paging.
-  `seconds` bounds picker work (greater than 0, at most 30, default 5), also capped
-  by the operation deadline. `effect: match|mismatch|unknown` is separate from
+  Optional positive `seconds` bounds picker work within the operation deadline;
+  otherwise the operation deadline applies. `effect: match|mismatch|unknown` is separate from
   dispatch. An already matching wheel sends no input. Unsupported routes are
   reported; uncertain writes are never replayed or followed by blind swipes.
   Set dependent day/month/year wheels deliberately; no date/locale guessing.
-- `launch.wait_seconds` optionally checks foreground identity within 0–30 seconds
+- `launch.wait_seconds` optionally checks foreground identity for the supplied
+  nonnegative duration, bounded by the operation deadline,
   after exactly one launch, then captures requested evidence. It returns
   `readiness.state: ready|unknown` with checks/time. This proves foreground only,
   not a fully loaded in-app screen. No blind sleep, repeated launch or global
   idle gate. Unready/unknown leaves dispatch acknowledged.
-- Input strings are bounded to 4096 characters. `type` excludes control
+- Input size is bounded by request framing or private-file size. `type` excludes control
   characters; `set` permits literal newlines in TextView only. Use `press`
   for control keys. Hardware buttons: `home`, `volumeUp`, `volumeDown`, `siri`.
   Keyboard controls: `enter`, `delete` (backspace), `tab`, `escape`. `back` uses
@@ -196,14 +204,14 @@ empty polling, and render returned images directly if the host tool permits it.
   A busy session reports advisory owner PID/start/last-activity/request count.
   Live idle owners are never evicted; process exit releases the OS lock.
 - `--operation-timeout` defaults to 30 seconds. Global `--timeout` caps individual
-  subprocess/WDA calls; `--read-timeout` defaults to 12 seconds. Each operation
+  subprocess/WDA calls; optional `--read-timeout` additionally caps safe reads. Each operation
   gets a fresh deadline; idle caller deliberation consumes none of it.
-- Gesture/button durations are at most ten seconds; long robot-side input is not
-  made cancellable merely by limiting the host's HTTP wait.
+- Gesture/button durations have no additional host-side ceiling; long robot-side
+  input is not made cancellable merely by limiting the host's HTTP wait.
   Swipe duration is movement time (minimum 100ms), with no equal-length hold.
 - Cancellation is process interruption (Ctrl-C/SIGINT), which releases ownership.
   Inspect before retrying any interrupted action.
-- Requests are at most 4 KiB; partial/nonterminated frames expire after five
+- Requests are at most 64 KiB; partial/nonterminated frames expire after five
   seconds. Idle between frames is unlimited. Outputs are bounded to 64 KiB;
   oversized responses retain the receipt and a successful image where it fits,
   without closing. Ordinary AX is byte-paged before reaching this fallback;

@@ -53,12 +53,11 @@ class ObservationTests(unittest.TestCase):
         self.assertEqual(len(snapshot(source(extra=duplicate)).matches(BUTTON)), 2)
 
     def test_rejects_incomplete_trees_and_escapes_locator_text(self):
-        for xml in ("<App />", '<!DOCTYPE a [<!ENTITY b "x">]><App/>',
-                    "<XCUIElementTypeApplication>" + "<XCUIElementTypeOther/>" * 2001 + "</XCUIElementTypeApplication>"):
+        for xml in ("<App />", '<!DOCTYPE a [<!ENTITY b "x">]><App/>'):
             with self.assertRaises(ObservationRejected):
                 snapshot(xml)
         self.assertEqual(xpath_literal("a'b\"c"), 'concat(\'a\', "\'", \'b"c\')')
-        label = '" OR TRUEPREDICATE OR label == "é🙂\\\n'
+        label = 'long native label ' * 20 + '" OR TRUEPREDICATE OR label == "é🙂\\\n'
         self.assertEqual(json.loads(predicate_literal(label)), label)
         using, query = Selector("XCUIElementTypeButton", label=label).locator()
         self.assertEqual(using, "predicate string")

@@ -3,20 +3,19 @@ from __future__ import annotations
 
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
-import time
 from typing import Iterator
 
 from .control_lock import control_lock
 from .devicectl import Device, DeviceCtl
 from .errors import DeviceSelectionError, WDAUnavailable
 from .execution import Budget, Metrics
-from .wda import DEFAULT_SCREEN_READ_TIMEOUT, WDAClient
+from .wda import WDAClient
 
 
 class Connection:
     def __init__(self, ctl: DeviceCtl, *, device: str | None = None,
                  seconds: float = 30, lock_path: Path | None = None,
-                 read_timeout: float = DEFAULT_SCREEN_READ_TIMEOUT) -> None:
+                 read_timeout: float | None = None) -> None:
         Budget.seconds(seconds)
         self.ctl, self.requested = ctl, device
         self.seconds, self.read_timeout, self.lock_path = seconds, read_timeout, lock_path
@@ -66,15 +65,13 @@ class Connection:
                 self.wda.budget = None
 
     def _connect(self, selector: str | None) -> None:
-        device = self.ctl.select_device(selector, read_only=True)
+        device = self.ctl.select_device(selector)
         if not device.udid or self.device is not None and device.udid != self.device.udid:
             raise DeviceSelectionError("Physical device identity unavailable or changed.")
         self.device = device
         url, _ = self.ctl.coredevice_wda_url(device.identifier)
         wda = WDAClient(url=url, timeout=self.ctl.runner.timeout, read_timeout=self.read_timeout)
         wda.budget, wda.metrics = self.ctl.runner.budget, self.metrics
-        if not wda.is_ready():
-            raise WDAUnavailable("WDA is not ready.")
         self.wda = wda
         self._sessions.enter_context(wda.session())
         self.valid = True

@@ -58,7 +58,7 @@ latest `origin/main`; preserve unrelated local work.
    npm run release:check -- vX.Y.Z
    npm run preflight
    sh -n bin/openclaw-iphone
-   for script in snippets/*.sh snippets/launchd/*.sh; do sh -n "$script" || exit; done
+   for script in snippets/launchd/*.sh; do sh -n "$script" || exit; done
    ```
 
    Preflight runs the full Python suite, compares all versions, inspects every

@@ -6,9 +6,9 @@ from datetime import date
 import re
 from typing import Callable
 
-from .errors import OpenClawIPhoneError, WDAUnsupportedCommand
+from .errors import OpenClawIPhoneError
 from .observations import CHECKABLE, boolean
-from .wda import WDAClient
+from .wda import NativeElement, WDAClient
 
 Send = Callable[[Callable[[], object]], None]
 TEXT_ROLES = frozenset({"XCUIElementTypeTextField", "XCUIElementTypeSecureTextField",
@@ -23,9 +23,9 @@ class InputUnavailable(OpenClawIPhoneError):
 
 
 class InputReadbackUnavailable(OpenClawIPhoneError):
-    def __init__(self, error: BaseException, *, complete: bool = True) -> None:
+    def __init__(self, error: BaseException) -> None:
         super().__init__("Input readback unavailable.")
-        self.error, self.complete = error, complete
+        self.error = error
 
 
 def readback(wda: WDAClient, ref: str) -> str:
@@ -36,7 +36,7 @@ def readback(wda: WDAClient, ref: str) -> str:
 
 
 def validate_text(text: object, *, multiline: bool = False, empty: bool = False) -> str:
-    if (not isinstance(text, str) or len(text) > 4096 or not empty and not text
+    if (not isinstance(text, str) or not empty and not text
             or any((ord(c) < 32 and not (multiline and c == "\n"))
                    or 0xE000 <= ord(c) <= 0xF8FF or ord(c) == 127 for c in text)):
         raise ValueError("Invalid text; use press for control keys.")
@@ -51,20 +51,19 @@ def iso_date(value: object) -> date:
 
 def write_text(wda: WDAClient, ref: str | None, text: str, send: Send, *,
                replace: bool, strategy: str, frequency: int | None = None) -> None:
-    with wda.input_transaction():
-        if replace:
-            send(lambda: wda.element_action(ref, "clear") if ref else wda.clear_text())
-        if not text:
-            return
-        if strategy == "sequential":
-            if ref:
-                send(lambda: wda.element_action(ref, "click"))
-            send(lambda: wda.type_text(text, frequency=frequency))
-        elif ref:
-            # WDA prepares keyboard focus itself; don't prepend another tap.
-            send(lambda: wda.element_action(ref, "value", text=text))
-        else:
-            send(lambda: wda.type_text_bulk(text, frequency=frequency))
+    if replace:
+        send(lambda: wda.element_action(ref, "clear") if ref else wda.clear_text())
+    if not text:
+        return
+    if strategy == "sequential":
+        if ref:
+            send(lambda: wda.element_action(ref, "click"))
+        send(lambda: wda.type_text(text, frequency=frequency))
+    elif ref:
+        # WDA prepares keyboard focus itself; don't prepend another tap.
+        send(lambda: wda.element_action(ref, "value", text=text))
+    else:
+        send(lambda: wda.type_text_bulk(text, frequency=frequency))
 
 
 def wheel_text(value: str) -> str:
@@ -87,29 +86,24 @@ def format_number(value: int, current: str) -> str:
 
 
 def pick_value(wda: WDAClient, ref: str, value: str, send: Send, *,
-               adjust: bool = False, order: str | None = None,
-               max_steps: int | None = None, offset: float = 0.15,
-               current: str | None = None, direction: Callable[[str], str] | None = None) -> str:
-    current = current if current is not None else wda.element_value(ref, allow_null_empty=False)
-    if current == value or wheel_text(current) == value:
+               order: str | None = None, max_steps: int = 10, offset: float = 0.15,
+               verify: bool = True,
+               current: str | None = None) -> str:
+    if current is not None and (current == value or wheel_text(current) == value):
         return "match"
     if order is None:
-        try:
-            send(lambda: wda.element_action(ref, "value", text=value))
-        except WDAUnsupportedCommand:
-            if not adjust:
-                raise
-            # An explicit unsupported response proves this route sent no input.
+        send(lambda: wda.element_action(ref, "value", text=value))
+        if not verify:
+            return "unknown"
         current = readback(wda, ref)
         if current == value or wheel_text(current) == value:
             return "match"
-        if not adjust:
-            return "mismatch"
+        return "mismatch"
+    current = current if current is not None else wda.element_value(ref, allow_null_empty=False)
     seen = {current}
     steps = 0
-    while max_steps is None or steps < max_steps:
-        adjustment = order or (direction(current) if direction else "next")
-        send(lambda: wda.picker_step(ref, adjustment, offset=offset))
+    while steps < max_steps:
+        send(lambda: wda.picker_step(ref, order, offset=offset))
         steps += 1
         current = readback(wda, ref)
         if current == value or wheel_text(current) == value:
@@ -120,13 +114,15 @@ def pick_value(wda: WDAClient, ref: str, value: str, send: Send, *,
     return "mismatch"
 
 
-def set_checked(wda: WDAClient, ref: str, value: bool, send: Send) -> str:
-    current = boolean(wda.element_value(ref))
+def set_checked(wda: WDAClient, ref: str, value: bool, send: Send, *, current: str | None, verify: bool) -> str:
+    current = boolean(current)
     if current is None:
         return "unknown"
     if current == value:
         return "match"
     send(lambda: wda.element_action(ref, "click"))
+    if not verify:
+        return "unknown"
     current = boolean(readback(wda, ref))
     return "unknown" if current is None else "match" if current == value else "mismatch"
 
@@ -142,19 +138,26 @@ def month_number(value: str, month_values: list[str] | None) -> int | None:
     return number if number is not None and 1 <= number <= 12 else None
 
 
+WHEELS = "**/XCUIElementTypePickerWheel[`visible == 1 AND enabled == 1`]"
+
+
 def date_components(wda: WDAClient, ref: str | None, components: dict | None,
-                    resolve: Callable[[str | dict], str], month_values: list[str] | None) -> tuple[dict[str, str], dict[str, str]]:
+                    resolve: Callable[[str | dict], NativeElement], month_values: list[str] | None) -> dict[str, NativeElement]:
     if components is not None:
-        refs = {part: resolve(target) for part, target in components.items()}
-        if len(set(refs.values())) != 3 or any(wda.element_type(wheel) != WHEEL for wheel in refs.values()):
+        wheels = {part: resolve(target) for part, target in components.items()}
+        if len({wheel.ref for wheel in wheels.values()}) != 3 or any(wheel.role != WHEEL for wheel in wheels.values()):
             raise InputUnavailable("date_components_must_be_distinct_native_wheels")
-        return refs, {part: wheel_text(wda.element_value(wheel, allow_null_empty=False)) for part, wheel in refs.items()}
-    wheels = wda.find_elements(".//XCUIElementTypePickerWheel[@visible='true' and @enabled='true']", element_id=ref)
+        if any(not isinstance(wheel.value, str) for wheel in wheels.values()):
+            raise InputUnavailable("date_component_value_unavailable")
+        return wheels
+    wheels = wda.find_elements(WHEELS, using="class chain", element_id=ref)
     if len(wheels) != 3:
         raise InputUnavailable("date_component_mapping_required")
-    values = {wheel: wheel_text(wda.element_value(wheel, allow_null_empty=False)) for wheel in wheels}
+    if any(not isinstance(wheel.value, str) for wheel in wheels):
+        raise InputUnavailable("date_component_value_unavailable")
     refs = {}
-    for wheel, value in values.items():
+    for wheel in wheels:
+        value = wheel_text(wheel.value)
         number = number_value(value)
         # Native birthday wheels use ---- for an omitted year.
         if value == "----" or number is not None and number > 31:
@@ -168,22 +171,23 @@ def date_components(wda: WDAClient, ref: str | None, components: dict | None,
         refs[part] = wheel
     remaining = [wheel for wheel in wheels if wheel not in refs.values()]
     if set(refs) == {"year", "month"} and len(remaining) == 1:
-        number = number_value(values[remaining[0]])
+        number = number_value(wheel_text(remaining[0].value))
         if number is not None and 1 <= number <= 31:
             refs["day"] = remaining[0]
     # Numeric dates can be ambiguous. Use explicit native labels, not positions.
     if set(refs) != {"year", "month", "day"}:
         refs = {}
         for wheel in wheels:
-            label = (wda.element_label(wheel) or "").casefold()
+            label = (wheel.label or "").casefold()
             if label not in {"year", "month", "day"} or label in refs:
                 raise InputUnavailable("date_component_mapping_required")
             refs[label] = wheel
-    return refs, {part: values[wheel] for part, wheel in refs.items()}
+    return refs
 
 
-def set_date(wda: WDAClient, refs: dict[str, str], current: dict[str, str], desired: date, send: Send,
-             month_values: list[str] | None, secrets: set[str]) -> str:
+def set_date(wda: WDAClient, group: str | None, wheels: dict[str, NativeElement], desired: date, send: Send,
+             month_values: list[str] | None, secrets: set[str], *, verify: bool) -> str:
+    current = {part: wheel_text(wheel.value) for part, wheel in wheels.items()}
     month = current["month"]
     if month_values:
         month = month_values[desired.month - 1]
@@ -198,25 +202,21 @@ def set_date(wda: WDAClient, refs: dict[str, str], current: dict[str, str], desi
     values = {"year": str(desired.year) if current["year"] == "----" else format_number(desired.year, current["year"]), "month": month,
               "day": format_number(desired.day, current["day"])}
     secrets.update(values.values())
-    def direction(part: str, value: str) -> str:
-        current_number = month_number(value, month_values) if part == "month" else number_value(value)
-        if current_number is None:
-            raise InputUnavailable("date_component_format_unsupported")
-        desired_number = getattr(desired, part)
-        if part == "month":
-            return "next" if (desired_number - current_number) % 12 <= (current_number - desired_number) % 12 else "previous"
-        return "previous" if current_number > desired_number else "next"
-    with wda.input_transaction():
-        for part in ("year", "month", "day"):
-            try:
-                pick_value(wda, refs[part], values[part], send, adjust=True,
-                           current=current["year"] if part == "year" else None,
-                           direction=lambda value: direction(part, value))
-            except InputReadbackUnavailable as exc:
-                exc.complete = part == "day"
-                raise
-        # Later wheels can clamp earlier components; check the complete date.
-        final = {part: wheel_text(readback(wda, ref)) for part, ref in refs.items()}
+    if current == values:
+        return "match"
+    for part in ("year", "month", "day"):
+        send(lambda: wda.element_action(wheels[part].ref, "value", text=values[part]))
+    if not verify:
+        return "unknown"
+    # One native snapshot verifies the complete date, including clamping.
+    try:
+        final_wheels = wda.find_elements(WHEELS, using="class chain", element_id=group)
+    except (OpenClawIPhoneError, OSError) as exc:
+        raise InputReadbackUnavailable(exc) from exc
+    by_ref = {wheel.ref: wheel.value for wheel in final_wheels}
+    if any(not isinstance(by_ref.get(wheel.ref), str) for wheel in wheels.values()):
+        return "unknown"
+    final = {part: wheel_text(by_ref[wheel.ref]) for part, wheel in wheels.items()}
     final_month = month_number(final["month"], month_values)
     final_year, final_day = number_value(final["year"]), number_value(final["day"])
     if final_month is None or final_year is None or final_day is None:
@@ -228,7 +228,7 @@ def set_date(wda: WDAClient, refs: dict[str, str], current: dict[str, str], desi
     return "match" if observed == desired else "mismatch"
 
 
-def input_kind(role: str, value: object, kind: str | None) -> str:
+def input_kind(role: str | None, value: object, kind: str | None) -> str:
     if kind == "date" or role == "XCUIElementTypeDatePicker":
         return "date"
     if type(value) is bool and role in CHECKABLE:

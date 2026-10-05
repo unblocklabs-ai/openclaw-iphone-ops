@@ -15,7 +15,7 @@ from unittest.mock import Mock, patch
 from openclaw_iphone import cli
 from openclaw_iphone.control_lock import control_lock
 from openclaw_iphone.devicectl import Device, DeviceCtl
-from openclaw_iphone.errors import DeviceLocked, DeviceSelectionError, WDAOutcomeUnknown, WDAUnavailable, WDAUnsupportedCommand
+from openclaw_iphone.errors import DeviceSelectionError, WDAOutcomeUnknown, WDAUnavailable, WDAUnsupportedCommand
 from openclaw_iphone.evidence import artifact_path, write_private
 from openclaw_iphone.execution import Budget
 from openclaw_iphone.wda import WDAClient, find_xcode_container
@@ -50,7 +50,6 @@ class EvidenceTests(unittest.TestCase):
 class ActionSafetyTests(unittest.TestCase):
     def client(self, *, cleanup_error=True, action_error=None):
         client = WDAClient(url="http://wda.test")
-        client.locked = Mock(return_value=False)
         client._create_session = Mock(return_value="one")
         client._delete_session = Mock(side_effect=WDAUnavailable("cleanup") if cleanup_error else None)
         def post(path, payload):
@@ -74,15 +73,6 @@ class ActionSafetyTests(unittest.TestCase):
         client._create_session.assert_not_called()
         self.assertEqual(client._json_post.call_count, 1)
 
-
-    def test_locked_or_unknown_screen_blocks_mutations(self):
-        for locked in (True, None):
-            for action in (lambda c: c.tap(1, 2), lambda c: c.open_url("test:"), lambda c: c.back(), lambda c: c.clear_text()):
-                client = self.client()
-                client.locked.return_value = locked
-                with self.assertRaises(DeviceLocked):
-                    action(client)
-                client._json_post.assert_not_called()
 
     def test_protocol_error_at_http_200_is_not_success(self):
         client = WDAClient(url="http://wda.test")
@@ -264,7 +254,7 @@ class ProtocolAndSnippetTests(unittest.TestCase):
                                 release_cleanup.set()
                                 server.shutdown()
                                 thread.join()
-                        expected_requests = [("GET", "/wda/locked"), ("POST", "/session"),
+                        expected_requests = [("POST", "/session"),
                             ("POST", "/session/one/appium/settings")]
                         expected_requests += [("POST", action_path)] * (2 if operation == "typing" else 1)
                         if cleanup_body != "expired":

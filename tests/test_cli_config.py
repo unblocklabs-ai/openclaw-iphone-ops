@@ -10,8 +10,8 @@ import unittest
 from unittest import mock
 
 from openclaw_iphone import cli
-from openclaw_iphone.config import IPhoneConfig
-from openclaw_iphone.devicectl import Device
+from openclaw_iphone.config import IPhoneConfig, load_config
+from openclaw_iphone.devicectl import Device, DeviceCtl
 from openclaw_iphone.errors import DeviceSelectionError, WDASetupError, WDAUnavailable
 from openclaw_iphone.wda import WDAStatus
 
@@ -19,7 +19,6 @@ from openclaw_iphone.wda import WDAStatus
 class FakeDeviceCtl:
     def __init__(self, *, lock_state_payload: dict | None = None, lock_state_error: Exception | None = None) -> None:
         self.selected: str | None = None
-        self.required_unlocked: str | None = None
         self.lock_state_payload = lock_state_payload or {"result": {"passcodeRequired": False}}
         self.lock_state_error = lock_state_error
 
@@ -34,10 +33,6 @@ class FakeDeviceCtl:
 
     def coredevice_wda_url(self, device_id: str, *, port: int = 8100) -> tuple[str, Path]:
         return (f"http://[fdaa::1]:{port}", Path("/tmp/device-details.json"))
-
-    def require_unlocked(self, device_id: str) -> Path:
-        self.required_unlocked = device_id
-        return Path("/tmp/lock-state.json")
 
     def lock_state(self, device_id: str) -> tuple[dict, Path]:
         if self.lock_state_error:
@@ -78,6 +73,42 @@ class LockFailingWDA(FakeWDA):
 
 
 class CLIConfigTests(unittest.TestCase):
+    def test_apps_find_rejects_blank_queries_instead_of_resolving_the_only_app(self) -> None:
+        client = DeviceCtl()
+        inventory = {"result": {"apps": [{"name": "Safari", "bundleIdentifier": "com.apple.mobilesafari"}]}}
+        with mock.patch.object(client, "select_device", side_effect=FakeDeviceCtl().select_device), \
+             mock.patch.object(client, "_json", return_value=(inventory, Path("fixture.json"))), \
+             mock.patch.object(cli, "client_from_args", return_value=client):
+            for query in ("", " ", "\t\n"):
+                with self.subTest(query=query), contextlib.redirect_stdout(io.StringIO()) as stdout, \
+                     contextlib.redirect_stderr(io.StringIO()) as stderr:
+                    self.assertEqual(cli.main(["apps", "find", query]), 1)
+                    self.assertEqual(stdout.getvalue(), "")
+                    self.assertTrue(stderr.getvalue())
+
+    def test_apps_list_distinguishes_valid_empty_inventory_from_malformed_response(self) -> None:
+        client = DeviceCtl()
+        app = {"name": "Safari", "bundleIdentifier": "com.apple.mobilesafari"}
+        cases = [({"result": {"apps": []}}, 0), ({"result": {"apps": [app]}}, 0),
+                 ({}, 1), ({"result": {}}, 1), ({"result": {"apps": None}}, 1),
+                 ({"result": {"apps": {}}}, 1), ({"result": {"apps": [None]}}, 1),
+                 ({"result": {"apps": [app, 7]}}, 1)]
+        with mock.patch.object(client, "select_device", side_effect=FakeDeviceCtl().select_device), \
+             mock.patch.object(cli, "client_from_args", return_value=client):
+            for payload, expected in cases:
+                with self.subTest(payload=payload), \
+                     mock.patch.object(client, "_json", return_value=(payload, Path("fixture.json"))), \
+                     contextlib.redirect_stdout(io.StringIO()) as stdout, \
+                     contextlib.redirect_stderr(io.StringIO()) as stderr:
+                    self.assertEqual(cli.main(["apps", "list"]), expected)
+                    if expected:
+                        self.assertEqual(stdout.getvalue(), "")
+                        self.assertTrue(stderr.getvalue())
+                    elif payload["result"]["apps"]:
+                        self.assertIn("Safari\tcom.apple.mobilesafari", stdout.getvalue())
+                    else:
+                        self.assertNotIn("Safari", stdout.getvalue())
+
     def test_wda_backed_commands_accept_device_override(self) -> None:
         parser = cli.build_parser()
 
@@ -113,6 +144,20 @@ class CLIConfigTests(unittest.TestCase):
 
         with mock.patch("openclaw_iphone.cli.load_config", return_value=IPhoneConfig({})):
             self.assertEqual(cli.resolve_wda_url_from_args(args), "http://wda.example:8100")
+
+    def test_device_selector_keeps_explicit_env_file_then_auto_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo with spaces"
+            repo.mkdir()
+            config_file = repo / ".env"
+            config_file.write_text('OPENCLAW_IPHONE_DEVICE="file phone"\n', encoding="utf-8")
+            env = {"HOME": tmp, "OPENCLAW_IPHONE_DEVICE": "env phone"}
+            config = load_config(env=env, cwd=repo)
+            self.assertEqual(cli.device_selector_from_args(argparse.Namespace(device="explicit phone"), config=config), "explicit phone")
+            self.assertEqual(cli.device_selector_from_args(argparse.Namespace(device=None), config=config), "env phone")
+            self.assertEqual(cli.device_selector_from_args(argparse.Namespace(device=None), config=load_config(env={"HOME": tmp}, cwd=repo)), "file phone")
+            config_file.unlink()
+            self.assertIsNone(cli.device_selector_from_args(argparse.Namespace(device=None), config=load_config(env={"HOME": tmp}, cwd=repo)))
 
     def test_wda_run_uses_host_config_for_runner_settings(self) -> None:
         fake = FakeDeviceCtl()
@@ -161,7 +206,6 @@ class CLIConfigTests(unittest.TestCase):
 
         self.assertEqual(result, 0)
         self.assertEqual(fake.selected, "Configured iPhone")
-        self.assertEqual(fake.required_unlocked, "coredevice-id")
         self.assertEqual(len(captured), 1)
         config = captured[0]
         self.assertEqual(config.device_id, "physical-udid")
@@ -172,26 +216,22 @@ class CLIConfigTests(unittest.TestCase):
         self.assertTrue(config.allow_provisioning_updates)
 
     def test_watchdog_once_unlocks_locked_phone_and_verifies(self) -> None:
-        fake_device = FakeDeviceCtl()
-        fake_wda = FakeWDA(locked_values=[True, False])
-        args = argparse.Namespace(
-            device=None,
-            url=None,
-            developer_dir=None,
-            evidence_dir=None,
-            timeout=30,
-            no_verify=False,
-        )
-
-        with mock.patch.dict("os.environ", {}, clear=True):
-            with mock.patch("openclaw_iphone.cli.client_from_args", return_value=fake_device):
-                with mock.patch("openclaw_iphone.cli.wda_client_from_args", return_value=fake_wda):
-                    with mock.patch("openclaw_iphone.cli.load_config", return_value=IPhoneConfig({})):
-                        with contextlib.redirect_stdout(io.StringIO()):
-                            result = cli.handle_watchdog_once(args)
-
-        self.assertEqual(result, 0)
-        self.assertEqual(fake_wda.unlock_count, 1)
+        for values, expected, unlocks in (([True, False], 0, 1), ([False], 0, 0), ([None], 1, 0)):
+            with self.subTest(locked=values):
+                fake_device = FakeDeviceCtl()
+                fake_wda = FakeWDA(ready=None, locked_values=values)
+                args = cli.build_parser().parse_args(["watchdog", "once"])
+                stdout = io.StringIO()
+                with mock.patch.dict("os.environ", {}, clear=True), \
+                     mock.patch("openclaw_iphone.cli.client_from_args", return_value=fake_device), \
+                     mock.patch("openclaw_iphone.cli.wda_client_from_args", return_value=fake_wda), \
+                     mock.patch("openclaw_iphone.cli.load_config", return_value=IPhoneConfig({})), \
+                     contextlib.redirect_stdout(stdout):
+                    self.assertEqual(cli.handle_watchdog_once(args), expected)
+                self.assertEqual(fake_wda.unlock_count, unlocks)
+                if unlocks:
+                    self.assertIn("result: unlocked", stdout.getvalue())
+                    self.assertIn("passcode-required: false", stdout.getvalue())
 
     def test_watchdog_once_reports_structured_url_resolution_failure(self) -> None:
         fake_device = FakeDeviceCtl()
@@ -218,29 +258,6 @@ class CLIConfigTests(unittest.TestCase):
         self.assertIn("wda-url: unknown", output)
         self.assertIn("result: wda-url-resolution-failed", output)
         self.assertIn("blocker: CoreDevice tunnel is not connected", output)
-
-    def test_watchdog_once_reports_ready_unknown(self) -> None:
-        fake_device = FakeDeviceCtl()
-        fake_wda = FakeWDA(ready=None)
-        args = argparse.Namespace(
-            device=None,
-            url=None,
-            developer_dir=None,
-            evidence_dir=None,
-            timeout=30,
-            no_verify=False,
-        )
-
-        with mock.patch("openclaw_iphone.cli.client_from_args", return_value=fake_device):
-            with mock.patch("openclaw_iphone.cli.wda_client_from_args", return_value=fake_wda):
-                stdout = io.StringIO()
-                with contextlib.redirect_stdout(stdout):
-                    result = cli.handle_watchdog_once(args)
-
-        output = stdout.getvalue()
-        self.assertEqual(result, 1)
-        self.assertIn("wda-ready: unknown", output)
-        self.assertIn("result: wda-ready-unknown", output)
 
     def test_watchdog_once_reports_structured_lock_check_failure(self) -> None:
         fake_device = FakeDeviceCtl()

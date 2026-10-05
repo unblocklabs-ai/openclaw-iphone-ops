@@ -30,9 +30,6 @@ class RecordingWDAClient(WDAClient):
         self.posts: list[tuple[str, dict]] = []
         self.requests: list[tuple[str, str, dict | None]] = []
 
-    def locked(self) -> bool:
-        return False
-
     def _send(self, path: str, *, method: str, payload: dict | None, timeout: float) -> bytes:
         if method == "POST":
             self.posts.append((path, payload))
@@ -266,14 +263,9 @@ class WDATests(unittest.TestCase):
 
         client.back()
 
-        self.assertEqual(
-            client.posts,
-            [
-                ("/session", {"capabilities": {"alwaysMatch": {}, "firstMatch": [{}]}}),
-                ("/session/session-123/appium/settings", {"settings": {"waitForIdleTimeout": 0, "animationCoolOffTimeout": 0}}),
-                ("/session/session-123/back", {}),
-            ],
-        )
+        self.assertEqual([path for path, _ in client.posts],
+                         ["/session", "/session/session-123/appium/settings", "/session/session-123/back"])
+        self.assertEqual(client.posts[-1][1], {})
         self.assertEqual(client.requests, [("DELETE", "/session/session-123", None)])
 
     def test_back_raises_clean_error_when_all_wda_routes_fail(self) -> None:

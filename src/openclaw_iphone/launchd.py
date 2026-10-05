@@ -37,6 +37,7 @@ def install_launchagent(script_repo: Path, template: Path, target: Path,
         rendered["StartInterval"] = interval
     if "__HOME__" in str(rendered) or "__REPO_DIR__" in str(rendered):
         raise SystemExit("Rendered plist still contains unresolved placeholders.")
+    serialized = plistlib.dumps(rendered)
     for key in ("StandardOutPath", "StandardErrorPath"):
         fd = os.open(rendered[key], os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         try:
@@ -45,5 +46,4 @@ def install_launchagent(script_repo: Path, template: Path, target: Path,
             os.fchmod(fd, 0o600)
         finally:
             os.close(fd)
-    with target.open("wb") as stream:
-        plistlib.dump(rendered, stream)
+    target.write_bytes(serialized)

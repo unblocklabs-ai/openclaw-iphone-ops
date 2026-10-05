@@ -7,7 +7,6 @@ import math
 import plistlib
 from pathlib import Path
 import sys
-import time
 
 from . import __version__
 from .config import IPhoneConfig, load_config
@@ -15,10 +14,10 @@ from .connection import Connection
 from .control_lock import control_lock
 from .devicectl import Device, DeviceCtl
 from .evidence import artifact_path, write_private
-from .errors import DeviceLocked, DeviceSelectionError, OpenClawIPhoneError, SessionOutputUnavailable, WDAUnavailable, diagnostic
+from .errors import OpenClawIPhoneError, SessionOutputUnavailable, WDAUnavailable, diagnostic
 from .protocol import json_line_emitter, read_requests, serve
 from .session import Session
-from .wda import DEFAULT_SCREEN_READ_TIMEOUT, DEFAULT_WDA_PORT, WDAClient, WDARunConfig, resolve_wda_path, run_wda
+from .wda import DEFAULT_WDA_PORT, WDAClient, WDARunConfig, resolve_wda_path, run_wda
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
@@ -68,7 +67,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--developer-dir", help="Override DEVELOPER_DIR for Xcode/devicectl.")
     parser.add_argument("--evidence-dir", help="Directory for JSON evidence artifacts.")
     parser.add_argument("--timeout", type=int, default=30, help="External command timeout in seconds.")
-    parser.add_argument("--read-timeout", type=float, default=DEFAULT_SCREEN_READ_TIMEOUT, help="Read-only WDA request timeout (default 12s), capped by each operation deadline.")
+    parser.add_argument("--read-timeout", type=float, help="Optional shorter read-only WDA timeout; otherwise use the request/operation deadline.")
 
     subcommands = parser.add_subparsers(dest="command")
 
@@ -203,7 +202,7 @@ def client_from_args(args: argparse.Namespace) -> DeviceCtl:
     return args._devicectl
 
 def wda_client_from_args(args: argparse.Namespace) -> WDAClient:
-    return WDAClient(url=resolve_wda_url_from_args(args), timeout=args.timeout, read_timeout=getattr(args, "read_timeout", DEFAULT_SCREEN_READ_TIMEOUT))
+    return WDAClient(url=resolve_wda_url_from_args(args), timeout=args.timeout, read_timeout=getattr(args, "read_timeout", None))
 
 def resolve_wda_url_from_args(args: argparse.Namespace) -> str:
     explicit = getattr(args, "url", None)
@@ -267,7 +266,7 @@ def handle_doctor(args: argparse.Namespace) -> int:
         return 1
     print(f"wda-url: {url}")
 
-    wda = WDAClient(url=url, timeout=args.timeout, read_timeout=getattr(args, "read_timeout", DEFAULT_SCREEN_READ_TIMEOUT))
+    wda = WDAClient(url=url, timeout=args.timeout, read_timeout=getattr(args, "read_timeout", None))
     try:
         status = wda.status()
     except WDAUnavailable as exc:
@@ -375,12 +374,10 @@ def handle_apps_find(args: argparse.Namespace) -> int:
 
 def handle_apps_launch(args: argparse.Namespace) -> int:
     client = client_from_args(args)
-    device = selected_device(args, client)
-    app = client.find_app(device.identifier, args.query)
-    if not device.udid:
-        raise DeviceSelectionError("Physical device identity is unavailable; launch not sent.")
-    with Connection(client, device=device.udid, seconds=args.timeout,
+    with Connection(client, device=device_selector_from_args(args), seconds=args.timeout,
                     read_timeout=args.read_timeout) as connection:
+        device = connection.device
+        app = client.find_app(device.identifier, args.query)
         result = Session(connection).request({"op": "launch", "bundle_id": app.bundle_identifier})
     if result.get("dispatch") != "acknowledged":
         print(json.dumps(result))
@@ -474,19 +471,7 @@ def handle_watchdog_once(args: argparse.Namespace) -> int:
         print(f"blocker: {exc}")
         return 1
 
-    try:
-        status = wda.status()
-    except WDAUnavailable as exc:
-        print(f"result: wda-unreachable")
-        print(f"blocker: {exc}")
-        return 1
-
-    print(f"wda-url: {status.url}")
-    print(f"wda-ready: {bool_value(status.ready)}")
-    if status.ready is not True:
-        print(f"result: {'wda-ready-unknown' if status.ready is None else 'wda-not-ready'}")
-        return 1
-
+    print(f"wda-url: {wda.url}")
     try:
         locked = wda.locked()
     except WDAUnavailable as exc:
@@ -495,26 +480,11 @@ def handle_watchdog_once(args: argparse.Namespace) -> int:
         return 1
     print(f"wda-locked: {bool_value(locked)}")
     if locked is False:
-        if not args.no_verify:
-            try:
-                client.require_unlocked(device.identifier)
-            except (OpenClawIPhoneError, ValueError) as exc:
-                print("result: lock-state-conflict-or-unknown")
-                print(f"blocker: {exc}")
-                return 1
         print("result: ok")
         return 0
     if locked is None:
         print("result: lock-state-unknown")
         return 1
-
-    if not args.no_verify:
-        try:
-            client.require_unlocked(device.identifier)
-        except (OpenClawIPhoneError, ValueError) as exc:
-            print("result: human-unlock-required-or-unknown")
-            print(f"blocker: {exc}")
-            return 1
 
     try:
         wda.unlock()
@@ -573,7 +543,6 @@ def handle_wda_run(args: argparse.Namespace) -> int:
     runner_bundle_id = args.runner_bundle_id or config.get("OPENCLAW_IPHONE_RUNNER_BUNDLE_ID")
     client = client_from_args(args)
     device = selected_device(args, client, config=config)
-    client.require_unlocked(device.identifier)
     print(f"device: {device.name} ({device.identifier})")
     print(f"wda path: {wda_path}")
     print("starting: xcodebuild test")

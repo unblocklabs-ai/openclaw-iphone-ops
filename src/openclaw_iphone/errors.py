@@ -32,10 +32,6 @@ class AppNotFound(OpenClawIPhoneError):
     """Raised when an app cannot be found on the selected device."""
 
 
-class DeviceLocked(OpenClawIPhoneError):
-    """Raised when foreground automation is blocked by lock state."""
-
-
 class WDAUnavailable(OpenClawIPhoneError):
     """Raised when WebDriverAgent cannot be reached or understood."""
 
@@ -93,8 +89,6 @@ def diagnostic(error: BaseException) -> dict[str, object]:
         return {"category": "deadline", "phase": "operation"}
     if isinstance(error, DeviceSelectionError):
         return {"category": "device_selection", "phase": "discovery"}
-    if isinstance(error, DeviceLocked):
-        return {"category": "device_locked", "phase": "input"}
     if isinstance(error, WDASetupError):
         return {"category": "wda_setup", "phase": "setup"}
     if isinstance(error, KeyboardInterrupt):

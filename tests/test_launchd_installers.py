@@ -93,7 +93,7 @@ class LaunchdInstallerTests(unittest.TestCase):
                 "snippets/launchd/install-watchdog-launchagent.sh",
                 home=home,
                 config=config,
-                interval="300",
+                interval="100000",
             )
 
             self.assertEqual(wda.returncode, 0, wda.stderr + wda.stdout)
@@ -113,7 +113,7 @@ class LaunchdInstallerTests(unittest.TestCase):
                 watchdog_data["ProgramArguments"],
                 [f"{configured_repo}/snippets/launchd/openclaw-iphone-watchdog.sh"],
             )
-            self.assertEqual(watchdog_data["StartInterval"], 300)
+            self.assertEqual(watchdog_data["StartInterval"], 100000)
             for data in (wda_data, watchdog_data):
                 self.assertEqual(data["Umask"], 0o077)
                 self.assertEqual(data["EnvironmentVariables"]["OPENCLAW_IPHONE_CONFIG"], str(config.resolve()))
@@ -143,6 +143,9 @@ class LaunchdInstallerTests(unittest.TestCase):
             home.mkdir()
             config = Path(tmp) / "config.env"
             config.write_text(f'OPENCLAW_IPHONE_REPO_DIR="{REPO}"\n', encoding="utf-8")
+            target = home / "Library/LaunchAgents/com.openclaw.iphone-watchdog.plist"
+            target.parent.mkdir(parents=True)
+            target.write_bytes(b"existing plist")
 
             result = self.run_installer(
                 "snippets/launchd/install-watchdog-launchagent.sh",
@@ -150,9 +153,10 @@ class LaunchdInstallerTests(unittest.TestCase):
                 config=config,
                 interval="999999999999999999999999999999",
             )
+            self.assertEqual(target.read_bytes(), b"existing plist")
 
         self.assertEqual(result.returncode, 2)
-        self.assertIn("between 1 and 86400", result.stderr)
+        self.assertIn("does not fit a plist integer", result.stderr)
 
     def test_installer_reads_repo_local_env_from_script_repo_cwd(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

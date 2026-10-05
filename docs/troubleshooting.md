@@ -7,8 +7,10 @@ USB pairing/trust, Developer Mode, and the dedicated physical UDID in host
 config. `wda run` must keep the signed XCTest runner alive; a successful build
 alone is not enough. `wda url` diagnoses CoreDevice tunnel discovery.
 
-For an exact disconnected pin, CoreDevice may perform a bounded read-only
-details probe and re-list that same phone. It never substitutes another device.
+An exact physical UDID or CoreDevice ID selects that phone even when discovery
+reports it disconnected; the actual native command determines availability.
+Name and automatic selection use connected devices only. No selection substitutes
+another phone for an exact pin.
 Sessions can recover safe reads repeatedly, once per read, without restarting
 the service. If AX fails, image observation and coordinate controls still work.
 

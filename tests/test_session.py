@@ -39,9 +39,9 @@ base = Path(os.environ["IPHONE_TEST_DIR"])
 class CoreDeviceFixture:
     def __init__(self):
         self.runner = Runner(timeout=float(os.environ.get("IPHONE_TEST_TIMEOUT", "2")))
-    def select_device(self, selector, *, read_only=False):
+    def select_device(self, selector):
         with (base / "selectors").open("a") as stream:
-            stream.write(json.dumps([selector, read_only]) + "\\n")
+            stream.write(json.dumps(selector) + "\\n")
         return Device("fixture", "core", "connected", "iPhone", (base / "identity").read_text())
     def coredevice_wda_url(self, identifier):
         return os.environ["IPHONE_TEST_URL"], None
@@ -153,7 +153,7 @@ class PhoneHandler(BaseHTTPRequestHandler):
             elif path.endswith("/elements"):
                 query = payload["value"]
                 refs = self.server.elements
-                if "/element/date/" in path:
+                if "/element/date/" in path or query.startswith("**/XCUIElementTypePickerWheel"):
                     refs = self.server.date_wheels
                 elif "XCUIElementTypeDatePicker" in query:
                     refs = ["date"]
@@ -163,7 +163,12 @@ class PhoneHandler(BaseHTTPRequestHandler):
                     for part, label in self.server.component_labels.items():
                         if label and (f'"{label}"' in query or f"'{label}'" in query):
                             refs = [part]
-                value = [{"ELEMENT": ref} for ref in refs]
+                value = [{"ELEMENT": ref, "type": self.server.element_types.get(ref),
+                          "label": self.server.component_labels.get(ref),
+                          "attribute/value": (self.server.wheel_value(ref) if ref in self.server.date_wheels
+                              else str(int(self.server.checked)) if ref == "switch" and self.server.checked is not None
+                              else self.server.picker_values[self.server.picker_index] if ref == "wheel"
+                              else self.server.text)} for ref in refs]
             elif path.endswith("/element/active"):
                 value = {"ELEMENT": "field"}
             elif "/attribute/" in path:
@@ -214,7 +219,9 @@ class PhoneHandler(BaseHTTPRequestHandler):
                 elif not self.server.reject_text:
                     self.server.text += text
                 if path in self.server.fail_read_after:
-                    self.server.failures[f"/session/one/element/{ref}/attribute/value"] = 1
+                    read_route = ("/session/one/element/date/elements" if ref in self.server.date_wheels
+                                  else f"/session/one/element/{ref}/attribute/value")
+                    self.server.failures[read_route] = 1
             elif path.endswith("/actions"):
                 self.server.submit_count += sum(action.get("value") == "\ue007" and action["type"] == "keyDown"
                     for source in payload["actions"] for action in source["actions"])
@@ -240,11 +247,13 @@ class PhoneHandler(BaseHTTPRequestHandler):
 
 class SessionTests(unittest.TestCase):
     @contextmanager
-    def running(self, *, images=False, seconds=2, read_seconds=12, timeout=2):
+    def running(self, *, images=False, seconds=2, read_seconds=None, timeout=2, status_unavailable=False):
         with tempfile.TemporaryDirectory() as directory, PhoneServer() as server:
             base = Path(directory)
             (base / "identity").write_text("physical")
             (base / "config.env").write_text("")
+            if status_unavailable:
+                server.failures["/status"] = 100
             thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
             thread.start()
             env = dict(os.environ, PYTHONPATH=str(ROOT / "src"), IPHONE_TEST_DIR=directory,
@@ -252,9 +261,10 @@ class SessionTests(unittest.TestCase):
                        IPHONE_TEST_URL=f"http://127.0.0.1:{server.server_port}",
                        OPENCLAW_IPHONE_CONFIG=str(base / "config.env"),
                        OPENCLAW_IPHONE_WDA_URL="", OPENCLAW_IPHONE_DEVICE="", http_proxy="http://127.0.0.1:1")
-            args = [sys.executable, "-c", BOOTSTRAP, "--evidence-dir", directory,
-                    "--read-timeout", str(read_seconds),
-                    "session", "--device", "physical", "--operation-timeout", str(seconds)]
+            args = [sys.executable, "-c", BOOTSTRAP, "--evidence-dir", directory]
+            if read_seconds is not None:
+                args.extend(["--read-timeout", str(read_seconds)])
+            args.extend(["session", "--device", "physical", "--operation-timeout", str(seconds)])
             if images:
                 args.append("--allow-images")
             proc = subprocess.Popen(args, env=env, cwd=base, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -272,17 +282,17 @@ class SessionTests(unittest.TestCase):
                 server.shutdown()
                 thread.join(timeout=5)
 
-    def receive(self, proc):
-        ready, _, _ = select.select([proc.stdout], [], [], 5)
+    def receive(self, proc, *, timeout=5):
+        ready, _, _ = select.select([proc.stdout], [], [], timeout)
         self.assertTrue(ready, "CLI did not respond")
         line = proc.stdout.readline()
         self.assertTrue(line, "CLI ended without a response")
         return json.loads(line)
 
-    def request(self, proc, data):
+    def request(self, proc, data, *, timeout=5):
         proc.stdin.write((json.dumps(data) + "\n").encode())
         proc.stdin.flush()
-        return self.receive(proc)
+        return self.receive(proc, timeout=timeout)
 
     def finish(self, proc, base):
         self.assertEqual(self.request(proc, {"op": "close"})["status"], "closed")
@@ -297,14 +307,15 @@ class SessionTests(unittest.TestCase):
         return next(json.loads(line) for line in output.splitlines() if json.loads(line)["status"] == "session_end")
 
     def test_idle_rejected_frames_and_many_requests_do_not_end_ownership(self):
-        with self.running(seconds=0.5) as (proc, server, base):
+        with self.running(seconds=0.5, status_unavailable=True) as (proc, server, base):
             time.sleep(0.7)
             with self.assertRaises(OpenClawIPhoneError) as busy, control_lock(base / ".openclaw/iphone/control.lock"):
                 pass
             self.assertEqual(busy.exception.owner["pid"], proc.pid)
             self.assertEqual(busy.exception.owner["requests"], 0)
-            for raw in (b'{"op":"close","op":"press"}\n', b'{broken}\n', b'x' * 5000 + b'\n', b'{"op":"tap"}\n', b'{"op":"tap","target":null}\n',
-                        b'{"op":"press","button":"home","duration":1e30}\n'):
+            server.failures["/wda/locked"] = 100
+            for raw in (b'{"op":"close","op":"press"}\n', b'{broken}\n', b'x' * 70000 + b'\n', b'{"op":"tap"}\n', b'{"op":"tap","target":null}\n',
+                        b'{"op":"press","button":"home","duration":-1}\n'):
                 proc.stdin.write(raw)
                 proc.stdin.flush()
                 self.assertEqual(self.receive(proc)["reason"], "invalid_request")
@@ -314,6 +325,13 @@ class SessionTests(unittest.TestCase):
             self.assertEqual(sum(path.endswith("/appium/settings") for _, path, _ in server.requests), 1)
             self.assertEqual(sum(path.endswith("/wda/pressButton") for _, path, _ in server.requests), 20)
             self.assertFalse(any(path == "/source" for _, path, _ in server.requests))
+            self.assertFalse(any(path == "/wda/locked" for _, path, _ in server.requests))
+            self.assertFalse(any(path == "/status" for _, path, _ in server.requests))
+            result = self.request(proc, {"op": "swipe", "from_x": 1, "from_y": 2,
+                "to_x": 3, "to_y": 4, "duration": 11})
+            self.assertEqual(result["dispatch"], "acknowledged")
+            moves = server.requests[-1][2]["actions"][0]["actions"]
+            self.assertEqual(moves[2]["duration"], 11000)
             self.finish(proc, base)
 
     def test_ambiguity_finds_late_matches_and_pages_only_relevant_candidates(self):
@@ -397,7 +415,8 @@ class SessionTests(unittest.TestCase):
         target = {"role": "XCUIElementTypePickerWheel", "label": "Month"}
         with self.running() as (proc, server, base):
             server.elements = ["wheel"]
-            result = self.request(proc, {"op": "pick", "target": target, "value": "Three"})
+            result = self.request(proc, {"op": "pick", "target": target, "value": "Three",
+                "max_steps": 100, "seconds": 60})
             self.assertEqual((result["dispatch"], result["effect"]), ("acknowledged", "match"))
             self.assertEqual(server.picker_index, 2)
             server.picker_index = 0
@@ -422,6 +441,7 @@ class SessionTests(unittest.TestCase):
         with self.running() as (proc, server, base):
             for role, text in (("XCUIElementTypeTextField", "Bék O'Neil 👋"),
                                ("XCUIElementTypeTextField", "007"),
+                               ("XCUIElementTypeTextField", "🙂" * 4096),
                                ("XCUIElementTypeTextField", ""),
                                ("XCUIElementTypeTextView", "First line\nSecond line")):
                 with self.subTest(role=role, text=text):
@@ -436,15 +456,16 @@ class SessionTests(unittest.TestCase):
             self.assertEqual(result["dispatch"], "not_sent")
             self.assertEqual(server.text, before)
             private = base / "input.txt"
-            private.write_text("SECRET-NAME")
+            private_text = "SECRET-NAME" + "x" * 5000
+            private.write_text(private_text)
             private.chmod(0o600)
             result = self.request(proc, {"op": "set", "target": {"role": "XCUIElementTypeTextField"},
                                          "value_ref": str(private), "verify": True})
-            self.assertEqual((server.text, result["effect"]), ("SECRET-NAME", "match"))
+            self.assertEqual((server.text, result["effect"]), (private_text, "match"))
             self.assertNotIn("SECRET", json.dumps(result))
             server.element_types["field"] = "XCUIElementTypeSecureTextField"
             result = self.request(proc, {"op": "set", "value_ref": str(private), "verify": True})
-            self.assertEqual((server.text, result["effect"]), ("SECRET-NAME", "unknown"))
+            self.assertEqual((server.text, result["effect"]), (private_text, "unknown"))
             self.assertEqual(server.submit_count, 0)
             self.finish(proc, base)
 
@@ -455,26 +476,30 @@ class SessionTests(unittest.TestCase):
             # March 31 to February 29 before the desired day is processed.
             result = self.request(proc, {"op": "set", "target": target, "value": "2024-02-29"})
             self.assertEqual(server.native_date, date(2024, 2, 29))
-            self.assertEqual((result["dispatch"], result["effect"]), ("acknowledged", "match"))
+            self.assertEqual((result["dispatch"], result["effect"]), ("acknowledged", "unknown"))
             self.assertEqual(result["request_sequence"], 1)
             self.assertNotIn("2024-02-29", json.dumps(result))
+            # Bound native round trips, not Python calls: lookup, grouped reads,
+            # three writes. No preflight or per-component polling.
+            routes = sum(result["timing"]["counts"].values())
+            self.assertLessEqual(routes, 5, "Date entry must not add preflight or per-wheel reads")
             result = self.request(proc, {"op": "set", "target": target, "value": "2024-02-29"})
             self.assertEqual((result["dispatch"], result["effect"], result["acknowledged_substeps"]),
                              ("not_sent", "match", 0))
             # Native Contacts represents a birthday without a year as ----.
             server.year_omitted = True
-            result = self.request(proc, {"op": "set", "target": target, "value": "1990-10-14"})
+            result = self.request(proc, {"op": "set", "target": target, "value": "1990-10-14", "verify": True})
             self.assertEqual((server.native_date, result.get("effect")), (date(1990, 10, 14), "match"))
             self.assertFalse(server.year_omitted)
             server.date_max = date(2024, 2, 28)
             server.native_date = date(2023, 3, 31)
-            result = self.request(proc, {"op": "set", "target": target, "value": "2024-02-29"})
+            result = self.request(proc, {"op": "set", "target": target, "value": "2024-02-29", "verify": True})
             self.assertEqual(server.native_date, date(2024, 2, 28))
             self.assertEqual(result["effect"], "mismatch")
             # Below the native minimum, don't march the year farther away.
             server.date_max, server.date_min = None, date(1970, 1, 1)
             server.native_date = date(2023, 3, 31)
-            result = self.request(proc, {"op": "set", "target": target, "value": "1900-10-14"})
+            result = self.request(proc, {"op": "set", "target": target, "value": "1900-10-14", "verify": True})
             self.assertEqual((server.native_date, result["effect"]), (date(1970, 10, 14), "mismatch"))
             self.assertEqual(self.request(proc, {"op": "press", "button": "home"})["dispatch"], "acknowledged")
             self.finish(proc, base)
@@ -483,7 +508,7 @@ class SessionTests(unittest.TestCase):
         with self.running() as (proc, server, base):
             server.month_values = [f"{month:02d}" for month in range(1, 13)]
             server.component_labels = {part: part.title() for part in server.date_wheels}
-            result = self.request(proc, {"op": "set", "kind": "date", "value": "1990-10-14",
+            result = self.request(proc, {"op": "set", "kind": "date", "value": "1990-10-14", "verify": True,
                                          "target": {"role": "XCUIElementTypeDatePicker"}})
             self.assertEqual((server.native_date, result["effect"]), (date(1990, 10, 14), "match"))
             # Without labels, two small numeric wheels aren't identifiable by
@@ -494,17 +519,25 @@ class SessionTests(unittest.TestCase):
                                          "target": {"role": "XCUIElementTypeDatePicker"}})
             self.assertEqual((result["dispatch"], result["reason"]), ("not_sent", "date_component_mapping_required"))
             self.assertEqual(server.native_date, before)
+            # Malformed optional provider labels must not crash the session or
+            # turn ambiguous numeric wheels into guessed date components.
+            for malformed in (1, {"bad": "label"}):
+                server.component_labels = {part: malformed for part in server.date_wheels}
+                result = self.request(proc, {"op": "set", "kind": "date", "value": "2001-01-01",
+                                             "target": {"role": "XCUIElementTypeDatePicker"}})
+                self.assertEqual((result["dispatch"], result["reason"]), ("not_sent", "date_component_mapping_required"))
+                self.assertEqual(server.native_date, before)
             months = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août",
                       "septembre", "octobre", "novembre", "décembre"]
             server.month_values = months
             server.component_labels = {"day": "D", "year": "Y", "month": "M"}
-            result = self.request(proc, {"op": "set", "kind": "date", "value": "2001-08-15",
+            result = self.request(proc, {"op": "set", "kind": "date", "value": "2001-08-15", "verify": True,
                 "components": {part: {"role": "XCUIElementTypePickerWheel", "label": server.component_labels[part]}
                                for part in server.date_wheels}, "month_values": months})
             self.assertEqual((server.native_date, result["effect"]), (date(2001, 8, 15), "match"))
             server.month_values = [f"{month}月" for month in range(1, 13)]
             server.number_suffixes = {"year": "年", "day": "日"}
-            result = self.request(proc, {"op": "set", "kind": "date", "value": "2024-01-01",
+            result = self.request(proc, {"op": "set", "kind": "date", "value": "2024-01-01", "verify": True,
                 "components": {part: {"role": "XCUIElementTypePickerWheel", "label": server.component_labels[part]}
                                for part in server.date_wheels}})
             self.assertEqual((server.native_date, result["effect"]), (date(2024, 1, 1), "match"))
@@ -528,9 +561,10 @@ class SessionTests(unittest.TestCase):
             server.mutate_then_fail.clear()
             self.assertEqual(self.request(proc, {"op": "press", "button": "home"})["dispatch"], "acknowledged")
             server.fail_read_after.add("/session/one/element/year/value")
-            result = self.request(proc, {"op": "set", "kind": "date", "target": target, "value": "1990-10-14"})
+            result = self.request(proc, {"op": "set", "kind": "date", "target": target, "value": "1990-10-14", "verify": True})
             self.assertEqual((result["dispatch"], result["acknowledged_substeps"], result["effect"]),
-                             ("partial", 1, "unknown"))
+                             ("acknowledged", 3, "unknown"))
+            self.assertEqual(server.native_date, date(1990, 10, 14))
             self.assertEqual(self.request(proc, {"op": "press", "button": "home"})["dispatch"], "acknowledged")
             self.finish(proc, base)
 
@@ -538,11 +572,15 @@ class SessionTests(unittest.TestCase):
         target = {"role": "XCUIElementTypeSwitch", "label": "Notifications"}
         with self.running() as (proc, server, base):
             for desired in (False, False, True, True):
+                previous = server.checked
                 result = self.request(proc, {"op": "set", "target": target, "value": desired})
                 self.assertIs(server.checked, desired)
-                self.assertEqual(result["effect"], "match")
+                self.assertEqual(result["effect"], "match" if previous == desired else "unknown")
+            self.assertFalse(any("/attribute/value" in path for _, path, _ in server.requests))
+            result = self.request(proc, {"op": "set", "target": target, "value": False, "verify": True})
+            self.assertEqual(result["effect"], "match")
             clicks = sum(path.endswith("/element/switch/click") for _, path, _ in server.requests)
-            self.assertEqual(clicks, 2)
+            self.assertEqual(clicks, 3)
             server.checked = None
             result = self.request(proc, {"op": "set", "target": target, "value": False})
             self.assertEqual((result["dispatch"], result["effect"]), ("not_sent", "unknown"))
@@ -550,23 +588,38 @@ class SessionTests(unittest.TestCase):
             self.assertEqual(self.request(proc, {"op": "press", "button": "home"})["dispatch"], "acknowledged")
             self.finish(proc, base)
 
-    def test_set_picker_handles_adjustments_and_missing_option_in_one_request(self):
+    def test_set_picker_sends_once_with_optional_readback_and_no_hidden_adjustment(self):
         with self.running() as (proc, server, base):
             server.elements = ["wheel"]
-            server.reject_picker_value = True
             target = {"role": "XCUIElementTypePickerWheel", "label": "Options"}
             result = self.request(proc, {"op": "set", "target": target, "value": "Three"})
-            self.assertEqual((server.picker_index, result["effect"]), (2, "match"))
-            result = self.request(proc, {"op": "set", "target": target, "value": "Missing"})
+            self.assertEqual((server.picker_index, result["effect"]), (2, "unknown"))
+            self.assertEqual(sum(result["timing"]["counts"].values()), 2)
+            self.assertFalse(any("/attribute/value" in path for _, path, _ in server.requests))
+            server.reject_picker_value = True
+            result = self.request(proc, {"op": "set", "target": target, "value": "One", "verify": True})
             self.assertEqual(result["effect"], "mismatch")
+            self.assertEqual(server.picker_index, 2)
+            self.assertFalse(any("/pickerwheel/" in path for _, path, _ in server.requests))
+            # Selecting an exact option does not require reading the old value.
+            server.reject_picker_value = False
+            server.picker_values[server.picker_index] = None
+            result = self.request(proc, {"op": "set", "target": target, "value": "One"})
+            self.assertEqual((result["dispatch"], result["effect"], server.picker_index), ("acknowledged", "unknown", 0))
+            self.assertEqual(sum(result["timing"]["counts"].values()), 2)
             self.assertEqual(self.request(proc, {"op": "press", "button": "home"})["dispatch"], "acknowledged")
             self.finish(proc, base)
 
-    def test_private_comparison_uses_operation_budget_not_hidden_two_seconds(self):
-        with self.running(seconds=6, timeout=6) as (proc, server, base):
+    def test_private_readback_uses_operation_budget_without_hidden_subdeadlines(self):
+        with self.running(seconds=8, timeout=8) as (proc, server, base):
             server.value_delay = 2.2
             result = self.request(proc, {"op": "type", "text": "slow-readback", "mode": "replace", "verify": True})
             self.assertEqual((result["dispatch"], result["verification"]), ("acknowledged", "match"))
+            server.elements = ["wheel"]
+            server.value_delay = 5.2
+            result = self.request(proc, {"op": "pick", "target": {"role": "XCUIElementTypePickerWheel"},
+                "value": "Three"}, timeout=8)
+            self.assertEqual((result["dispatch"], result["effect"]), ("acknowledged", "match"))
             self.assertEqual(self.request(proc, {"op": "press", "button": "home"})["dispatch"], "acknowledged")
             self.finish(proc, base)
 
@@ -578,8 +631,9 @@ class SessionTests(unittest.TestCase):
                 result = self.request(proc, {"op": "type", "text": "SUPPLIED-PRIVATE", "mode": "replace", "verify": True})
                 self.assertEqual((result["dispatch"], result["verification"]), ("acknowledged", expected))
                 self.assertNotIn("PRIVATE", json.dumps(result))
-            result = self.request(proc, {"op": "launch", "bundle_id": "new.app", "wait_seconds": 1, "observe": "image"})
-            self.assertEqual((result["dispatch"], result["readiness"]["state"]), ("acknowledged", "ready"))
+            result = self.request(proc, {"op": "launch", "bundle_id": "new.app", "wait_seconds": 60, "observe": "image"})
+            self.assertEqual(result["dispatch"], "acknowledged")
+            self.assertEqual(result["readiness"]["state"], "ready")
             self.assertGreaterEqual(result["readiness"]["checks"], 2)
             self.assertEqual(sum(path.endswith("/wda/apps/activate") for _, path, _ in server.requests), 1)
             self.assertEqual(sum(path == "/screenshot" for _, path, _ in server.requests), 1)
@@ -604,6 +658,8 @@ class SessionTests(unittest.TestCase):
             result = self.request(proc, {"op": "observe"})
             view = result["observation"]
             self.assertTrue(Path(view["image"]["path"]).is_file())
+            self.assertIsNone(view["image"]["device_size"])
+            self.assertFalse(any(path.endswith("/window/size") for _, path, _ in server.requests))
             elements = view["accessibility"]["elements"]
             self.assertEqual(len(elements), 43)  # Two groups, two controls, 39 other controls.
             by_id = {e["id"]: e for e in elements}
@@ -627,10 +683,12 @@ class SessionTests(unittest.TestCase):
         with self.running(images=True) as (proc, server, base):
             attrs = 'visible="true" enabled="true" x="1" y="2" width="4" height="4"'
             labels = [f'{i} ' + '\U0001f680' * 240 for i in range(160)]
+            labels.extend(f"Tail {i}" for i in range(2200))
             server.xml = f'<XCUIElementTypeApplication bundleId="test.app" {attrs}>' + ''.join(
                 f'<XCUIElementTypeButton label="{label}" {attrs}/>' for label in labels) + '</XCUIElementTypeApplication>'
-            first = self.request(proc, {"op": "observe", "limit": 200})
+            first = self.request(proc, {"op": "observe", "limit": 2000})
             self.assertTrue(Path(first["observation"]["image"]["path"]).is_file())
+            self.assertIn("accessibility", first["observation"])
             page = first["observation"]["accessibility"]
             snapshot_id = page["snapshot_id"]
             first_id = page["elements"][0]["id"]
@@ -642,7 +700,7 @@ class SessionTests(unittest.TestCase):
                 seen.extend(e["label"] for e in page["elements"])
                 if page["next_offset"] is None:
                     break
-                page = self.request(proc, {"op": "observe", "offset": page["next_offset"], "limit": 200})["observation"]["accessibility"]
+                page = self.request(proc, {"op": "observe", "offset": page["next_offset"], "limit": 2000})["observation"]["accessibility"]
             self.assertEqual(seen, labels)
             self.assertEqual(sum(route == "/source" for _, route, _ in server.requests), 1)
             self.assertEqual(sum(route == "/screenshot" for _, route, _ in server.requests), 1)
@@ -655,7 +713,7 @@ class SessionTests(unittest.TestCase):
                 server.failures["/wda/activeAppInfo"] = 1
                 self.assertIn("accessibility", self.request(proc, {"op": "observe"})["observation"])
             selectors = [json.loads(line) for line in (base / "selectors").read_text().splitlines()]
-            self.assertEqual(selectors, [["physical", True]] * 4)
+            self.assertEqual(selectors, ["physical"] * 4)
             old_sessions = server.sessions
             (base / "identity").write_text("replacement")
             server.failures["/wda/activeAppInfo"] = 1
@@ -669,6 +727,11 @@ class SessionTests(unittest.TestCase):
         with self.running(images=True) as (proc, server, base):
             server.failures["/source"] = 20
             server.image = png(16, 32)
+            self.request(proc, {"op": "observe", "mode": "image"})
+            self.assertFalse(any(route.endswith("/window/size") for _, route, _ in server.requests))
+            for _ in range(2):
+                self.assertEqual(self.request(proc, {"op": "tap", "space": "image", "x": 6, "y": 8})["dispatch"], "acknowledged")
+            self.assertEqual(sum(route.endswith("/window/size") for _, route, _ in server.requests), 1)
             observed = self.request(proc, {"op": "observe", "mode": "image", "masks": [[0, 0, 8, 16]]})
             path = Path(observed["observation"]["image"]["path"])
             raw = path.read_bytes()
@@ -684,8 +747,13 @@ class SessionTests(unittest.TestCase):
                 self.assertEqual(self.request(proc, {"op": "tap", "space": "image", "x": 6, "y": 8})["dispatch"], "acknowledged")
             actions = [p for _, route, p in server.requests if route.endswith("/actions")]
             self.assertEqual(actions[-1]["actions"][0]["actions"][0]["x"], 3)
+            self.assertEqual(sum(route.endswith("/window/size") for _, route, _ in server.requests), 2)
+            # A new screenshot resets conversion; explicit caller recapture
+            # replaces continuous orientation probes before every tap.
             server.size = {"width": 16, "height": 8}
-            self.assertEqual(self.request(proc, {"op": "tap", "space": "image", "x": 6, "y": 8})["dispatch"], "not_sent")
+            server.image = png(32, 16)
+            self.request(proc, {"op": "observe", "mode": "image"})
+            self.assertEqual(self.request(proc, {"op": "tap", "space": "image", "x": 6, "y": 8})["dispatch"], "acknowledged")
             server.failures["/screenshot"] = 2
             result = self.request(proc, {"op": "swipe", "from_x": 1, "from_y": 2, "to_x": 3, "to_y": 4, "observe": "image"})
             self.assertEqual(result["dispatch"], "acknowledged")

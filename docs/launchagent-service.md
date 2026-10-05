@@ -160,7 +160,7 @@ Restart the runner when signing, trust, Xcode state, or phone state changes.
 
 The runner replaces its Python process with `xcodebuild`, so launchd supervises
 the actual long-lived process. KeepAlive restarts exited processes, **not hung
-ones**. The watchdog checks readiness and lock state but does not restart WDA,
+ones**. The watchdog checks lock state but does not restart WDA,
 repair trust/signing, unlock a passcode, or guarantee recovery after reboot.
 These are per-user GUI LaunchAgents: the user must be logged in. Provisioning
 and signing expiry still require operator attention.
@@ -187,8 +187,8 @@ Once the LaunchAgent is installed, ask OpenClaw to treat WDA as a service:
 ```text
 Use the plugged-in physical iPhone via the WDA LaunchAgent from
 the installed openclaw-iphone interface and host config at
-~/.openclaw/iphone/config.env. Use one direct session; acquisition checks readiness
-and physical device identity. Mutations check screen lock. If acquisition fails, use `doctor --check-ui`,
+~/.openclaw/iphone/config.env. Use one direct session; acquisition establishes the
+native session and physical device identity. If acquisition fails, use `doctor --check-ui`,
 then inspect `launchctl print` and
 `~/Library/Logs/openclaw/iphone-wda-run*.log`. If lock recovery is failing,
 inspect `~/Library/Logs/openclaw/iphone-watchdog*.log`. Restart the relevant

@@ -57,7 +57,9 @@ subsequent action. Optional observation failure does not erase acknowledgment.
 ```sh
 PYTHONPATH=src python3 -m openclaw_iphone devices list
 PYTHONPATH=src python3 -m openclaw_iphone doctor --check-ui
+PYTHONPATH=src python3 -m openclaw_iphone apps list
 PYTHONPATH=src python3 -m openclaw_iphone apps find Safari
+PYTHONPATH=src python3 -m openclaw_iphone apps launch Safari
 ```
 
 Use diagnosis after a failure, not as a ritual before every action. Use
@@ -71,8 +73,8 @@ Close the session before separate mutating commands.
 
 ## Distribution
 
-This is a CLI/skills bundle, not a native OpenClaw plugin. Install v0.6.0 with
-`npm install -g @unblocklabs/openclaw-iphone-ops@0.6.0`.
+This is a CLI/skills bundle, not a native OpenClaw plugin. Install v0.7.0 with
+`npm install -g @unblocklabs/openclaw-iphone-ops@0.7.0`.
 The package ships the CLI, skills, docs and snippets; register its `skills/` directory with
 the agent explicitly. The launcher supports `OPENCLAW_IPHONE_PYTHON` to select
 an absolute Python interpreter. Configuration/evidence belong outside the package.

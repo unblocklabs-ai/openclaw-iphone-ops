@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import math
 import os
 from pathlib import Path
@@ -19,7 +19,7 @@ from .image_evidence import redact_png
 from .inputs import (InputReadbackUnavailable, InputUnavailable, date_components, input_kind,
                      iso_date, pick_value, set_checked, set_date, validate_text, write_text)
 from .observations import Observation, Selector, parse_observation
-from .wda import WDAClient
+from .wda import NativeElement, WDAClient
 
 T = TypeVar("T")
 
@@ -54,7 +54,7 @@ class Session:
         self.connection, self.allow_images, self.evidence_base = connection, allow_images, evidence_base
         self.closed = False
         self.snapshot: Observation | None = None
-        self.image_geometry: tuple[tuple[float, float], tuple[int, int]] | None = None
+        self.image_geometry: tuple[tuple[float, float] | None, tuple[int, int]] | None = None
         self.secrets: set[str] = set()
         self.candidate_ids: set[str] | None = None
 
@@ -92,7 +92,7 @@ class Session:
     def _image(self, masks: list) -> dict[str, object]:
         started = time.monotonic()
         def capture(wda: WDAClient):
-            size = wda.window_size()
+            size = wda.window_size() if masks else None
             raw = wda.screenshot()
             stamp, captured = datetime.now(timezone.utc).isoformat(), time.monotonic()
             if masks:
@@ -101,14 +101,14 @@ class Session:
                 if len(raw) < 24 or not raw.startswith(b"\x89PNG\r\n\x1a\n"):
                     raise WDAUnavailable("Invalid PNG.")
                 pixels = struct.unpack_from(">II", raw, 16)
-                if not 0 < pixels[0] * pixels[1] <= 12_000_000 or abs(pixels[0] / pixels[1] - size[0] / size[1]) > 0.02:
+                if not 0 < pixels[0] * pixels[1] <= 12_000_000:
                     raise WDAUnavailable("Invalid image geometry.")
             return size, pixels, raw, stamp, captured
         size, pixels, raw, stamp, captured = self._read(capture)
         path = artifact_path("screen", ".png", base=self.evidence_base)
         write_private(path, raw)
         self.image_geometry = size, pixels
-        return {"path": str(path), "pixels": list(pixels), "device_size": list(size),
+        return {"path": str(path), "pixels": list(pixels), "device_size": list(size) if size else None,
                 "masked_regions": len(masks), "privacy": "potentially_private",
                 "captured_at": stamp, "capture_seconds": captured - started,
                 "processing_seconds": time.monotonic() - captured}
@@ -126,15 +126,13 @@ class Session:
                 result[name + "_error"] = diagnostic(exc)
         return result
 
-    def _target(self, target: str | dict) -> str:
+    def _target(self, target: str | dict) -> NativeElement:
         selector = None
         if isinstance(target, str):
             matches = [e for e in self.snapshot.elements or () if e.id == target] if self.snapshot else []
             if len(matches) != 1:
                 raise TargetUnavailable([])
             element = matches[0]
-            if element.visible is not True or element.enabled is not True:
-                raise TargetUnavailable([])
             if self._read(lambda w: w.active_app())["bundleId"] != self.snapshot.app:
                 raise TargetUnavailable([])
             using, query = self.snapshot.locator(element)
@@ -162,10 +160,13 @@ class Session:
             if self.image_geometry is None:
                 raise ValueError("Observe an image first.")
             size, pixels = self.image_geometry
-            if self._read(lambda w: w.window_size()) != size:
-                raise TargetUnavailable([])
             if any(v >= pixels[i % 2] for i, v in enumerate(points)):
                 raise ValueError("Coordinates outside image.")
+            if size is None:
+                size = self._read(lambda w: w.window_size())
+                if abs(pixels[0] / pixels[1] - size[0] / size[1]) > 0.02:
+                    raise ValueError("Image and window orientations differ; capture a new image.")
+                self.image_geometry = size, pixels
             points = [v * size[i % 2] / pixels[i % 2] for i, v in enumerate(points)]
         return points
 
@@ -255,11 +256,11 @@ class Session:
         if mode is not None and mode not in ("image", "accessibility", "both"):
             raise ValueError("Unknown observation mode.")
         masks = data.get("masks", [])
-        if not isinstance(masks, list) or len(masks) > 100 or any(not isinstance(r, list) or len(r) != 4 for r in masks):
+        if not isinstance(masks, list) or any(not isinstance(r, list) or len(r) != 4 for r in masks):
             raise ValueError("Invalid masks.")
         masks = [[number(v) for v in region] for region in masks]
         limit, offset = data.get("limit", 80), data.get("offset", 0) if op != "pick" else 0
-        if type(limit) is not int or not 1 <= limit <= 200 or type(offset) is not int or not 0 <= offset <= 2000:
+        if type(limit) is not int or limit < 1 or type(offset) is not int or offset < 0:
             raise ValueError("Invalid observation page.")
         if offset and op != "observe":
             raise ValueError("Only observations can page a captured screen.")
@@ -285,7 +286,7 @@ class Session:
             except InputReadbackUnavailable as exc:
                 if isinstance(exc.error, WDATransportUnavailable):
                     self.connection.invalidate()
-                effect, error, completed = "unknown", diagnostic(exc.error), exc.complete
+                effect, error, completed = "unknown", diagnostic(exc.error), True
             result = {"status": "action" if acknowledged else "checked",
                       "dispatch": "acknowledged" if acknowledged and completed else "partial" if acknowledged else "not_sent",
                       "acknowledged_substeps": acknowledged, "effect": effect}
@@ -304,8 +305,6 @@ class Session:
                 # Validate the whole request before any input is dispatched.
                 points = self._points(data) if op == "swipe" or op == "tap" and target is None else []
                 duration = number(data.get("duration", 0.1))
-                if duration > 10:
-                    raise ValueError("Gesture/button duration must be at most ten seconds.")
                 if op == "tap" and target is not None and any(k in data for k in ("x", "y", "space")):
                     raise ValueError("Choose target or coordinates.")
                 if op == "type":
@@ -344,7 +343,7 @@ class Session:
                         raise ValueError("Provide year, month and day targets.")
                     month_values = data.get("month_values")
                     if month_values is not None and (not isinstance(month_values, list) or len(month_values) != 12
-                            or any(not isinstance(v, str) or not v or len(v) > 256 or any(ord(c) < 32 for c in v) for v in month_values)
+                            or any(not isinstance(v, str) or not v or any(ord(c) < 32 for c in v) for v in month_values)
                             or len({v.casefold() for v in month_values}) != 12):
                         raise ValueError("Provide twelve distinct native month values.")
                     strategy, verify = data.get("strategy", "native"), data.get("verify", False)
@@ -352,26 +351,26 @@ class Session:
                         raise ValueError("Invalid input options.")
                 if op == "pick":
                     value = data["value"]
-                    if not isinstance(value, str) or not value or len(value) > 256 or any(ord(c) < 32 for c in value):
+                    if not isinstance(value, str) or not value or any(ord(c) < 32 for c in value):
                         raise ValueError("Invalid picker value.")
                     self.secrets.add(value)
                     order = data.get("order")
                     steps = data.get("max_steps", 10)
                     picker_offset = number(data.get("offset", 0.15))
-                    seconds = number(data.get("seconds", 5))
-                    if order not in (None, "next", "previous") or type(steps) is not int or not 1 <= steps <= 50 or not 0 < picker_offset <= 0.5 or not 0 < seconds <= 30:
+                    seconds = number(data["seconds"]) if "seconds" in data else None
+                    if (order not in (None, "next", "previous") or type(steps) is not int or steps < 1
+                            or not 0 < picker_offset <= 0.5 or seconds is not None and seconds <= 0):
                         raise ValueError("Invalid picker bounds.")
                 wait_seconds = number(data.get("wait_seconds", 0))
-                if wait_seconds > 30:
-                    raise ValueError("Readiness wait must be at most thirty seconds.")
                 if op in ("launch", "open_url", "press"):
                     key = {"launch": "bundle_id", "open_url": "url", "press": "button"}[op]
                     value = data.get(key)
-                    if not isinstance(value, str) or not value or len(value) > 2048 or any(ord(c) < 32 for c in value):
+                    if not isinstance(value, str) or not value or any(ord(c) < 32 for c in value):
                         raise ValueError("Invalid operation argument.")
                     if op == "press" and value not in {"home", "volumeUp", "volumeDown", "siri", "back", "enter", "delete", "tab", "escape"}:
                         raise ValueError("Unsupported button.")
-                ref = self._target(target) if target is not None else None
+                element = self._target(target) if target is not None else None
+                ref = element.ref if element else None
                 wda = self.connection.require_active()
                 if op == "set":
                     role = None
@@ -379,7 +378,7 @@ class Session:
                         kind = "date"
                     else:
                         ref = ref or wda.active_element()
-                        role = wda.element_type(ref)
+                        role = element.role if element else wda.element_type(ref)
                         kind = input_kind(role, value, kind)
                     if kind != "date" and (components is not None or month_values is not None):
                         raise ValueError("Date options require a date picker.")
@@ -388,8 +387,8 @@ class Session:
                             if ref is None and components is None:
                                 raise ValueError("Identify the date picker or its components.")
                             desired_date = desired or iso_date(value)
-                            refs, current = date_components(wda, ref, components, self._target, month_values)
-                            return set_date(wda, refs, current, desired_date, send, month_values, self.secrets)
+                            wheels = date_components(wda, ref, components, self._target, month_values)
+                            return set_date(wda, ref, wheels, desired_date, send, month_values, self.secrets, verify=verify)
                         if kind == "text":
                             if "\n" in value and role != "XCUIElementTypeTextView":
                                 raise InputUnavailable("multiline_requires_text_view")
@@ -397,16 +396,20 @@ class Session:
                             return self._compare(wda, ref, value, role=role) if verify else "unknown"
                         if kind == "picker" and (not value or "\n" in value):
                             raise ValueError("Picker options must be non-empty single-line strings.")
-                        with wda.input_transaction():
-                            return (set_checked(wda, ref, value, send) if kind == "checked"
-                                    else pick_value(wda, ref, value, send, adjust=True))
+                        current = element.value if element else None
+                        if kind == "checked":
+                            if element is None:
+                                current = wda.element_value(ref, allow_null_empty=False)
+                            return set_checked(wda, ref, value, send, current=current, verify=verify)
+                        return pick_value(wda, ref, value, send, current=current, verify=verify)
                     return input_reply(perform_set)
                 if op == "pick":
                     def perform_pick() -> str:
-                        with self._within(wda, seconds), wda.input_transaction():
-                            if wda.element_type(ref) != "XCUIElementTypePickerWheel":
+                        with self._within(wda, seconds) if seconds is not None else nullcontext():
+                            if element.role != "XCUIElementTypePickerWheel":
                                 raise ValueError("Picker target must be a native wheel.")
-                            return pick_value(wda, ref, value, send, order=order, max_steps=steps, offset=picker_offset)
+                            return pick_value(wda, ref, value, send, order=order, max_steps=steps,
+                                              offset=picker_offset, current=element.value)
                     return input_reply(perform_pick)
                 if op == "tap":
                     send(lambda: wda.element_action(ref, "click") if ref else wda.tap(*points))
@@ -429,7 +432,7 @@ class Session:
                 completed = True
                 result = {"status": "action", "dispatch": "acknowledged", "acknowledged_substeps": acknowledged}
                 if op == "type" and verify:
-                    result["verification"] = self._compare(wda, ref, text)
+                    result["verification"] = self._compare(wda, ref, text, role=element.role if element else None)
                 if op == "launch" and wait_seconds:
                     result["readiness"] = self._ready(wda, value, wait_seconds)
                 if mode:
