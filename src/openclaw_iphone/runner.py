@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 import math
+import shlex
 import subprocess
 import time
 
@@ -59,7 +60,7 @@ class Runner:
             raise CommandFailed(
                 (f"{phase} timed out after {time.monotonic() - started:.3f}s "
                  f"(limit {timeout or self.timeout:g}s).") if phase else
-                f"Command timed out after {timeout or self.timeout}s: {format_command(command)}",
+                f"Command timed out after {timeout or self.timeout}s: {shlex.join(command)}",
                 command=command,
                 stdout=decode_output(exc.stdout),
                 stderr=decode_output(exc.stderr),
@@ -71,7 +72,7 @@ class Runner:
         if proc.returncode != 0:
             detail = proc.stderr.strip() or proc.stdout.strip() or f"exit {proc.returncode}"
             raise CommandFailed(
-                f"Command failed: {format_command(command)}\n{detail}",
+                f"Command failed: {shlex.join(command)}\n{detail}",
                 command=command,
                 returncode=proc.returncode,
                 stdout=proc.stdout,
@@ -91,23 +92,8 @@ def devicectl_phase(command: list[str]) -> str | None:
             "lockState": "devicectl device lock state",
             "apps": "devicectl device apps",
         }.get(parts[2])
-    if parts == ["device", "process", "launch"]:
-        return "devicectl process launch"
     return None
 
 
 def decode_output(value: str | bytes | None) -> str:
     return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value or ""
-
-
-def format_command(command: list[str]) -> str:
-    return " ".join(shell_quote(part) for part in command)
-
-
-def shell_quote(value: str) -> str:
-    if not value:
-        return "''"
-    safe = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_+-=.,/:@%")
-    if all(char in safe for char in value):
-        return value
-    return "'" + value.replace("'", "'\"'\"'") + "'"

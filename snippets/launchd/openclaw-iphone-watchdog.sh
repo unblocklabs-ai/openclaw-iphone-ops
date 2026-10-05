@@ -6,9 +6,10 @@ SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 REPO_FROM_SCRIPT="$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd)"
 
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+IPHONE_PYTHON="${OPENCLAW_IPHONE_PYTHON:-python3}"
 
 CONFIG_REPO_DIR="$(
-  SCRIPT_REPO_DIR="$REPO_FROM_SCRIPT" python3 - <<'PY'
+  SCRIPT_REPO_DIR="$REPO_FROM_SCRIPT" "$IPHONE_PYTHON" - <<'PY'
 from pathlib import Path
 import os
 import sys
@@ -33,4 +34,4 @@ export PYTHONPATH="$REPO_DIR/src${PYTHONPATH:+:$PYTHONPATH}"
 
 cd "$REPO_DIR"
 
-exec python3 -m openclaw_iphone --timeout "$TIMEOUT" watchdog once
+exec "$IPHONE_PYTHON" -m openclaw_iphone --timeout "$TIMEOUT" watchdog once

@@ -10,29 +10,23 @@
 
 ## Flow
 
-1. Verify device discovery.
-2. Check lock state.
-3. Open App Store.
+1. Start one installed `openclaw-iphone session` for the dedicated phone.
+2. Acquisition establishes the phone connection.
+3. Launch `com.apple.AppStore`, optionally waiting for foreground identity.
 4. Search for the requested app.
 5. Verify the exact target app title and publisher when visible.
 6. Tap the correct result's action button.
-7. Handle Apple ID, confirmation, and free-item prompts.
+7. Ask the operator to handle Apple ID, confirmation, and security prompts.
 8. Verify the App Store state reaches `Open` or equivalent.
-9. Verify the app appears in `devicectl` installed-app output.
+9. Close the session and verify the expected bundle with `openclaw-iphone apps find EXACT_BUNDLE_ID`.
 
-The reusable example is `snippets/wda-app-store-install-example.py`. It assumes
-WebDriverAgent is already running and resolves the selected device's CoreDevice
-URL. It requires `APP_NAME`, `EXPECTED_PUBLISHER`, `EXPECTED_BUNDLE_ID`, and
-`ALLOW_INSTALL=1`, plus optional `DEVICE_ID`. A human must inspect the page and
-type `INSTALL` in the terminal before the install tap. Element requests are
-session-scoped, exact and unambiguous. It does not handle credentials, paid
-buttons, cloud-icon guesses, or secure prompts. This is a supervised template,
+Use the [session protocol](session.md): launch, observe, exact target, type,
+press, and optional attached observation. Confirm the requested app, publisher
+and exact bundle before the installation action, and obtain explicit
+installation authorization.
+Never infer the intended app from a generic cloud/Get icon or automate paid
+buttons, credentials or secure confirmation. This is a supervised workflow,
 not a validated unattended installer.
-
-## Default Prompt Choices
-
-- If App Store asks to save the password for free items, choose `Not Now` unless the task explicitly says to save it.
-- If first launch asks whether to share email through Sign in with Apple, choose not to share the email address unless the task explicitly says otherwise.
 
 ## Proof Rules
 
@@ -40,7 +34,6 @@ Do not claim install success from only a visible `Open` button. Also verify inst
 
 Minimum evidence for repeat installs:
 
-- Live automation check at start
 - Exact target-result proof before install tap
 - Final success or blocker screen
 - Fresh installed-app proof

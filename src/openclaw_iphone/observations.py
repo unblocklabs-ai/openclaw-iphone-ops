@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import hashlib
+from functools import cached_property
 import json
 import math
 import re
@@ -16,20 +16,9 @@ from .errors import OpenClawIPhoneError
 class ObservationRejected(OpenClawIPhoneError):
     """Observation is incomplete, ambiguous, or no longer valid for an action."""
 
-    CODES = frozenset({"observation_rejected", "snapshot_expired", "snapshot_superseded",
-                       "foreground_changed", "geometry_changed", "evidence_unavailable"})
-
-    def __init__(self, message: str, *, code: str = "observation_rejected") -> None:
-        super().__init__(message)
-        # Public diagnostics never derive from private exception messages.
-        self.code = code if code in self.CODES else "observation_rejected"
 
 
 
-
-EDITABLE = frozenset({"XCUIElementTypeTextField", "XCUIElementTypeTextView", "XCUIElementTypeSearchField"})
-SCROLLABLE = frozenset({"XCUIElementTypeScrollView", "XCUIElementTypeTable", "XCUIElementTypeCollectionView"})
-TAPPABLE = EDITABLE | {"XCUIElementTypeButton", "XCUIElementTypeCell", "XCUIElementTypeLink"}
 LAYOUT = frozenset({"XCUIElementTypeOther", "XCUIElementTypeWebView"})
 CHECKABLE = frozenset({"XCUIElementTypeSwitch", "XCUIElementTypeCheckBox", "XCUIElementTypeRadioButton", "XCUIElementTypeToggleButton"})
 
@@ -61,9 +50,9 @@ class Selector:
     def __post_init__(self) -> None:
         if not re.fullmatch(r"XCUIElementType[A-Za-z]+", self.role):
             raise ValueError("Selector requires an exact XCUIElementType role.")
-        if any(value is not None and (not isinstance(value, str) or not value or len(value) > 256)
+        if any(value is not None and (not isinstance(value, str) or not value)
                for value in (self.name, self.label, self.ancestor_label)):
-            raise ValueError("Selector labels must be short non-empty strings.")
+            raise ValueError("Selector labels must be non-empty strings.")
 
     def xpath(self) -> str:
         """Live predicate lookup, not a durable action reference."""
@@ -96,24 +85,13 @@ class Element:
     bounds: tuple[float, float, float, float] | None
     ancestors: tuple[tuple[str, str | None, str | None], ...] = field(repr=False)
     path: str
-    xpath: str = field(repr=False)
     selected: bool | None = None
-
-    @property
-    def actionable(self) -> bool:
-        return self.visible is True and self.enabled is True and self.bounds is not None
 
     def matches(self, selector: Selector) -> bool:
         return (self.role == selector.role
                 and (selector.name is None or self.name == selector.name)
                 and (selector.label is None or self.label == selector.label)
                 and (selector.ancestor_label is None or any(label == selector.ancestor_label for _, _, label in self.ancestors)))
-
-    def fingerprint(self) -> tuple[object, ...]:
-        # Includes position in hierarchy AND geometry: identical labels moving
-        # to another list item must not silently remap an old action.
-        return (self.role, self.name, self.label, self.value, self.visible,
-                self.enabled, self.bounds, self.ancestors, self.path, self.selected)
 
     def locator(self) -> tuple[str, str]:
         named_ancestor = any(role != "XCUIElementTypeApplication" and (name or label)
@@ -148,51 +126,90 @@ class Observation:
     # None means app identity only, not an empty or non-secure screen.
     elements: tuple[Element, ...] | None = field(repr=False)
     secure: bool | None
-    signature: str
     process_id: int | None = None
 
     def matches(self, selector: Selector) -> tuple[Element, ...]:
         if self.elements is None:
-            raise ObservationRejected("App-only observation has no accessibility evidence; observe the full screen first.",
-                                      code="evidence_unavailable")
+            raise ObservationRejected("App-only observation has no accessibility evidence; observe the full screen first.")
         return tuple(e for e in self.elements if e.visible is True and e.matches(selector))
 
-    def unique(self, selector: Selector) -> Element | None:
-        matches = self.matches(selector)
-        return matches[0] if len(matches) == 1 else None
+    def locator(self, element: Element) -> tuple[str, str]:
+        locator = element.locator()
+        if (element.name or element.label) and sum(e.locator() == locator for e in self.elements or ()) == 1:
+            return locator
+        # Ambiguous/unnamed IDs denote a position in this captured hierarchy.
+        # Construct the positional query only when needed, retaining named
+        # ancestors and exact empty identity. Never guess from coordinates.
+        parts = element.path.removeprefix("//").split("/")
+        identities = list(element.ancestors) + [(element.role, element.name, element.label)]
+        for index, (_, name, label) in enumerate(identities):
+            checks = []
+            for key, value in (("name", name), ("label", label)):
+                if index == 0 or identities[index][0] == "XCUIElementTypeSecureTextField":
+                    continue
+                checks.append(f"@{key}={xpath_literal(value)}" if value else f"(not(@{key}) or @{key}='')")
+            if index == len(parts) - 1:
+                checks.extend(["@visible='true'", "@enabled='true'"])
+            if checks:
+                parts[index] += "[" + " and ".join(checks) + "]"
+        return "xpath", "//" + "/".join(parts)
+
+    @cached_property
+    def projection(self) -> tuple[tuple[Element, str | None], ...]:
+        elements = self.elements or ()
+        parents = {e.path.rsplit("/", 1)[0] for e in elements}
+        projected: dict[str, Element] = {}
+        screen = []
+        for element in elements:
+            if element.visible is not True or element.role in {"XCUIElementTypeApplication", "XCUIElementTypeWindow"}:
+                continue
+            if element.role in LAYOUT and not (element.name or element.label) and (element.path in parents or not element.bounds):
+                continue
+            parent_path = element.path.rsplit("/", 1)[0]
+            while parent_path and parent_path not in projected:
+                parent_path = parent_path.rsplit("/", 1)[0]
+            parent = projected.get(parent_path)
+            if element.role == "XCUIElementTypeStaticText" and element.label and parent and parent.label == element.label:
+                projected[element.path] = parent
+                continue
+            projected[element.path] = element
+            screen.append((element, parent.id if parent else None))
+        return tuple(screen)
+
+    @cached_property
+    def counts(self) -> dict[str, int]:
+        elements = self.elements or ()
+        visible = [e for e in elements if e.visible is True]
+        return {"source_nodes": len(elements), "visible": len(visible),
+                "unnamed_visible": sum(not (e.name or e.label) for e in visible),
+                "unknown_visibility": sum(e.visible is None for e in elements),
+                "screen_elements": len(self.projection)}
 
     def compact(self, *, include_labels: bool = True, limit: int = 80, offset: int = 0,
-                redact: Callable[[str], str] = str) -> dict[str, object]:
+                redact: Callable[[str], str] = str, ids: set[str] | None = None) -> dict[str, object]:
         """Caller-facing local projection, not a cloud-sanitization API.
 
         Text values never leave this projection. Labels may disclose private content: even a
         non-secure screen can contain private messages or credentials.
         Display truncation never changes the full source/targets.
         """
-        if not 1 <= limit <= 200:
-            raise ValueError("Compact observation limit must be from 1 to 200.")
-        elements = self.elements or ()
-        visible = [e for e in elements if e.visible is True]
-        parents = {e.path.rsplit("/", 1)[0] for e in elements}
-        projected: dict[str, dict[str, object]] = {}
-        screen = []
-        for element in visible:
-            if element.role in {"XCUIElementTypeApplication", "XCUIElementTypeWindow"}:
-                continue
-            if element.role in LAYOUT and not element.label and (element.path in parents or not element.bounds):
-                continue
-            parent_path = element.path.rsplit("/", 1)[0]
-            while parent_path and parent_path not in projected:
-                parent_path = parent_path.rsplit("/", 1)[0]
-            parent = projected.get(parent_path)
+        projection = self.projection
+        if ids is not None:
+            ids = set(ids)
+            parent_by_id = {element.id: parent for element, parent in projection}
+            for element_id in list(ids):
+                parent = parent_by_id.get(element_id)
+                while parent:
+                    ids.add(parent)
+                    parent = parent_by_id.get(parent)
+            projection = tuple((e, p) for e, p in projection if e.id in ids)
+        rows, size = [], 0
+        for element, parent in projection[offset:offset + limit]:
             label = redact(element.label or "")[:256]
-            if element.role == "XCUIElementTypeStaticText" and label and parent and parent.get("label") == label:
-                projected[element.path] = parent
-                continue
             row = {"id": element.id, "role": element.role, "enabled": element.enabled,
                    "bounds": element.bounds}
             if parent:
-                row["parent"] = parent["id"]
+                row["parent"] = parent
             if element.focused is not None:
                 row["focused"] = element.focused
             if element.selected is not None:
@@ -202,14 +219,9 @@ class Observation:
             if include_labels and element.role != "XCUIElementTypeSecureTextField":
                 if label:
                     row["label"] = label
-                if element.name and element.name != element.label and element.role not in LAYOUT:
+                if element.name and element.name != element.label:
                     row["name"] = redact(element.name)[:256]
-            projected[element.path] = row
-            screen.append(row)
-        # Leave room for the envelope, image metadata and action receipts. A page
-        # boundary is determined here, not by throwing away the emitter's output.
-        rows, size = [], 0
-        for row in screen[offset:offset + limit]:
+            # Leave room for the envelope, image metadata and action receipts.
             row_size = len(json.dumps(row, ensure_ascii=True, separators=(",", ":")).encode()) + 1
             if size + row_size > 48_000:
                 break
@@ -220,12 +232,9 @@ class Observation:
                 "process_id": self.process_id, "generation": self.generation,
                 "capture_seconds": self.finished - self.started, "secure": self.secure,
                 "accessibility_observed": self.elements is not None,
-                "counts": {"source_nodes": len(elements), "visible": len(visible),
-                           "unnamed_visible": sum(not (e.name or e.label) for e in visible),
-                           "unknown_visibility": sum(e.visible is None for e in elements),
-                           "screen_elements": len(screen)},
-                "elements": rows, "omitted_elements": max(0, len(screen) - end),
-                "offset": offset, "next_offset": end if len(screen) > end else None,
+                "counts": self.counts,
+                "elements": rows, "omitted_elements": max(0, len(projection) - end),
+                "offset": offset, "next_offset": end if len(projection) > end else None,
                 "labels_included": include_labels,
                 "values_included": False}
 
@@ -252,9 +261,9 @@ def parse_observation(source: str, *, generation: int, device_udid: str,
     elements: list[Element] = []
     secure = False
 
-    def walk(node: ET.Element, path: str, ancestors: tuple, depth: int, locator: str | None = None) -> None:
+    def walk(node: ET.Element, path: str, ancestors: tuple, depth: int) -> None:
         nonlocal secure
-        if depth > 60 or len(elements) >= 2000:
+        if depth > 60:
             raise ObservationRejected("Accessibility tree exceeds limits; nothing was truncated into an actionable snapshot.")
         role = node.tag
         if not re.fullmatch(r"XCUIElementType[A-Za-z]+", role):
@@ -270,25 +279,15 @@ def parse_observation(source: str, *, generation: int, device_udid: str,
                 bounds = None
         except (KeyError, ValueError):
             bounds = None
-        # XPath is local only, built from observed hierarchy plus exact source
-        # attributes. Escaping prevents labels becoming executable predicates.
-        checks = [f"@{key}={xpath_literal(attrs[key])}" for key in
-                  ("name", "label", "value", "visible", "enabled", "x", "y", "width", "height")
-                  if key in attrs and not (is_secure and key == "value")]
-        locator = path if locator is None else locator
-        xpath = locator + ("[" + " and ".join(checks) + "]" if checks else "")
         elements.append(Element(f"{snapshot_id}:{len(elements)}", role, name, label, value,
                                 boolean(attrs.get("visible")), boolean(attrs.get("enabled")),
-                                boolean(attrs.get("focused")), bounds, ancestors, path, xpath,
+                                boolean(attrs.get("focused")), bounds, ancestors, path,
                                 boolean(attrs.get("selected"))))
         siblings: dict[str, int] = {}
-        identity = [f"@{key}={xpath_literal(attrs[key])}" for key in ("name", "label") if key in attrs]
-        parent = locator + ("[" + " and ".join(identity) + "]" if identity else "")
         for child in node:
             siblings[child.tag] = siblings.get(child.tag, 0) + 1
             walk(child, f"{path}/{child.tag}[{siblings[child.tag]}]",
-                 ancestors + ((role, name, label),), depth + 1,
-                 f"{parent}/{child.tag}[{siblings[child.tag]}]")
+                 ancestors + ((role, name, label),), depth + 1)
 
     if root.tag == "AppiumAUT":
         for index, child in enumerate(root, 1):
@@ -299,6 +298,5 @@ def parse_observation(source: str, *, generation: int, device_udid: str,
         walk(root, f"//{root.tag}[1]", (), 0)
     if not elements or elements[0].role != "XCUIElementTypeApplication":
         raise ObservationRejected("Accessibility application root is missing.")
-    signature = hashlib.sha256(json.dumps([e.fingerprint() for e in elements], ensure_ascii=False).encode()).hexdigest()
     return Observation(snapshot_id, generation, device_udid, app, captured_at,
-                       started, finished, tuple(elements), secure, signature, process_id)
+                       started, finished, tuple(elements), secure, process_id)

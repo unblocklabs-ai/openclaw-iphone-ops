@@ -10,16 +10,15 @@ TARGET="$HOME/Library/LaunchAgents/com.openclaw.iphone-watchdog.plist"
 
 mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs/openclaw"
 
-SCRIPT_REPO_DIR="$SCRIPT_REPO_DIR" TEMPLATE="$TEMPLATE" TARGET="$TARGET" INTERVAL="$INTERVAL" python3 - <<'PY'
+SCRIPT_REPO_DIR="$SCRIPT_REPO_DIR" TEMPLATE="$TEMPLATE" TARGET="$TARGET" INTERVAL="$INTERVAL" "${OPENCLAW_IPHONE_PYTHON:-python3}" - <<'PY'
 from pathlib import Path
 import os
-import plistlib
 import sys
 
 script_repo = Path(os.environ["SCRIPT_REPO_DIR"])
 sys.path.insert(0, str(script_repo / "src"))
 
-from openclaw_iphone.config import load_config
+from openclaw_iphone.launchd import install_launchagent
 
 try:
     interval = int(os.environ["INTERVAL"])
@@ -29,50 +28,12 @@ except ValueError:
 if interval < 1:
     print("OPENCLAW_IPHONE_WATCHDOG_INTERVAL must be a positive integer.", file=sys.stderr)
     raise SystemExit(2)
-if interval > 86400:
-    print("OPENCLAW_IPHONE_WATCHDOG_INTERVAL must be between 1 and 86400 seconds.", file=sys.stderr)
+try:
+    install_launchagent(script_repo, Path(os.environ["TEMPLATE"]), Path(os.environ["TARGET"]),
+                        "openclaw-iphone-watchdog.sh", interval=interval)
+except OverflowError:
+    print("OPENCLAW_IPHONE_WATCHDOG_INTERVAL does not fit a plist integer.", file=sys.stderr)
     raise SystemExit(2)
-
-config = load_config(cwd=script_repo)
-repo_dir = config.get("OPENCLAW_IPHONE_REPO_DIR") or str(script_repo)
-repo_path = Path(repo_dir).expanduser()
-wrapper = repo_path / "snippets/launchd/openclaw-iphone-watchdog.sh"
-package = repo_path / "src/openclaw_iphone"
-if not package.is_dir():
-    raise SystemExit(f"Repo dir does not contain src/openclaw_iphone: {repo_path}")
-if not wrapper.is_file():
-    raise SystemExit(f"Watchdog launchd wrapper is missing: {wrapper}")
-
-template = Path(os.environ["TEMPLATE"])
-with template.open("rb") as fh:
-    data = plistlib.load(fh)
-
-def replace(value):
-    if isinstance(value, str):
-        return value.replace("__HOME__", str(Path.home())).replace("__REPO_DIR__", str(repo_path))
-    if isinstance(value, list):
-        return [replace(item) for item in value]
-    if isinstance(value, dict):
-        return {key: replace(item) for key, item in value.items()}
-    return value
-
-rendered = replace(data)
-if config.path:
-    rendered["EnvironmentVariables"] = {"OPENCLAW_IPHONE_CONFIG": str(config.path.resolve())}
-for key in ("StandardOutPath", "StandardErrorPath"):
-    fd = os.open(rendered[key], os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-    try:
-        if os.fstat(fd).st_nlink != 1:
-            raise SystemExit("Refusing a hardlinked service log.")
-        os.fchmod(fd, 0o600)
-    finally:
-        os.close(fd)
-rendered["StartInterval"] = interval
-if "__HOME__" in str(rendered) or "__REPO_DIR__" in str(rendered):
-    raise SystemExit("Rendered plist still contains unresolved placeholders.")
-
-with Path(os.environ["TARGET"]).open("wb") as fh:
-    plistlib.dump(rendered, fh)
 PY
 
 plutil -lint "$TARGET"

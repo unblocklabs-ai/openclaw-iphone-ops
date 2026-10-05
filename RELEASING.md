@@ -12,7 +12,7 @@ Ordinary pushes, PRs, drafts, and prereleases do not publish packages.
   jobs. Offline tests do not prove physical-device readiness.
 
 The npm archive uses an explicit allowlist. Local config, evidence, tests,
-release tooling, and historical `build/` notes are excluded. The Python wheel
+release tooling, and `build/` artifacts are excluded. The Python wheel
 contains Python code only; its source distribution includes docs/skills/snippets.
 The repository does not currently grant an open-source license; npm metadata is
 `UNLICENSED`, rather than inventing a license as part of packaging.
@@ -58,7 +58,7 @@ latest `origin/main`; preserve unrelated local work.
    npm run release:check -- vX.Y.Z
    npm run preflight
    sh -n bin/openclaw-iphone
-   for script in snippets/*.sh snippets/launchd/*.sh; do sh -n "$script" || exit; done
+   for script in snippets/launchd/*.sh; do sh -n "$script" || exit; done
    ```
 
    Preflight runs the full Python suite, compares all versions, inspects every

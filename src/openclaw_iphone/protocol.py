@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import io
+from datetime import datetime, timezone
 import json
 import os
 import select
@@ -10,6 +11,10 @@ from typing import Callable, Iterator
 
 from .errors import SessionOutputUnavailable
 from .execution import Budget, TaskStopped
+
+
+class FramingError(ValueError):
+    """Incomplete frame, distinct from a malformed complete request."""
 
 
 def strict_json(raw: bytes | str) -> object:
@@ -28,30 +33,35 @@ def strict_json(raw: bytes | str) -> object:
 
 
 def read_requests(fd: int, *, frame_timeout: float = 5) -> Iterator[bytes]:
-    pending = b""
+    pending = bytearray()
     started = None
     oversized = False
     while True:
-        if started is not None and time.monotonic() - started >= frame_timeout:
-            raise ValueError("Incomplete request frame timed out.")
-        ready, _, _ = select.select([fd], [], [], 0.2)
+        timeout = None if started is None else frame_timeout - (time.monotonic() - started)
+        if timeout is not None and timeout <= 0:
+            raise FramingError("Incomplete request frame timed out.")
+        ready, _, _ = select.select([fd], [], [], timeout)
         if not ready:
-            continue
-        chunk = os.read(fd, 4096)
+            raise FramingError("Incomplete request frame timed out.")
+        chunk = os.read(fd, 65_536)
         if not chunk:
             if pending or oversized:
-                raise ValueError("Request needs a terminating newline.")
+                raise FramingError("Request needs a terminating newline.")
             return
-        for byte in chunk:
-            if started is None:
+        parts = chunk.split(b"\n")
+        for index, part in enumerate(parts):
+            if part and started is None:
                 started = time.monotonic()
-            if byte == 10:
-                yield b"" if oversized else pending
-                pending, oversized, started = b"", False, None
-            elif not oversized:
-                pending += bytes([byte])
-                if len(pending) > 4096:
-                    pending, oversized = b"", True
+            if not oversized:
+                if len(pending) + len(part) > 65_536:
+                    pending.clear()
+                    oversized = True
+                else:
+                    pending.extend(part)
+            if index < len(parts) - 1:
+                yield b"" if oversized else bytes(pending)
+                pending.clear()
+                oversized, started = False, None
 
 
 class JsonLineEmitter:
@@ -110,12 +120,27 @@ def json_line_emitter(stream) -> Callable[[dict[str, object]], None]:
 
 
 def serve(session, requests: Iterator[bytes], emit: Callable[[dict[str, object]], None]) -> int:
-    for sequence, line in enumerate(requests, 1):
+    iterator = iter(requests)
+    sequence = 0
+    while True:
+        try:
+            line = next(iterator)
+        except StopIteration:
+            break
+        except FramingError:
+            emit({"status": "error", "dispatch": "not_sent", "reason": "framing_error",
+                  "error": {"category": "incomplete_frame", "phase": "framing"}})
+            return 1
+        sequence += 1
+        started, stamp = time.monotonic(), datetime.now(timezone.utc).isoformat()
         try:
             result = session.request(strict_json(line))
         except (ValueError, TypeError, UnicodeError, RecursionError, OverflowError):
             result = {"status": "error", "dispatch": "not_sent", "reason": "invalid_request"}
         result["request_sequence"] = sequence
+        result.setdefault("timing", {"started_at": stamp, "finished_at": datetime.now(timezone.utc).isoformat(),
+                                    "seconds": round(time.monotonic() - started, 6), "reconnects": 0,
+                                    "counts": {}, "seconds_by_route": {}})
         emit(result)
         if session.closed:
             return 1 if result["status"] == "error" else 0

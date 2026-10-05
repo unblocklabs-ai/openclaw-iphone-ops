@@ -7,7 +7,6 @@ import math
 import plistlib
 from pathlib import Path
 import sys
-import time
 
 from . import __version__
 from .config import IPhoneConfig, load_config
@@ -15,10 +14,10 @@ from .connection import Connection
 from .control_lock import control_lock
 from .devicectl import Device, DeviceCtl
 from .evidence import artifact_path, write_private
-from .errors import DeviceLocked, OpenClawIPhoneError, SessionOutputUnavailable, WDAUnavailable
+from .errors import OpenClawIPhoneError, SessionOutputUnavailable, WDAUnavailable, diagnostic
 from .protocol import json_line_emitter, read_requests, serve
 from .session import Session
-from .wda import DEFAULT_SCREEN_READ_TIMEOUT, DEFAULT_WDA_PORT, WDAClient, WDARunConfig, resolve_wda_path, run_wda
+from .wda import DEFAULT_WDA_PORT, WDAClient, WDARunConfig, resolve_wda_path, run_wda
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
@@ -33,7 +32,7 @@ def main(argv: list[str] | None = None) -> int:
         # Read-only observers and the long-lived runner do not hold this lock.
         mutating = (
             args.command == "watchdog"
-            or args.command == "apps" and args.apps_command in {"launch", "terminate"}
+            or args.command == "apps" and args.apps_command == "terminate"
             or args.command == "wda" and args.wda_command in {"unlock", "lock"}
         )
         with control_lock() if mutating else nullcontext():
@@ -68,7 +67,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--developer-dir", help="Override DEVELOPER_DIR for Xcode/devicectl.")
     parser.add_argument("--evidence-dir", help="Directory for JSON evidence artifacts.")
     parser.add_argument("--timeout", type=int, default=30, help="External command timeout in seconds.")
-    parser.add_argument("--read-timeout", type=float, default=DEFAULT_SCREEN_READ_TIMEOUT, help="Read-only WDA request timeout (default 12s), capped by each operation deadline.")
+    parser.add_argument("--read-timeout", type=float, help="Optional shorter read-only WDA timeout; otherwise use the request/operation deadline.")
 
     subcommands = parser.add_subparsers(dest="command")
 
@@ -98,11 +97,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     apps_launch = apps_subcommands.add_parser("launch", help="Launch an installed app by name or bundle id.")
     add_device_arg(apps_launch)
-    apps_launch.add_argument(
-        "--skip-lock-check",
-        action="store_true",
-        help="Launch without first checking lock state.",
-    )
     apps_launch.add_argument("query")
     apps_launch.set_defaults(handler=handle_apps_launch)
 
@@ -202,14 +196,13 @@ def add_wda_url_arg(parser: argparse.ArgumentParser) -> None:
     )
 
 def client_from_args(args: argparse.Namespace) -> DeviceCtl:
-    return DeviceCtl(
-        developer_dir=args.developer_dir,
-        evidence_base=args.evidence_dir,
-        timeout=args.timeout,
-    )
+    if not hasattr(args, "_devicectl"):
+        args._devicectl = DeviceCtl(developer_dir=args.developer_dir,
+                                   evidence_base=args.evidence_dir, timeout=args.timeout)
+    return args._devicectl
 
 def wda_client_from_args(args: argparse.Namespace) -> WDAClient:
-    return WDAClient(url=resolve_wda_url_from_args(args), timeout=args.timeout, read_timeout=getattr(args, "read_timeout", DEFAULT_SCREEN_READ_TIMEOUT))
+    return WDAClient(url=resolve_wda_url_from_args(args), timeout=args.timeout, read_timeout=getattr(args, "read_timeout", None))
 
 def resolve_wda_url_from_args(args: argparse.Namespace) -> str:
     explicit = getattr(args, "url", None)
@@ -273,7 +266,7 @@ def handle_doctor(args: argparse.Namespace) -> int:
         return 1
     print(f"wda-url: {url}")
 
-    wda = WDAClient(url=url, timeout=args.timeout, read_timeout=getattr(args, "read_timeout", DEFAULT_SCREEN_READ_TIMEOUT))
+    wda = WDAClient(url=url, timeout=args.timeout, read_timeout=getattr(args, "read_timeout", None))
     try:
         status = wda.status()
     except WDAUnavailable as exc:
@@ -294,7 +287,7 @@ def handle_doctor(args: argparse.Namespace) -> int:
     print(f"wda-locked: {bool_value(locked)}")
 
     healthy = passcode_required is False and status.ready is True and locked is False
-    if healthy and getattr(args, "check_ui", False):
+    if getattr(args, "check_ui", False):
         try:
             wda.source()
         except WDAUnavailable:
@@ -381,11 +374,14 @@ def handle_apps_find(args: argparse.Namespace) -> int:
 
 def handle_apps_launch(args: argparse.Namespace) -> int:
     client = client_from_args(args)
-    device = selected_device(args, client)
-    app = client.find_app(device.identifier, args.query)
-    if not args.skip_lock_check:
-        ensure_unlocked_or_attempt_wda(args, client, device.identifier)
-    client.launch_app(device.identifier, app.bundle_identifier)
+    with Connection(client, device=device_selector_from_args(args), seconds=args.timeout,
+                    read_timeout=args.read_timeout) as connection:
+        device = connection.device
+        app = client.find_app(device.identifier, args.query)
+        result = Session(connection).request({"op": "launch", "bundle_id": app.bundle_identifier})
+    if result.get("dispatch") != "acknowledged":
+        print(json.dumps(result))
+        return 1
     print(f"launched: {app.name} ({app.bundle_identifier}) on {device.name}")
     return 0
 
@@ -436,13 +432,9 @@ def handle_wda_unlock(args: argparse.Namespace) -> int:
     if locked is not None:
         print(f"wda-locked: {str(locked).lower()}")
     if args.verify:
-        client = client_from_args(args)
-        device = selected_device(args, client)
         data, artifact = client.lock_state(device.identifier)
-        result = data.get("result", {})
-        passcode_required = result.get("passcodeRequired") if isinstance(result, dict) else None
-        value = "unknown" if not isinstance(passcode_required, bool) else str(passcode_required).lower()
-        print(f"passcode-required: {value}")
+        passcode_required = passcode_required_from_lock_state(data)
+        print(f"passcode-required: {bool_value(passcode_required)}")
         print(f"evidence: {artifact}")
         if passcode_required is True:
             print("result: human-unlock-required")
@@ -479,19 +471,7 @@ def handle_watchdog_once(args: argparse.Namespace) -> int:
         print(f"blocker: {exc}")
         return 1
 
-    try:
-        status = wda.status()
-    except WDAUnavailable as exc:
-        print(f"result: wda-unreachable")
-        print(f"blocker: {exc}")
-        return 1
-
-    print(f"wda-url: {status.url}")
-    print(f"wda-ready: {bool_value(status.ready)}")
-    if status.ready is not True:
-        print(f"result: {'wda-ready-unknown' if status.ready is None else 'wda-not-ready'}")
-        return 1
-
+    print(f"wda-url: {wda.url}")
     try:
         locked = wda.locked()
     except WDAUnavailable as exc:
@@ -500,26 +480,11 @@ def handle_watchdog_once(args: argparse.Namespace) -> int:
         return 1
     print(f"wda-locked: {bool_value(locked)}")
     if locked is False:
-        if not args.no_verify:
-            try:
-                client.require_unlocked(device.identifier)
-            except (OpenClawIPhoneError, ValueError) as exc:
-                print("result: lock-state-conflict-or-unknown")
-                print(f"blocker: {exc}")
-                return 1
         print("result: ok")
         return 0
     if locked is None:
         print("result: lock-state-unknown")
         return 1
-
-    if not args.no_verify:
-        try:
-            client.require_unlocked(device.identifier)
-        except (OpenClawIPhoneError, ValueError) as exc:
-            print("result: human-unlock-required-or-unknown")
-            print(f"blocker: {exc}")
-            return 1
 
     try:
         wda.unlock()
@@ -578,7 +543,6 @@ def handle_wda_run(args: argparse.Namespace) -> int:
     runner_bundle_id = args.runner_bundle_id or config.get("OPENCLAW_IPHONE_RUNNER_BUNDLE_ID")
     client = client_from_args(args)
     device = selected_device(args, client, config=config)
-    client.require_unlocked(device.identifier)
     print(f"device: {device.name} ({device.identifier})")
     print(f"wda path: {wda_path}")
     print("starting: xcodebuild test")
@@ -596,18 +560,6 @@ def handle_wda_run(args: argparse.Namespace) -> int:
             allow_provisioning_updates=args.allow_provisioning_updates,
         )
     )
-
-def ensure_unlocked_or_attempt_wda(args: argparse.Namespace, client: DeviceCtl, device_id: str) -> None:
-    # passcodeRequired=false is not proof the screen is unlocked.
-    client.require_unlocked(device_id)
-    wda = wda_client_from_args(args)
-    locked = wda.locked()
-    if locked is True:
-        wda.unlock()
-        client.require_unlocked(device_id)
-        locked = wda.locked()
-    if locked is not False:
-        raise DeviceLocked("Screen lock state is locked or unknown after one recovery attempt.")
 
 def passcode_required_from_lock_state(data: dict[str, object]) -> bool | None:
     result = data.get("result")
@@ -631,15 +583,20 @@ def handle_session(args: argparse.Namespace) -> int:
                                 seconds=args.operation_timeout, read_timeout=args.read_timeout)
         with connection:
             session = Session(connection, allow_images=args.allow_images, evidence_base=args.evidence_dir)
-            emit({"status": "ready", "protocol": 2, "device_udid": connection.device.udid})
+            emit({"status": "ready", "protocol": 2, "device_udid": connection.device.udid,
+                  "capabilities": ["set_input", "gregorian_wheel_date", "native_picker", "private_replace_verification",
+                                   "foreground_readiness", "request_timing", "candidate_paging"]})
             code = serve(session, read_requests(sys.stdin.fileno()), emit)
-        emit({"status": "session_end", "cleanup": "warning" if connection.cleanup_failed else "completed"})
+        emit({"status": "session_end", "cleanup": "warning" if connection.cleanup_failed else "completed",
+              "timing": connection.metrics.summary(), "reconnects": connection.reconnects})
         return code
     except SessionOutputUnavailable:
         return 1
-    except (ValueError, OSError, OpenClawIPhoneError, KeyboardInterrupt):
+    except (ValueError, OSError, OpenClawIPhoneError, KeyboardInterrupt) as exc:
         try:
             emit({"status": "error", "reason": "session_unavailable_or_interrupted",
+                  "error": diagnostic(exc),
+                  "timing": connection.metrics.summary() if connection else {},
                   "cleanup": "warning" if connection and connection.cleanup_failed else "completed"})
         except SessionOutputUnavailable:
             pass

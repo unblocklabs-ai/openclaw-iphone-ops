@@ -4,9 +4,11 @@ A small Python controller for a dedicated USB-connected physical iPhone.
 The agent plans and judges results; this package owns the phone connection and
 executes direct WebDriverAgent controls. No second model or runtime dependencies.
 
-**Breaking change in v0.6.0:** `session` replaces the `task`, `ui`, and
-`instagram` commands. Earlier versions use the retired API;
-see [migration notes](docs/session.md#migration).
+Use one persistent `session` for observation, taps, swipes, desired-value inputs
+and app transitions. `set` fills text, a native wheel date, a picker option or a
+Boolean control in one agent-facing request. Optional private input comparison, foreground
+readiness and route timing help inspect results. The session's
+`ready.capabilities` reports supported optional operations.
 
 ## Use this checkout
 
@@ -25,7 +27,7 @@ read each response before making the next decision. For example:
 ```json
 {"op":"observe"}
 {"op":"tap","target":{"role":"XCUIElementTypeButton","label":"Search"}}
-{"op":"type","text":"a search query"}
+{"op":"set","value":"a search query"}
 {"op":"press","button":"enter","observe":"image"}
 {"op":"swipe","from_x":200,"from_y":700,"to_x":200,"to_y":250}
 {"op":"close"}
@@ -34,6 +36,9 @@ read each response before making the next decision. For example:
 Coordinates default to device points. Image-pixel coordinates explicitly use
 `"space":"image"`. See [the session protocol](docs/session.md) for units,
 target IDs, input replacement, private input files, masking and failure outcomes.
+Use `set` for a complete field value and `type` for deliberate insertion.
+Date input accepts one ISO date and handles supported native wheels internally;
+ambiguous component identity can use an explicit mapping.
 
 Observation is a screen, not a native view-tree dump: readable content and
 controls, short IDs, meaningful parent groups, bounds and state. Empty layout
@@ -43,7 +48,7 @@ follow `next_offset` without recapturing the screen or invalidating earlier IDs.
 
 The session pins one physical phone and holds exclusive control. Timeouts apply
 to operations, not agent deliberation. There are no grants, task files, quotas,
-completion verdicts, automatic readbacks, or reconciliation permissions. Unknown
+completion verdicts, mandatory readbacks, or reconciliation permissions. Unknown
 writes are never replayed automatically. The caller may inspect and choose a
 subsequent action. Optional observation failure does not erase acknowledgment.
 
@@ -52,22 +57,24 @@ subsequent action. Optional observation failure does not erase acknowledgment.
 ```sh
 PYTHONPATH=src python3 -m openclaw_iphone devices list
 PYTHONPATH=src python3 -m openclaw_iphone doctor --check-ui
+PYTHONPATH=src python3 -m openclaw_iphone apps list
 PYTHONPATH=src python3 -m openclaw_iphone apps find Safari
+PYTHONPATH=src python3 -m openclaw_iphone apps launch Safari
 ```
 
-Use diagnosis after a failure, not as a ritual before every action. Existing
-`wda run`, `watchdog once`, app inspection/control, and launchd tooling remain.
+Use diagnosis after a failure, not as a ritual before every action. Use
+`wda run`, `watchdog once`, app inspection/control, and launchd tooling for setup
+and recovery.
 Close the session before separate mutating commands.
 
 - [Service setup](docs/launchagent-service.md)
 - [Mechanics](docs/mechanics.md) and [troubleshooting](docs/troubleshooting.md)
 - [Supervised App Store installation](docs/app-store-installs.md)
-- [Approved simplification plan](docs/simple-agent-harness-plan.md)
 
 ## Distribution
 
-This is a CLI/skills bundle, not a native OpenClaw plugin. Install v0.6.0 with
-`npm install -g @unblocklabs/openclaw-iphone-ops@0.6.0`.
+This is a CLI/skills bundle, not a native OpenClaw plugin. Install v0.7.0 with
+`npm install -g @unblocklabs/openclaw-iphone-ops@0.7.0`.
 The package ships the CLI, skills, docs and snippets; register its `skills/` directory with
 the agent explicitly. The launcher supports `OPENCLAW_IPHONE_PYTHON` to select
 an absolute Python interpreter. Configuration/evidence belong outside the package.
@@ -82,5 +89,4 @@ npm run preflight
 Preflight checks shared versions, offline/loopback tests, and the real packed
 npm installation outside the checkout. Physical-device reliability and speed
 still require a matched on-device comparison; these checks do not establish it.
-Historical notes in `build/` describe retired versions, not the current API.
 See [release procedure](RELEASING.md) before publishing a new version.

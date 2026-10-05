@@ -39,7 +39,6 @@ class ObservationTests(unittest.TestCase):
     def test_ids_are_snapshot_local_and_hierarchy_is_retained(self):
         one, two = snapshot(source()), snapshot(source())
         self.assertNotEqual(one.elements[1].id, two.elements[1].id)
-        self.assertEqual(one.signature, two.signature)
         self.assertEqual(one.elements[1].ancestors[0][0], "XCUIElementTypeApplication")
         self.assertEqual(one.elements[1].path, "//XCUIElementTypeApplication[1]/XCUIElementTypeButton[1]")
 
@@ -48,18 +47,17 @@ class ObservationTests(unittest.TestCase):
         obs = snapshot(source(extra=secure, enabled="unknown"))
         self.assertTrue(obs.secure)
         self.assertIsNone(obs.elements[-1].value)
-        self.assertFalse(obs.elements[1].actionable)
+        self.assertIsNone(obs.elements[1].enabled)
         self.assertNotIn("SECRET", repr(obs))
         duplicate = '<XCUIElementTypeButton label="Next" visible="true" />'
-        self.assertIsNone(snapshot(source(extra=duplicate)).unique(BUTTON))
+        self.assertEqual(len(snapshot(source(extra=duplicate)).matches(BUTTON)), 2)
 
     def test_rejects_incomplete_trees_and_escapes_locator_text(self):
-        for xml in ("<App />", '<!DOCTYPE a [<!ENTITY b "x">]><App/>',
-                    "<XCUIElementTypeApplication>" + "<XCUIElementTypeOther/>" * 2001 + "</XCUIElementTypeApplication>"):
+        for xml in ("<App />", '<!DOCTYPE a [<!ENTITY b "x">]><App/>'):
             with self.assertRaises(ObservationRejected):
                 snapshot(xml)
         self.assertEqual(xpath_literal("a'b\"c"), 'concat(\'a\', "\'", \'b"c\')')
-        label = '" OR TRUEPREDICATE OR label == "é🙂\\\n'
+        label = 'long native label ' * 20 + '" OR TRUEPREDICATE OR label == "é🙂\\\n'
         self.assertEqual(json.loads(predicate_literal(label)), label)
         using, query = Selector("XCUIElementTypeButton", label=label).locator()
         self.assertEqual(using, "predicate string")

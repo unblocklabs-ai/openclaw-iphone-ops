@@ -5,9 +5,8 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .errors import AppNotFound, DeviceLocked, DeviceSelectionError
+from .errors import AppNotFound, DeviceSelectionError
 from .evidence import artifact_path
-from .execution import Budget
 from .runner import Runner
 from .xcode import resolve_developer_dir
 
@@ -48,27 +47,16 @@ class DeviceCtl:
         self.evidence_base = evidence_base
 
     def list_devices(self) -> tuple[list[Device], Path]:
-        output = artifact_path("devices", base=self.evidence_base)
-        self.runner.run(["xcrun", "devicectl", "list", "devices", "--json-output", str(output)])
-        data = read_json(output)
+        data, output = self._json(["list", "devices"], "devices")
         devices = [_device_from_json(item) for item in find_list(data, "devices")]
         return devices, output
 
     def device_details(self, device_id: str) -> tuple[dict[str, Any], Path]:
-        output = artifact_path("device-details", base=self.evidence_base)
-        self.runner.run(
-            [
-                "xcrun",
-                "devicectl",
-                "device",
-                "info",
-                "details",
-                "--device",
-                device_id,
-                "--json-output",
-                str(output),
-            ]
-        )
+        return self._json(["device", "info", "details", "--device", device_id], "device-details")
+
+    def _json(self, arguments: list[str], name: str) -> tuple[dict[str, Any], Path]:
+        output = artifact_path(name, base=self.evidence_base)
+        self.runner.run(["xcrun", "devicectl", *arguments, "--json-output", str(output)])
         return read_json(output), output
 
     def coredevice_wda_url(self, device_id: str, *, port: int = 8100) -> tuple[str, Path]:
@@ -91,7 +79,7 @@ class DeviceCtl:
 
         return f"http://{url_host(str(tunnel_ip))}:{port}", output
 
-    def select_device(self, requested: str | None = None, *, read_only: bool = False) -> Device:
+    def select_device(self, requested: str | None = None) -> Device:
         requested = requested or None
         devices, _ = self.list_devices()
         connected = [
@@ -100,14 +88,14 @@ class DeviceCtl:
             and device.model.casefold().startswith("iphone")
         ]
         if requested:
-            # Resolve identity before filtering connection state. Never wake a
-            # name match or substitute another phone for a dormant pinned one.
+            # Explicit identity is not an availability probe. The native
+            # command determines whether the selected phone is reachable.
             exact = [d for d in devices if d.identifier and d.model.casefold().startswith("iphone")
                      and requested.casefold() in {d.identifier.casefold(), d.udid.casefold()}]
             if len(exact) > 1:
                 raise DeviceSelectionError("Device identity matched multiple records.")
             if exact:
-                return exact[0] if exact[0] in connected else self._wake_pinned(exact[0], read_only=read_only)
+                return exact[0]
             matches = [
                 device
                 for device in connected
@@ -130,73 +118,11 @@ class DeviceCtl:
             f"or pass --device where supported. Candidates: {names}"
         )
 
-    def _wake_pinned(self, original: Device, *, read_only: bool = False) -> Device:
-        """One read-only details probe and recheck, bounded by 10s/task budget."""
-        if not original.udid:
-            raise DeviceSelectionError("Disconnected device has no physical UDID; reconnect it manually.")
-        previous = self.runner.budget
-        budget = Budget.seconds(min(10, self.runner.timeout))
-        if previous is not None:
-            budget.deadline = min(budget.deadline, previous.deadline)
-            budget.cancelled = previous.cancelled
-        self.runner.budget = budget
-        try:
-            details, _ = self.device_details(original.identifier)
-            udid = value_at(details, "result.hardwareProperties.udid")
-            if not isinstance(udid, str) or udid.casefold() != original.udid.casefold():
-                raise DeviceSelectionError("Device identity unavailable or changed during reconnect.")
-            devices, _ = self.list_devices()
-            matches = [d for d in devices if d.identifier == original.identifier
-                       and d.udid.casefold() == original.udid.casefold()
-                       and d.model.casefold().startswith("iphone") and d.state.lower() == "connected"]
-            if len(matches) != 1:
-                raise DeviceSelectionError("Pinned iPhone is still disconnected; no alternative device selected.")
-            if not read_only:
-                self.require_unlocked(matches[0].identifier)
-            return matches[0]
-        finally:
-            self.runner.budget = previous
-
     def lock_state(self, device_id: str) -> tuple[dict[str, Any], Path]:
-        output = artifact_path("lock-state", base=self.evidence_base)
-        self.runner.run(
-            [
-                "xcrun",
-                "devicectl",
-                "device",
-                "info",
-                "lockState",
-                "--device",
-                device_id,
-                "--json-output",
-                str(output),
-            ]
-        )
-        return read_json(output), output
-
-    def require_unlocked(self, device_id: str) -> Path:
-        data, output = self.lock_state(device_id)
-        result = data.get("result")
-        if not isinstance(result, dict):
-            raise DeviceLocked(
-                "Blocked at lock state: devicectl returned an unknown lock-state response."
-            )
-        passcode_required = result.get("passcodeRequired")
-        if passcode_required is False:
-            return output
-        if passcode_required is True:
-            raise DeviceLocked(
-                "Blocked at lock state: the device is locked and needs human unlock."
-            )
-        raise DeviceLocked(
-            "Blocked at lock state: devicectl did not report a boolean passcodeRequired value."
-        )
+        return self._json(["device", "info", "lockState", "--device", device_id], "lock-state")
 
     def list_apps(self, device_id: str, *, include_all: bool = True) -> tuple[list[App], Path]:
-        output = artifact_path("apps", base=self.evidence_base)
         command = [
-            "xcrun",
-            "devicectl",
             "device",
             "info",
             "apps",
@@ -205,32 +131,21 @@ class DeviceCtl:
         ]
         if include_all:
             command.append("--include-all-apps")
-        command.extend(["--json-output", str(output)])
-        self.runner.run(command)
-        data = read_json(output)
-        apps = [_app_from_json(item) for item in find_list(data, "apps")]
+        data, output = self._json(command, "apps")
+        result = data.get("result")
+        entries = result.get("apps") if isinstance(result, dict) else None
+        if not isinstance(entries, list) or any(not isinstance(item, dict) for item in entries):
+            raise ValueError("Installed-app inventory is missing or malformed.")
+        apps = [_app_from_json(item) for item in entries]
         return apps, output
 
     def find_app(self, device_id: str, query: str) -> App:
         apps, _ = self.list_apps(device_id, include_all=True)
         return resolve_app(apps, query, device_id)
 
-    def launch_app(self, device_id: str, bundle_id: str) -> None:
-        self.runner.run(
-            [
-                "xcrun",
-                "devicectl",
-                "device",
-                "process",
-                "launch",
-                "--device",
-                device_id,
-                bundle_id,
-            ]
-        )
-
-
 def resolve_app(apps: list[App], query: str, device_id: str) -> App:
+    if not query.strip():
+        raise ValueError("App query must be non-empty.")
     query_lower = query.lower()
 
     exact_bundle = [app for app in apps if app.bundle_identifier == query]

@@ -1,10 +1,8 @@
-from pathlib import Path
-import io
 import json
 import unittest
+import time
 from unittest.mock import Mock, patch
-from urllib.parse import urlsplit
-from openclaw_iphone.errors import DeviceLocked, WDAOutcomeUnknown, WDAUnavailable
+from openclaw_iphone.errors import WDAOutcomeUnknown, WDAUnavailable
 from openclaw_iphone.execution import Budget, TaskStopped
 from openclaw_iphone.runner import Runner
 from openclaw_iphone.wda import WDAClient
@@ -14,14 +12,13 @@ class TransportTests(unittest.TestCase):
         for text in ("a", "hé🙂" * 10):
             client = WDAClient(url="http://wda.test")
             routes = []
-            def respond(request, timeout):
-                path = urlsplit(request.full_url).path
-                routes.append((request.method, path))
-                payload = {"sessionId": "one", "value": {}} if path == "/session" else {"value": False if path == "/wda/locked" else None}
-                return io.BytesIO(json.dumps(payload).encode())
-            with patch.object(client.opener, "open", side_effect=respond):
+            def respond(url, path, method, body, timeout, *, max_bytes):
+                routes.append((method, path))
+                payload = {"sessionId": "one", "value": {}} if path == "/session" else {"value": None}
+                return 200, json.dumps(payload).encode()
+            with patch("openclaw_iphone.wda.exchange", side_effect=respond):
                 client.type_text_bulk(text)
-            self.assertEqual(routes, [("GET", "/wda/locked"), ("POST", "/session"),
+            self.assertEqual(routes, [("POST", "/session"),
                                       ("POST", "/session/one/appium/settings"),
                                       ("POST", "/session/one/wda/keys"), ("DELETE", "/session/one")])
 
@@ -35,18 +32,15 @@ class TransportTests(unittest.TestCase):
 
     def client(self):
         client = WDAClient(url="http://wda.test")
-        client.locked = Mock(return_value=False)
         client._create_session = Mock(return_value="one")
         client._delete_session = Mock()
         client._json_post = Mock(return_value={"value": None})
         return client
 
-    def test_nested_and_child_deadline_borrow_one_session(self):
+    def test_nested_operations_borrow_one_session(self):
         client = self.client()
         with client.session():
-            child = client.with_deadline(5)
-            self.assertLessEqual(child.with_deadline(50).deadline, child.deadline)
-            child.tap(1, 2)
+            client.tap(1, 2)
             client.type_text_bulk("hé🙂")
             client.type_text("ab")
             client._delete_session.assert_not_called()
@@ -54,33 +48,25 @@ class TransportTests(unittest.TestCase):
         client._delete_session.assert_called_once_with("one")
         client._json_post.assert_any_call("/session/one/wda/keys", {"value": ["hé🙂"]})
 
-    def test_cancel_between_characters_reports_partial_typing_and_never_replays(self):
+    def test_deadline_between_characters_reports_partial_typing_and_never_replays(self):
         client = self.client()
         client.budget = Budget.seconds(3)
         def post(path, payload):
             if path.endswith("/actions"):
-                client.budget.cancelled.set()
+                client.budget.deadline = time.monotonic() - 1
             return {"value": None}
         client._json_post.side_effect = post
         with self.assertRaisesRegex(WDAOutcomeUnknown, "1 acknowledged characters"):
             client.type_text("ab", frequency=100)
         self.assertEqual(client._json_post.call_count, 2)
 
-    def test_typing_checks_lock_before_session_creation(self):
-        for method in ("type_text", "type_text_bulk"):
-            client = self.client()
-            client.locked.return_value = None
-            with self.assertRaises(DeviceLocked):
-                getattr(client, method)("text")
-            client._create_session.assert_not_called()
-
-    def test_cancelled_budget_starts_no_network_or_subprocess_and_no_count(self):
+    def test_expired_budget_starts_no_network_or_subprocess_and_no_count(self):
         budget = Budget.seconds(10)
-        budget.cancelled.set()
+        budget.deadline = time.monotonic() - 1
         client = WDAClient(url="http://wda.test")
         runner = Runner()
         client.budget = runner.budget = budget
-        with patch.object(client.opener, "open") as network, patch("subprocess.run") as process:
+        with patch("openclaw_iphone.wda.exchange") as network, patch("subprocess.run") as process:
             for action in (client.status, lambda: runner.run(["private-argument"]), lambda: budget.sleep(1)):
                 with self.assertRaises(TaskStopped):
                     action()

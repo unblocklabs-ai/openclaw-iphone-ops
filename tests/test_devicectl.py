@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import Mock
 
 from openclaw_iphone.devicectl import App, Device, DeviceCtl, _app_from_json, _device_from_json, find_list, url_host
-from openclaw_iphone.errors import AppNotFound, DeviceLocked
+from openclaw_iphone.errors import AppNotFound, DeviceSelectionError
 
 
 class DeviceCtlJsonTests(unittest.TestCase):
@@ -122,56 +122,20 @@ class DeviceCtlJsonTests(unittest.TestCase):
 
     def test_select_device_matches_physical_udid(self) -> None:
         client = DeviceCtl()
-        client.list_devices = Mock(  # type: ignore[method-assign]
-            return_value=(
-                [
-                    Device(
-                        name="Pearl's iPhone",
-                        identifier="coredevice-id",
-                        state="connected",
-                        udid="physical-udid",
-                        model="iPhone 15",
-                    )
-                ],
-                Path("/tmp/devices.json"),
-            )
-        )
+        client.device_details = Mock(side_effect=AssertionError("Selection must not probe availability."))
+        for state in ("connected", "disconnected"):
+            device = Device("phone", "core", state, "iPhone 15", "physical")
+            client.list_devices = Mock(return_value=([device], Path("unused")))
+            for selector in ("core", "physical", "PHYSICAL"):
+                with self.subTest(state=state, selector=selector):
+                    self.assertEqual(client.select_device(selector), device)
+            client.list_devices.return_value = ([device, device], Path("unused"))
+            with self.assertRaisesRegex(DeviceSelectionError, "multiple records"):
+                client.select_device("physical")
 
-        self.assertEqual(client.select_device("physical-udid").identifier, "coredevice-id")
-
-    def test_require_unlocked_returns_artifact_when_passcode_not_required(self) -> None:
-        client = DeviceCtl()
-        client.lock_state = Mock(return_value=({"result": {"passcodeRequired": False}}, Path("/tmp/lock.json")))  # type: ignore[method-assign]
-
-        self.assertEqual(client.require_unlocked("device-id"), Path("/tmp/lock.json"))
-
-    def test_require_unlocked_raises_when_passcode_required(self) -> None:
-        client = DeviceCtl()
-        client.lock_state = Mock(return_value=({"result": {"passcodeRequired": True}}, Path("/tmp/lock.json")))  # type: ignore[method-assign]
-
-        with self.assertRaises(DeviceLocked):
-            client.require_unlocked("device-id")
-
-    def test_require_unlocked_raises_when_lock_state_missing(self) -> None:
-        client = DeviceCtl()
-        client.lock_state = Mock(return_value=({}, Path("/tmp/lock.json")))  # type: ignore[method-assign]
-
-        with self.assertRaisesRegex(DeviceLocked, "unknown lock-state response"):
-            client.require_unlocked("device-id")
-
-    def test_require_unlocked_raises_when_result_is_not_object(self) -> None:
-        client = DeviceCtl()
-        client.lock_state = Mock(return_value=({"result": "unknown"}, Path("/tmp/lock.json")))  # type: ignore[method-assign]
-
-        with self.assertRaisesRegex(DeviceLocked, "unknown lock-state response"):
-            client.require_unlocked("device-id")
-
-    def test_require_unlocked_raises_when_passcode_required_not_boolean(self) -> None:
-        client = DeviceCtl()
-        client.lock_state = Mock(return_value=({"result": {"passcodeRequired": "false"}}, Path("/tmp/lock.json")))  # type: ignore[method-assign]
-
-        with self.assertRaisesRegex(DeviceLocked, "boolean passcodeRequired"):
-            client.require_unlocked("device-id")
+        client.list_devices.return_value = ([Device("other", "other-core", "connected", "iPhone 15", "other-physical")], Path("unused"))
+        with self.assertRaises(DeviceSelectionError):
+            client.select_device("physical")
 
 
 if __name__ == "__main__":
