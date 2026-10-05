@@ -1,5 +1,7 @@
 """CLI JSON-lines against real WDA HTTP; no physical device access."""
 from contextlib import contextmanager
+import calendar
+from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
@@ -36,7 +38,7 @@ from openclaw_iphone.runner import Runner
 base = Path(os.environ["IPHONE_TEST_DIR"])
 class CoreDeviceFixture:
     def __init__(self):
-        self.runner = Runner(timeout=2)
+        self.runner = Runner(timeout=float(os.environ.get("IPHONE_TEST_TIMEOUT", "2")))
     def select_device(self, selector, *, read_only=False):
         with (base / "selectors").open("a") as stream:
             stream.write(json.dumps([selector, read_only]) + "\\n")
@@ -74,10 +76,38 @@ class PhoneServer(ThreadingHTTPServer):
         self.picker_values = ["One", "Two", "Three"]
         self.picker_index = 0
         self.reject_text = False
+        self.reject_picker_value = False
         self.foreground = "test.app"
         self.transition_at = 0
         self.transition_to = "test.app"
         self.fail_picker_readback = False
+        self.native_date = date(2023, 3, 31)
+        self.date_max = None
+        self.date_min = None
+        self.month_values = list(calendar.month_name)[1:]
+        self.date_wheels = ["day", "year", "month"]
+        self.element_types.update({"date": "XCUIElementTypeDatePicker", "switch": "XCUIElementTypeSwitch",
+                                   **{ref: "XCUIElementTypePickerWheel" for ref in self.date_wheels}})
+        self.component_labels = {"day": "", "year": "", "month": ""}
+        self.number_suffixes = {"day": "", "year": ""}
+        self.checked = True
+        self.submit_count = 0
+        self.value_delay = 0
+        self.mutate_then_fail = set()
+        self.fail_read_after = set()
+
+    def wheel_value(self, part):
+        value = getattr(self.native_date, part)
+        return self.month_values[value - 1] if part == "month" else str(value) + self.number_suffixes[part]
+
+    def adjust_date(self, part, value):
+        values = {part: getattr(self.native_date, part) for part in ("year", "month", "day")}
+        values[part] = self.month_values.index(value) + 1 if part == "month" else int(value.removesuffix(self.number_suffixes[part]))
+        values["day"] = min(values["day"], calendar.monthrange(values["year"], values["month"])[1])
+        updated = date(**values)
+        if self.date_min:
+            updated = max(updated, self.date_min)
+        self.native_date = min(updated, self.date_max) if self.date_max else updated
 
 
 class PhoneHandler(BaseHTTPRequestHandler):
@@ -116,7 +146,19 @@ class PhoneHandler(BaseHTTPRequestHandler):
             elif path.endswith("/window/size"):
                 value = self.server.size
             elif path.endswith("/elements"):
-                value = [{"ELEMENT": ref} for ref in self.server.elements]
+                query = payload["value"]
+                refs = self.server.elements
+                if "/element/date/" in path:
+                    refs = self.server.date_wheels
+                elif "XCUIElementTypeDatePicker" in query:
+                    refs = ["date"]
+                elif "XCUIElementTypeSwitch" in query:
+                    refs = ["switch"]
+                elif "XCUIElementTypePickerWheel" in query:
+                    for part, label in self.server.component_labels.items():
+                        if label and (f'"{label}"' in query or f"'{label}'" in query):
+                            refs = [part]
+                value = [{"ELEMENT": ref} for ref in refs]
             elif path.endswith("/element/active"):
                 value = {"ELEMENT": "field"}
             elif "/attribute/" in path:
@@ -124,9 +166,31 @@ class PhoneHandler(BaseHTTPRequestHandler):
                 if attribute == "type":
                     value = self.server.element_types.get(ref)
                 elif attribute == "value":
-                    value = self.server.picker_values[self.server.picker_index] if ref == "wheel" else self.server.text
+                    time.sleep(self.server.value_delay)
+                    if ref in self.server.date_wheels:
+                        value = self.server.wheel_value(ref)
+                    elif ref == "switch":
+                        value = str(int(self.server.checked)) if self.server.checked is not None else None
+                    else:
+                        value = self.server.picker_values[self.server.picker_index] if ref == "wheel" else self.server.text
+                elif attribute == "label":
+                    value = self.server.component_labels.get(ref)
             elif "/pickerwheel/" in path:
-                self.server.picker_index = (self.server.picker_index + (1 if payload["order"] == "next" else -1)) % len(self.server.picker_values)
+                ref = path.split("/pickerwheel/")[1].split("/")[0]
+                step = 1 if payload["order"] == "next" else -1
+                if ref in self.server.date_wheels:
+                    current = getattr(self.server.native_date, ref)
+                    if ref == "month":
+                        self.server.adjust_date(ref, self.server.month_values[(current - 1 + step) % 12])
+                    elif ref == "day":
+                        limit = calendar.monthrange(self.server.native_date.year, self.server.native_date.month)[1]
+                        self.server.adjust_date(ref, str((current - 1 + step) % limit + 1))
+                    else:
+                        self.server.adjust_date(ref, str(current + step))
+                else:
+                    self.server.picker_index = (self.server.picker_index + step) % len(self.server.picker_values)
+            elif path.endswith("/element/switch/click"):
+                self.server.checked = not self.server.checked
             elif path.endswith("/wda/apps/activate"):
                 self.server.transition_to = payload["bundleId"]
                 self.server.transition_at = time.monotonic() + 0.2
@@ -134,14 +198,24 @@ class PhoneHandler(BaseHTTPRequestHandler):
                 self.server.text = ""
             elif path.endswith("/wda/keys") or path.endswith("/value"):
                 text = "".join(payload["value"])
-                if "/element/wheel/" in path:
-                    if text in self.server.picker_values:
+                ref = path.split("/element/")[1].split("/")[0] if "/element/" in path else "field"
+                if ref in self.server.date_wheels:
+                    self.server.adjust_date(ref, text)
+                elif ref == "wheel":
+                    if text in self.server.picker_values and not self.server.reject_picker_value:
                         self.server.picker_index = self.server.picker_values.index(text)
                     if self.server.fail_picker_readback:
                         self.server.failures["/session/one/element/wheel/attribute/value"] = 1
                 elif not self.server.reject_text:
                     self.server.text += text
+                if path in self.server.fail_read_after:
+                    self.server.failures[f"/session/one/element/{ref}/attribute/value"] = 1
+            elif path.endswith("/actions"):
+                self.server.submit_count += sum(action.get("value") == "\ue007" and action["type"] == "keyDown"
+                    for source in payload["actions"] for action in source["actions"])
             body = {"value": value}
+            if path in self.server.mutate_then_fail:
+                body, status = {"value": {"error": "unknown error", "message": "SERVER-PRIVATE"}}, 500
             if path == "/session" and self.command == "POST":
                 self.server.sessions += 1
                 body["sessionId"] = "one"
@@ -161,7 +235,7 @@ class PhoneHandler(BaseHTTPRequestHandler):
 
 class SessionTests(unittest.TestCase):
     @contextmanager
-    def running(self, *, images=False, seconds=2, read_seconds=12):
+    def running(self, *, images=False, seconds=2, read_seconds=12, timeout=2):
         with tempfile.TemporaryDirectory() as directory, PhoneServer() as server:
             base = Path(directory)
             (base / "identity").write_text("physical")
@@ -169,6 +243,7 @@ class SessionTests(unittest.TestCase):
             thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
             thread.start()
             env = dict(os.environ, PYTHONPATH=str(ROOT / "src"), IPHONE_TEST_DIR=directory,
+                       IPHONE_TEST_TIMEOUT=str(timeout),
                        IPHONE_TEST_URL=f"http://127.0.0.1:{server.server_port}",
                        OPENCLAW_IPHONE_CONFIG=str(base / "config.env"),
                        OPENCLAW_IPHONE_WDA_URL="", OPENCLAW_IPHONE_DEVICE="", http_proxy="http://127.0.0.1:1")
@@ -336,6 +411,153 @@ class SessionTests(unittest.TestCase):
             self.assertEqual(result["dispatch"], "unknown")
             self.assertEqual(sum(path == route for method, path, _ in server.requests if method == "POST"), 3)
             self.assertNotIn("Two", json.dumps(result))
+            self.finish(proc, base)
+
+    def test_set_text_replaces_clears_preserves_literal_input_and_does_not_submit(self):
+        with self.running() as (proc, server, base):
+            for role, text in (("XCUIElementTypeTextField", "Bék O'Neil 👋"),
+                               ("XCUIElementTypeTextField", "007"),
+                               ("XCUIElementTypeTextField", ""),
+                               ("XCUIElementTypeTextView", "First line\nSecond line")):
+                with self.subTest(role=role, text=text):
+                    server.element_types["field"] = role
+                    server.text = "old value"
+                    result = self.request(proc, {"op": "set", "value": text, "verify": True})
+                    self.assertEqual(server.text, text)
+                    self.assertEqual((result["dispatch"], result["effect"]), ("acknowledged", "match"))
+            server.element_types["field"] = "XCUIElementTypeTextField"
+            before = server.text
+            result = self.request(proc, {"op": "set", "value": "Do not\nsubmit"})
+            self.assertEqual(result["dispatch"], "not_sent")
+            self.assertEqual(server.text, before)
+            private = base / "input.txt"
+            private.write_text("SECRET-NAME")
+            private.chmod(0o600)
+            result = self.request(proc, {"op": "set", "target": {"role": "XCUIElementTypeTextField"},
+                                         "value_ref": str(private), "verify": True})
+            self.assertEqual((server.text, result["effect"]), ("SECRET-NAME", "match"))
+            self.assertNotIn("SECRET", json.dumps(result))
+            server.element_types["field"] = "XCUIElementTypeSecureTextField"
+            result = self.request(proc, {"op": "set", "value_ref": str(private), "verify": True})
+            self.assertEqual((server.text, result["effect"]), ("SECRET-NAME", "unknown"))
+            self.assertEqual(server.submit_count, 0)
+            self.finish(proc, base)
+
+    def test_set_date_is_one_request_handles_clamping_and_checks_complete_date(self):
+        target = {"role": "XCUIElementTypeDatePicker", "label": "Birthday"}
+        with self.running() as (proc, server, base):
+            # Day/month/year are not in semantic order. Month adjustment clamps
+            # March 31 to February 29 before the desired day is processed.
+            result = self.request(proc, {"op": "set", "target": target, "value": "2024-02-29"})
+            self.assertEqual(server.native_date, date(2024, 2, 29))
+            self.assertEqual((result["dispatch"], result["effect"]), ("acknowledged", "match"))
+            self.assertEqual(result["request_sequence"], 1)
+            self.assertNotIn("2024-02-29", json.dumps(result))
+            result = self.request(proc, {"op": "set", "target": target, "value": "2024-02-29"})
+            self.assertEqual((result["dispatch"], result["effect"], result["acknowledged_substeps"]),
+                             ("not_sent", "match", 0))
+            server.date_max = date(2024, 2, 28)
+            server.native_date = date(2023, 3, 31)
+            result = self.request(proc, {"op": "set", "target": target, "value": "2024-02-29"})
+            self.assertEqual(server.native_date, date(2024, 2, 28))
+            self.assertEqual(result["effect"], "mismatch")
+            # Below the native minimum, don't march the year farther away.
+            server.date_max, server.date_min = None, date(1970, 1, 1)
+            server.native_date = date(2023, 3, 31)
+            result = self.request(proc, {"op": "set", "target": target, "value": "1900-10-14"})
+            self.assertEqual((server.native_date, result["effect"]), (date(1970, 10, 14), "mismatch"))
+            self.assertEqual(self.request(proc, {"op": "press", "button": "home"})["dispatch"], "acknowledged")
+            self.finish(proc, base)
+
+    def test_set_date_numeric_labels_and_explicit_localized_component_mapping(self):
+        with self.running() as (proc, server, base):
+            server.month_values = [f"{month:02d}" for month in range(1, 13)]
+            server.component_labels = {part: part.title() for part in server.date_wheels}
+            result = self.request(proc, {"op": "set", "kind": "date", "value": "1990-10-14",
+                                         "target": {"role": "XCUIElementTypeDatePicker"}})
+            self.assertEqual((server.native_date, result["effect"]), (date(1990, 10, 14), "match"))
+            # Without labels, two small numeric wheels aren't identifiable by
+            # their positions. No input is sent; ordinary control remains usable.
+            server.component_labels = {part: "" for part in server.date_wheels}
+            before = server.native_date
+            result = self.request(proc, {"op": "set", "kind": "date", "value": "2001-01-01",
+                                         "target": {"role": "XCUIElementTypeDatePicker"}})
+            self.assertEqual((result["dispatch"], result["reason"]), ("not_sent", "date_component_mapping_required"))
+            self.assertEqual(server.native_date, before)
+            months = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août",
+                      "septembre", "octobre", "novembre", "décembre"]
+            server.month_values = months
+            server.component_labels = {"day": "D", "year": "Y", "month": "M"}
+            result = self.request(proc, {"op": "set", "kind": "date", "value": "2001-08-15",
+                "components": {part: {"role": "XCUIElementTypePickerWheel", "label": server.component_labels[part]}
+                               for part in server.date_wheels}, "month_values": months})
+            self.assertEqual((server.native_date, result["effect"]), (date(2001, 8, 15), "match"))
+            server.month_values = [f"{month}月" for month in range(1, 13)]
+            server.number_suffixes = {"year": "年", "day": "日"}
+            result = self.request(proc, {"op": "set", "kind": "date", "value": "2024-01-01",
+                "components": {part: {"role": "XCUIElementTypePickerWheel", "label": server.component_labels[part]}
+                               for part in server.date_wheels}})
+            self.assertEqual((server.native_date, result["effect"]), (date(2024, 1, 1), "match"))
+            self.finish(proc, base)
+
+    def test_set_date_invalid_input_and_partial_unknown_writes_never_replay_or_end_session(self):
+        target = {"role": "XCUIElementTypeDatePicker"}
+        with self.running() as (proc, server, base):
+            for value in ("2023-02-29", "October 14 1990"):
+                result = self.request(proc, {"op": "set", "kind": "date", "target": target, "value": value})
+                self.assertEqual(result["dispatch"], "not_sent")
+                self.assertEqual(server.native_date, date(2023, 3, 31))
+            route = "/session/one/element/month/value"
+            server.mutate_then_fail.add(route)
+            result = self.request(proc, {"op": "set", "kind": "date", "target": target, "value": "2024-02-20"})
+            self.assertEqual((result["dispatch"], result["acknowledged_substeps"]), ("unknown", 1))
+            self.assertEqual(server.native_date, date(2024, 2, 29))
+            self.assertEqual(sum(path == route for method, path, _ in server.requests if method == "POST"), 1)
+            self.assertFalse(any(path.endswith("/element/day/value") for _, path, _ in server.requests))
+            self.assertNotIn("PRIVATE", json.dumps(result))
+            server.mutate_then_fail.clear()
+            self.assertEqual(self.request(proc, {"op": "press", "button": "home"})["dispatch"], "acknowledged")
+            server.fail_read_after.add("/session/one/element/year/value")
+            result = self.request(proc, {"op": "set", "kind": "date", "target": target, "value": "1990-10-14"})
+            self.assertEqual((result["dispatch"], result["acknowledged_substeps"], result["effect"]),
+                             ("partial", 1, "unknown"))
+            self.assertEqual(self.request(proc, {"op": "press", "button": "home"})["dispatch"], "acknowledged")
+            self.finish(proc, base)
+
+    def test_set_checked_does_not_toggle_correct_or_unreadable_state(self):
+        target = {"role": "XCUIElementTypeSwitch", "label": "Notifications"}
+        with self.running() as (proc, server, base):
+            for desired in (False, False, True, True):
+                result = self.request(proc, {"op": "set", "target": target, "value": desired})
+                self.assertIs(server.checked, desired)
+                self.assertEqual(result["effect"], "match")
+            clicks = sum(path.endswith("/element/switch/click") for _, path, _ in server.requests)
+            self.assertEqual(clicks, 2)
+            server.checked = None
+            result = self.request(proc, {"op": "set", "target": target, "value": False})
+            self.assertEqual((result["dispatch"], result["effect"]), ("not_sent", "unknown"))
+            self.assertEqual(sum(path.endswith("/element/switch/click") for _, path, _ in server.requests), clicks)
+            self.assertEqual(self.request(proc, {"op": "press", "button": "home"})["dispatch"], "acknowledged")
+            self.finish(proc, base)
+
+    def test_set_picker_handles_adjustments_and_missing_option_in_one_request(self):
+        with self.running() as (proc, server, base):
+            server.elements = ["wheel"]
+            server.reject_picker_value = True
+            target = {"role": "XCUIElementTypePickerWheel", "label": "Options"}
+            result = self.request(proc, {"op": "set", "target": target, "value": "Three"})
+            self.assertEqual((server.picker_index, result["effect"]), (2, "match"))
+            result = self.request(proc, {"op": "set", "target": target, "value": "Missing"})
+            self.assertEqual(result["effect"], "mismatch")
+            self.assertEqual(self.request(proc, {"op": "press", "button": "home"})["dispatch"], "acknowledged")
+            self.finish(proc, base)
+
+    def test_private_comparison_uses_operation_budget_not_hidden_two_seconds(self):
+        with self.running(seconds=6, timeout=6) as (proc, server, base):
+            server.value_delay = 2.2
+            result = self.request(proc, {"op": "type", "text": "slow-readback", "mode": "replace", "verify": True})
+            self.assertEqual((result["dispatch"], result["verification"]), ("acknowledged", "match"))
+            self.assertEqual(self.request(proc, {"op": "press", "button": "home"})["dispatch"], "acknowledged")
             self.finish(proc, base)
 
     def test_private_replace_comparison_and_optional_launch_readiness(self):

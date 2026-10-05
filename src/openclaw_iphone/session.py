@@ -16,6 +16,8 @@ from .errors import OpenClawIPhoneError, WDAOutcomeUnknown, WDAUnavailable, WDAT
 from .execution import Budget
 from .evidence import artifact_path, write_private
 from .image_evidence import redact_png
+from .inputs import (InputReadbackUnavailable, InputUnavailable, date_components, input_kind,
+                     iso_date, pick_value, set_checked, set_date, validate_text, write_text)
 from .observations import Observation, Selector, parse_observation
 from .wda import WDAClient
 
@@ -184,16 +186,16 @@ class Session:
         finally:
             wda.budget = previous
 
-    def _compare(self, wda: WDAClient, ref: str | None, expected: str) -> str:
+    def _compare(self, wda: WDAClient, ref: str | None, expected: str, *, role: str | None = None) -> str:
         try:
-            with self._within(wda, min(2, self.connection.seconds)):
-                ref = ref or wda.active_element()
-                if wda.element_type(ref) not in {"XCUIElementTypeTextField", "XCUIElementTypeTextView", "XCUIElementTypeSearchField"}:
-                    return "unknown"
-                value = wda.element_value(ref, allow_null_empty=False)
-                if value == wda.element_placeholder(ref):
-                    return "unknown"
-                return "match" if value == expected else "mismatch"
+            ref = ref or wda.active_element()
+            if (role or wda.element_type(ref)) not in {"XCUIElementTypeTextField", "XCUIElementTypeTextView", "XCUIElementTypeSearchField"}:
+                return "unknown"
+            value = wda.element_value(ref)
+            placeholder = wda.element_placeholder(ref)
+            if placeholder is not None and value == placeholder:
+                return "unknown"
+            return "match" if value == expected else "mismatch"
         except (OpenClawIPhoneError, OSError):
             return "unknown"
 
@@ -236,6 +238,7 @@ class Session:
                   "swipe": {"from_x", "from_y", "to_x", "to_y", "duration", "space"},
                   "type": {"text", "text_ref", "target", "mode", "strategy", "frequency", "verify"},
                   "pick": {"target", "value", "order", "max_steps", "offset", "seconds"},
+                  "set": {"target", "value", "value_ref", "kind", "components", "month_values", "strategy", "verify"},
                   "press": {"button", "duration"}, "launch": {"bundle_id", "wait_seconds"},
                   "open_url": {"url"}, "close": set()}
         if not isinstance(op, str) or op not in fields or set(data) - (fields[op] | {"op", "observe", "masks", "limit", "offset"}):
@@ -268,6 +271,29 @@ class Session:
         acknowledged = 0
         action_started = False
         completed = False
+        def send(action: Callable[[], object]) -> None:
+            nonlocal acknowledged, action_started
+            action_started = True
+            action()
+            acknowledged += 1
+        def input_reply(run: Callable[[], str]) -> dict[str, object]:
+            nonlocal completed
+            error = None
+            try:
+                effect = run()
+                completed = True
+            except InputReadbackUnavailable as exc:
+                if isinstance(exc.error, WDATransportUnavailable):
+                    self.connection.invalidate()
+                effect, error, completed = "unknown", diagnostic(exc.error), exc.complete
+            result = {"status": "action" if acknowledged else "checked",
+                      "dispatch": "acknowledged" if acknowledged and completed else "partial" if acknowledged else "not_sent",
+                      "acknowledged_substeps": acknowledged, "effect": effect}
+            if error:
+                result["error"] = error
+            if mode:
+                result["observation"] = self._observe(mode, masks, limit=limit, offset=offset)
+            return result
         try:
             with self.connection.operation():
                 if op == "observe":
@@ -286,8 +312,7 @@ class Session:
                     if ("text" in data) == ("text_ref" in data):
                         raise ValueError("Choose text or text_ref.")
                     text = read_input(data["text_ref"]) if "text_ref" in data else data["text"]
-                    if not isinstance(text, str) or not 1 <= len(text) <= 4096 or any(ord(c) < 32 or 0xE000 <= ord(c) <= 0xF8FF or ord(c) == 127 for c in text):
-                        raise ValueError("Invalid text; use press for control keys.")
+                    text = validate_text(text)
                     self.secrets.add(text)
                     strategy, input_mode = data.get("strategy", "native"), data.get("mode", "insert")
                     if strategy not in ("native", "sequential") or input_mode not in ("insert", "replace"):
@@ -298,6 +323,33 @@ class Session:
                     verify = data.get("verify", False)
                     if type(verify) is not bool or verify and input_mode != "replace":
                         raise ValueError("Private verification requires explicit whole-field replacement.")
+                if op == "set":
+                    if ("value" in data) == ("value_ref" in data):
+                        raise ValueError("Choose value or value_ref.")
+                    value = read_input(data["value_ref"]) if "value_ref" in data else data["value"]
+                    if isinstance(value, str):
+                        value = validate_text(value, multiline=True, empty=True)
+                        if value:
+                            self.secrets.add(value)
+                    elif type(value) is not bool:
+                        raise ValueError("Input values are strings or Boolean states.")
+                    kind = data.get("kind")
+                    if kind not in (None, "date"):
+                        raise ValueError("Only dates require an explicit kind.")
+                    desired = iso_date(value) if kind == "date" else None
+                    components = data.get("components")
+                    if components is not None and (not isinstance(components, dict)
+                            or set(components) != {"year", "month", "day"}
+                            or any(not isinstance(t, (str, dict)) for t in components.values())):
+                        raise ValueError("Provide year, month and day targets.")
+                    month_values = data.get("month_values")
+                    if month_values is not None and (not isinstance(month_values, list) or len(month_values) != 12
+                            or any(not isinstance(v, str) or not v or len(v) > 256 or any(ord(c) < 32 for c in v) for v in month_values)
+                            or len({v.casefold() for v in month_values}) != 12):
+                        raise ValueError("Provide twelve distinct native month values.")
+                    strategy, verify = data.get("strategy", "native"), data.get("verify", False)
+                    if strategy not in ("native", "sequential") or type(verify) is not bool:
+                        raise ValueError("Invalid input options.")
                 if op == "pick":
                     value = data["value"]
                     if not isinstance(value, str) or not value or len(value) > 256 or any(ord(c) < 32 for c in value):
@@ -321,71 +373,59 @@ class Session:
                         raise ValueError("Unsupported button.")
                 ref = self._target(target) if target is not None else None
                 wda = self.connection.require_active()
+                if op == "set":
+                    role = None
+                    if kind == "date" or components is not None:
+                        kind = "date"
+                    else:
+                        ref = ref or wda.active_element()
+                        role = wda.element_type(ref)
+                        kind = input_kind(role, value, kind)
+                    if kind != "date" and (components is not None or month_values is not None):
+                        raise ValueError("Date options require a date picker.")
+                    def perform_set() -> str:
+                        if kind == "date":
+                            if ref is None and components is None:
+                                raise ValueError("Identify the date picker or its components.")
+                            desired_date = desired or iso_date(value)
+                            refs, current = date_components(wda, ref, components, self._target, month_values)
+                            return set_date(wda, refs, current, desired_date, send, month_values, self.secrets)
+                        if kind == "text":
+                            if "\n" in value and role != "XCUIElementTypeTextView":
+                                raise InputUnavailable("multiline_requires_text_view")
+                            write_text(wda, ref, value, send, replace=True, strategy=strategy)
+                            return self._compare(wda, ref, value, role=role) if verify else "unknown"
+                        if kind == "picker" and (not value or "\n" in value):
+                            raise ValueError("Picker options must be non-empty single-line strings.")
+                        with wda.input_transaction():
+                            return (set_checked(wda, ref, value, send) if kind == "checked"
+                                    else pick_value(wda, ref, value, send, adjust=True))
+                    return input_reply(perform_set)
                 if op == "pick":
-                    with self._within(wda, seconds), wda.input_transaction():
-                        if wda.element_type(ref) != "XCUIElementTypePickerWheel":
-                            raise ValueError("Picker target must be a native wheel.")
-                        current = wda.element_value(ref, allow_null_empty=False)
-                        readback_error = None
-                        for step in range(steps if order else 1):
-                            if current == value:
-                                break
-                            action_started = True
-                            if order:
-                                wda.picker_step(ref, order, offset=picker_offset)
-                            else:
-                                wda.element_action(ref, "value", text=value)
-                            acknowledged += 1
-                            try:
-                                current = wda.element_value(ref, allow_null_empty=False)
-                            except (OpenClawIPhoneError, OSError) as exc:
-                                # Every adjustment so far was acknowledged.
-                                # Unknown readback stops adjustment, not receipts.
-                                readback_error = diagnostic(exc)
-                                if isinstance(exc, WDATransportUnavailable):
-                                    self.connection.invalidate()
-                                break
-                        completed = True
-                        effect = "unknown" if readback_error else "match" if current == value else "mismatch"
-                    result = {"status": "action" if acknowledged else "checked",
-                              "dispatch": "acknowledged" if acknowledged else "not_sent",
-                              "acknowledged_substeps": acknowledged, "effect": effect}
-                    if readback_error:
-                        result["error"] = readback_error
-                    if mode:
-                        result["observation"] = self._observe(mode, masks, limit=limit, offset=offset)
-                    return result
-                action_started = True
+                    def perform_pick() -> str:
+                        with self._within(wda, seconds), wda.input_transaction():
+                            if wda.element_type(ref) != "XCUIElementTypePickerWheel":
+                                raise ValueError("Picker target must be a native wheel.")
+                            return pick_value(wda, ref, value, send, order=order, max_steps=steps, offset=picker_offset)
+                    return input_reply(perform_pick)
                 if op == "tap":
-                    wda.element_action(ref, "click") if ref else wda.tap(*points)
+                    send(lambda: wda.element_action(ref, "click") if ref else wda.tap(*points))
                 elif op == "swipe":
-                    wda.drag(*points, duration=duration)
+                    send(lambda: wda.drag(*points, duration=duration))
                 elif op == "type":
-                    with wda.input_transaction():
-                        if ref and strategy == "sequential":
-                            wda.element_action(ref, "click")
-                            acknowledged += 1
-                        if input_mode == "replace":
-                            wda.element_action(ref, "clear") if ref else wda.clear_text()
-                            acknowledged += 1
-                        if strategy == "sequential":
-                            wda.type_text(text, frequency=frequency)
-                        elif ref:
-                            wda.element_action(ref, "value", text=text)
-                        else:
-                            wda.type_text_bulk(text, frequency=frequency)
+                    write_text(wda, ref, text, send, replace=input_mode == "replace",
+                               strategy=strategy, frequency=frequency)
                 elif op == "press":
                     if value in {"enter", "delete", "tab", "escape"}:
-                        wda.type_text({"enter": "\ue007", "delete": "\ue003", "tab": "\ue004", "escape": "\ue00c"}[value])
+                        send(lambda: wda.type_text({"enter": "\ue007", "delete": "\ue003", "tab": "\ue004", "escape": "\ue00c"}[value]))
                     elif value == "back":
-                        wda.back()
+                        send(wda.back)
                     else:
-                        wda.press_button(value, duration=data.get("duration"))
+                        send(lambda: wda.press_button(value, duration=data.get("duration")))
                 elif op == "launch":
-                    wda.activate_app(value)
+                    send(lambda: wda.activate_app(value))
                 elif op == "open_url":
-                    wda.open_url(value)
-                acknowledged += 1
+                    send(lambda: wda.open_url(value))
                 completed = True
                 result = {"status": "action", "dispatch": "acknowledged", "acknowledged_substeps": acknowledged}
                 if op == "type" and verify:
@@ -397,15 +437,19 @@ class Session:
                 return result
         except TargetUnavailable as exc:
             view = exc.candidates
-            return {"status": "error", "dispatch": "not_sent", "reason": "target_missing_or_ambiguous",
+            return {"status": "error", "dispatch": "partial" if acknowledged else "not_sent", "reason": "target_missing_or_ambiguous",
+                    "acknowledged_substeps": acknowledged,
                     "candidates": view["elements"] if isinstance(view, dict) else view,
                     "candidate_page": {key: view[key] for key in ("snapshot_id", "next_offset", "offset", "omitted_elements")} if isinstance(view, dict) else None}
+        except InputUnavailable as exc:
+            return {"status": "error", "dispatch": "partial" if acknowledged else "not_sent",
+                    "acknowledged_substeps": acknowledged, "effect": "unknown", "reason": exc.reason}
         except WDAOutcomeUnknown as exc:
             self.connection.invalidate()
             return {"status": "error", "dispatch": "unknown" if action_started else "not_sent", "reason": "inspect_before_retry" if action_started else "connection_unavailable",
                     "error": diagnostic(exc), "acknowledged_substeps": acknowledged,
                     "acknowledged_characters": getattr(exc, "acknowledged_characters", 0),
-                    **({"effect": "unknown"} if op == "pick" else {})}
+                    **({"effect": "unknown"} if op in ("pick", "set") else {})}
         except KeyboardInterrupt:
             self.connection.invalidate()
             self.closed = True
@@ -418,4 +462,4 @@ class Session:
             return {"status": "error", "dispatch": "partial" if acknowledged else "not_sent",
                     "reason": "invalid_request" if isinstance(exc, (ValueError, TypeError, OverflowError)) else "operation_unavailable",
                     "error": diagnostic(exc), "acknowledged_substeps": acknowledged,
-                    **({"effect": "unknown"} if op == "pick" else {})}
+                    **({"effect": "unknown"} if op in ("pick", "set") else {})}

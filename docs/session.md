@@ -22,6 +22,13 @@ Hold onto the process across the workflow. Don't recreate it after each step.
 {"op":"tap","target":{"role":"XCUIElementTypeButton","label":"Continue","ancestor_label":"Account"}}
 {"op":"tap","target":"RETURNED_ELEMENT_ID"}
 {"op":"swipe","from_x":200,"from_y":700,"to_x":200,"to_y":250,"duration":0.2}
+{"op":"set","target":"NAME_FIELD_ID","value":"Bek"}
+{"op":"set","target":"NAME_FIELD_ID","value":""}
+{"op":"set","target":"TEXT_VIEW_ID","value":"First line\nSecond line"}
+{"op":"set","target":"PASSWORD_FIELD_ID","value_ref":"/absolute/private/input.txt"}
+{"op":"set","target":"DATE_PICKER_ID","kind":"date","value":"1990-10-14"}
+{"op":"set","target":"WHEEL_ID","value":"October"}
+{"op":"set","target":"SWITCH_ID","value":false}
 {"op":"type","text":"hello","mode":"insert"}
 {"op":"type","text_ref":"/absolute/private/input.txt","mode":"replace","strategy":"native"}
 {"op":"type","text_ref":"/absolute/private/input.txt","mode":"replace","verify":true}
@@ -55,7 +62,8 @@ Hold onto the process across the workflow. Don't recreate it after each step.
   observation at offset 0 replaces the snapshot. Paging is disclosure of a
   prior screen, not evidence of current state.
 - Actions accept optional `observe: accessibility|image|both`, otherwise no
-  automatic capture or verification is performed. `masks` applies to images.
+  automatic capture is performed. Native input readback is described below;
+  task verification belongs to the caller. `masks` applies to images.
 - Coordinates are device points, unless `space: image` explicitly selects
   pixels in the most recent successfully captured image. Returned image
   metadata includes both sizes. Image coordinates are reusable, not consumable
@@ -79,6 +87,40 @@ Hold onto the process across the workflow. Don't recreate it after each step.
   input uses WDA keys or targeted value insertion. Explicit `sequential` uses
   individual key requests, focusing a supplied target first. It never falls
   back, submits Return, or repeats failed input automatically.
+- `set` supplies the desired value in **one request**. Native target type selects
+  text, wheel, date or Boolean behavior; `kind: date` explicitly identifies a
+  date group. Without a target, ordinary input uses the focused native element.
+  Text replaces the field; `""` clears it. WDA handles native keyboard focus
+  without an extra host tap. Literal newlines require a native TextView. Names,
+  emails, numbers and codes are strings: spelling and leading zeros are preserved.
+  No Return, Next, Done or submission action is added. Supplied newlines can
+  still invoke an app's own input handlers. `strategy: sequential` is an explicit
+  compatibility option, not an automatic retry. `value_ref` has the same private
+  file rules as `text_ref`. Optional `verify: true` compares text privately;
+  `effect: match|mismatch|unknown` is separate from delivery. Unverified text and
+  secure/unreadable values return unknown, not a failed action.
+- Date `set` takes a Gregorian `YYYY-MM-DD` value, scopes discovery to the
+  identified group, and coordinates year, month, then day. It checks the whole
+  final date because later wheels may clamp earlier components. Recognizable
+  English named/abbreviated months and native Year/Month/Day labels identify
+  components without assuming their screen order. Numeric formats preserve
+  digit style, leading-zero conventions and native unit text. If component
+  identity is ambiguous, supply `components` mapping
+  `year`, `month`, `day` to the usual targets; the group target is then optional.
+  Localized month strings use an explicit twelve-item `month_values` list in
+  calendar order. This is wheel-style Gregorian entry, not arbitrary calendar,
+  compact/inline picker navigation or non-Gregorian conversion. Unsupported
+  identity/format returns a specific reason without input or session termination.
+- Wheel `set` selects the native value once, reads back, then adjusts internally
+  if the acknowledged selection differs or the direct route is explicitly
+  unsupported. Adjustment ends on a match, a repeated/no-change value, or the
+  existing operation budget. There is no separate `set` completion timer or
+  blind sleep. Unknown writes or unreadable adjustment state are not replayed.
+  A mismatch or partial result leaves ordinary controls available.
+- Boolean `set` uses readable native switch/checkbox/radio/toggle state. Already
+  matching means no input; otherwise it clicks once and reads back. Unknown
+  initial state sends no guessed toggle. An app may not permit a state change;
+  the result reports mismatch/unknown rather than repeatedly clicking.
 - `verify: true` is optional and requires `mode: replace`: the expected value
   is the supplied whole field, not an inferred append/caret position. Local
   readback returns only `verification: match|mismatch|unknown`. Secure fields,
@@ -99,7 +141,8 @@ Hold onto the process across the workflow. Don't recreate it after each step.
   `readiness.state: ready|unknown` with checks/time. This proves foreground only,
   not a fully loaded in-app screen. No blind sleep, repeated launch or global
   idle gate. Unready/unknown leaves dispatch acknowledged.
-- Text is bounded to 4096 characters without control characters; use `press`
+- Input strings are bounded to 4096 characters. `type` excludes control
+  characters; `set` permits literal newlines in TextView only. Use `press`
   for control keys. Hardware buttons: `home`, `volumeUp`, `volumeDown`, `siri`.
   Keyboard controls: `enter`, `delete` (backspace), `tab`, `escape`. `back` uses
   supported WDA routes only, never guesses a screen control.

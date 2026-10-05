@@ -23,17 +23,25 @@ completion. No task file, grants, second model, quota or reconciliation step.
 - Tap a semantic selector/returned ID or coordinates. Coordinate swipes and
   images do not need AX. Device points are default; image pixels explicitly
   use `space: image` and the returned image geometry.
-- Type inserts by default; `mode: replace` explicitly clears first. Prefer
-  native input; select sequential only for field compatibility. Use private
-  owner-only `text_ref` files for credentials, never CLI arguments or logs.
+- Use `set` with a complete `value` for text, picker options and Boolean states.
+  Text replaces; an empty string clears. Native input handles keyboard focus;
+  no letter-by-letter agent calls are needed. Literal newlines require TextView.
+  `type` is for intentional insertion. Native input is preferred; sequential
+  is explicit field compatibility. Credentials use private owner-only
+  `value_ref`/`text_ref` files, never CLI arguments or logs.
 - Use `press`, `launch`, and `open_url` for ordinary transitions. Optional
   `observe` attaches the next view without changing acknowledged dispatch.
-- Where supported, use native `pick` for picker wheels rather than repeated
-  screenshot/swipe decisions. Supply exact locale-specific values; adjust
-  dependent date components deliberately. Native readback is separate from
-  acknowledgement, and bounds stop adjustment—not the agent's whole task.
+- Set a wheel-style Gregorian date in one request: `set`, picker target,
+  `kind: date`, and `value: YYYY-MM-DD`. The controller identifies supported
+  components and handles dependencies and final readback. Ambiguous identity
+  uses explicit `components`; localized months use `month_values` in calendar
+  order. Do not assume screen order or non-Gregorian conversion. For an ordinary
+  wheel, `set` uses an exact native option and handles adjustments internally;
+  `pick` exposes explicit low-level control when needed. Boolean `set` avoids
+  toggling a correct state. Readback uncertainty is not input failure or a
+  permanent stop; ordinary controls remain available.
 - Optional `launch.wait_seconds` checks foreground before capture. Optional
-  `type.verify` compares whole-field replacement privately, returning only
+  `set.verify`/`type.verify` compare whole-field replacement privately, returning only
   match/mismatch/unknown. Neither adds mandatory verification or blind retries.
 - Inspect unknown/partial outcomes before retrying. The session never replays
   writes; uncertainty does not block subsequent deliberate requests.

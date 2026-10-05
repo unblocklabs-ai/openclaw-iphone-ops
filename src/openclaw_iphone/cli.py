@@ -615,7 +615,8 @@ def handle_session(args: argparse.Namespace) -> int:
         with connection:
             session = Session(connection, allow_images=args.allow_images, evidence_base=args.evidence_dir)
             emit({"status": "ready", "protocol": 2, "device_udid": connection.device.udid,
-                  "capabilities": ["native_picker", "private_replace_verification", "foreground_readiness", "request_timing", "candidate_paging"]})
+                  "capabilities": ["set_input", "gregorian_wheel_date", "native_picker", "private_replace_verification",
+                                   "foreground_readiness", "request_timing", "candidate_paging"]})
             code = serve(session, read_requests(sys.stdin.fileno()), emit)
         emit({"status": "session_end", "cleanup": "warning" if connection.cleanup_failed else "completed",
               "timing": connection.metrics.summary(), "reconnects": connection.reconnects})

@@ -4,8 +4,9 @@ A small Python controller for a dedicated USB-connected physical iPhone.
 The agent plans and judges results; this package owns the phone connection and
 executes direct WebDriverAgent controls. No second model or runtime dependencies.
 
-Use one persistent `session` for observation, taps, swipes, typing, picker
-selection and app transitions. Optional private input comparison, foreground
+Use one persistent `session` for observation, taps, swipes, desired-value inputs
+and app transitions. `set` fills text, a native wheel date, a picker option or a
+Boolean control in one agent-facing request. Optional private input comparison, foreground
 readiness and route timing help inspect results. The session's
 `ready.capabilities` reports supported optional operations.
 
@@ -26,7 +27,7 @@ read each response before making the next decision. For example:
 ```json
 {"op":"observe"}
 {"op":"tap","target":{"role":"XCUIElementTypeButton","label":"Search"}}
-{"op":"type","text":"a search query"}
+{"op":"set","value":"a search query"}
 {"op":"press","button":"enter","observe":"image"}
 {"op":"swipe","from_x":200,"from_y":700,"to_x":200,"to_y":250}
 {"op":"close"}
@@ -35,6 +36,9 @@ read each response before making the next decision. For example:
 Coordinates default to device points. Image-pixel coordinates explicitly use
 `"space":"image"`. See [the session protocol](docs/session.md) for units,
 target IDs, input replacement, private input files, masking and failure outcomes.
+Use `set` for a complete field value and `type` for deliberate insertion.
+Date input accepts one ISO date and handles supported native wheels internally;
+ambiguous component identity can use an explicit mapping.
 
 Observation is a screen, not a native view-tree dump: readable content and
 controls, short IDs, meaningful parent groups, bounds and state. Empty layout

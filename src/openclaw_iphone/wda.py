@@ -228,13 +228,14 @@ class WDAClient:
         with self.session() as session_id:
             return self._json_post(f"/session/{session_id}/wda/apps/activate", {"bundleId": bundle_id})
 
-    def find_elements(self, query: str, *, using: str = "xpath") -> list[str]:
+    def find_elements(self, query: str, *, using: str = "xpath", element_id: str | None = None) -> list[str]:
         """Read-only query (WDA uses POST); no implicit retries."""
         if using not in {"xpath", "predicate string", "class chain", "accessibility id"}:
             raise ValueError("Unsupported native locator strategy.")
         with self.session() as session_id:
+            scope = f"/element/{urllib.parse.quote(element_id, safe='')}" if element_id else ""
             try:
-                value = self._json_post(f"/session/{session_id}/elements", {"using": using, "value": query}).get("value")
+                value = self._json_post(f"/session/{session_id}{scope}/elements", {"using": using, "value": query}).get("value")
             except WDAOutcomeUnknown as exc:
                 # POST /elements is a read, unlike POST /element/.../click.
                 raise WDAUnavailable("WDA element query unavailable; no input dispatched.") from exc
@@ -284,6 +285,14 @@ class WDAClient:
             value = self._json_request(path).get("value")
         if not isinstance(value, str):
             raise WDAReadUnavailable("Native element type unavailable.")
+        return value
+
+    def element_label(self, element_id: str) -> str | None:
+        with self.session() as session_id:
+            path = f"/session/{session_id}/element/{urllib.parse.quote(element_id, safe='')}/attribute/label"
+            value = self._json_request(path).get("value")
+        if value is not None and not isinstance(value, str):
+            raise WDAReadUnavailable("Native component label unavailable.")
         return value
 
     def picker_step(self, element_id: str, order: str, *, offset: float) -> dict[str, Any]:
