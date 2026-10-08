@@ -15,7 +15,7 @@ from .control_lock import control_lock
 from .devicectl import Device, DeviceCtl
 from .evidence import artifact_path, write_private
 from .errors import OpenClawIPhoneError, SessionOutputUnavailable, WDAUnavailable, diagnostic
-from .goal import clef_from_config, goal_navigation
+from .goal import decisions_from_config, goal_navigation
 from .protocol import json_line_emitter, read_requests, serve
 from .session import Session
 from .wda import DEFAULT_WDA_PORT, WDAClient, WDARunConfig, resolve_wda_path, run_wda
@@ -585,11 +585,11 @@ def handle_session(args: argparse.Namespace) -> int:
                                 seconds=args.operation_timeout, read_timeout=args.read_timeout)
         with connection:
             session = Session(connection, allow_images=args.allow_images, evidence_base=args.evidence_dir,
-                              clef=clef_from_config(config))
+                              decisions=decisions_from_config(config))
             emit({"status": "ready", "protocol": 2, "device_udid": connection.device.udid,
                   "capabilities": ["set_input", "gregorian_wheel_date", "native_picker", "private_replace_verification",
                                    "foreground_readiness", "request_timing", "candidate_paging"]
-                                  + (["goal"] if session.clef else [])})
+                                  + (["goal"] if session.decisions else [])})
             code = serve(session, read_requests(sys.stdin.fileno()), emit)
         emit({"status": "session_end", "cleanup": "warning" if connection.cleanup_failed else "completed",
               "timing": connection.metrics.summary(), "reconnects": connection.reconnects})

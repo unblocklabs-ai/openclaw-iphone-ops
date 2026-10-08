@@ -21,7 +21,7 @@ from openclaw_iphone.connection import Connection
 from openclaw_iphone.control_lock import control_lock
 from openclaw_iphone.errors import OpenClawIPhoneError, SessionOutputUnavailable
 from openclaw_iphone.protocol import JsonLineEmitter, read_requests
-from test_goal import ClefServer, answers, risk
+from test_goal import DecisionsServer, check, step
 from test_image_evidence import png
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -282,7 +282,7 @@ class SessionTests(unittest.TestCase):
                        OPENCLAW_IPHONE_CONFIG=str(base / "config.env"),
                        OPENCLAW_IPHONE_WDA_URL="", OPENCLAW_IPHONE_DEVICE="", http_proxy="http://127.0.0.1:1")
             if config:
-                env["no_proxy"] = "127.0.0.1"  # the fake Clef
+                env["no_proxy"] = "127.0.0.1"  # the fake Decisions API
             args = [sys.executable, "-c", BOOTSTRAP, "--evidence-dir", directory]
             if read_seconds is not None:
                 args.extend(["--read-timeout", str(read_seconds)])
@@ -898,24 +898,23 @@ class SessionTests(unittest.TestCase):
 
 
     @contextmanager
-    def clef(self):
-        with ClefServer() as clef:
-            thread = threading.Thread(target=clef.serve_forever, kwargs={"poll_interval": 0.01})
+    def decisions(self):
+        with DecisionsServer() as api:
+            thread = threading.Thread(target=api.serve_forever, kwargs={"poll_interval": 0.01})
             thread.start()
             try:
-                yield clef, ("OPENCLAW_IPHONE_CLEF_ENABLED=1\nOPENCLAW_IPHONE_CLEF_ACCOUNT_ID=acct\n"
-                             "OPENCLAW_IPHONE_CLEF_API_TOKEN=test-token\n"
-                             f"OPENCLAW_IPHONE_CLEF_BASE_URL=http://127.0.0.1:{clef.server_port}\n")
+                yield api, ("OPENCLAW_IPHONE_GOAL_ENABLED=1\nOPENCLAW_IPHONE_OPENAI_API_KEY=test-key\n"
+                            f"OPENCLAW_IPHONE_OPENAI_BASE_URL=http://127.0.0.1:{api.server_port}/v1\n")
             finally:
-                clef.shutdown()
+                api.shutdown()
                 thread.join(timeout=5)
 
-    def test_goal_steps_through_the_session_until_clef_judges_it_done(self):
-        with self.clef() as (clef, config), self.running(config=config) as (proc, server, base):
+    def test_goal_steps_through_the_session_until_the_navigator_judges_it_done(self):
+        with self.decisions() as (api, config), self.running(config=config) as (proc, server, base):
             self.assertIn("goal", self.ready["capabilities"])
             server.xml = GOAL_XML
-            clef.replies = [(200, {"success": True, "result": r}) for r in
-                            (answers("e1"), risk(0.05), answers("type_text"), answers("scroll_down"), answers("e1", progress=2.9))]
+            api.replies = [(200, r) for r in (step("e1"), check(0.05), step("type_text"), step("scroll_down"),
+                                              step("done", {"done": 0.9, "e1": 0.1}, progress=2.9, done=0.95))]
             reply = self.request(proc, {"op": "goal", "goal": "Reply on the next page", "text": "see you at 5"}, timeout=20)
             self.assertEqual({k: reply[k] for k in ("status", "dispatch", "acknowledged_substeps", "outcome")},
                              {"status": "action", "dispatch": "acknowledged", "acknowledged_substeps": 3, "outcome": "done"})
@@ -926,33 +925,34 @@ class SessionTests(unittest.TestCase):
             self.assertEqual(server.text, "see you at 5")
             swipe = next(p for _, path, p in server.requests if path.endswith("/actions"))["actions"][0]["actions"]
             self.assertEqual([(a["x"], a["y"]) for a in swipe if a["type"] == "pointerMove"], [(207, 650), (207, 300)])
-            (_, auth, first), *_, (_, _, last) = clef.requests
-            self.assertEqual(auth, "Bearer test-token")
-            self.assertTrue(first["images"][0].startswith("data:image/jpeg;base64,"))
-            self.assertIn('e1 Button "Next" @(70,122) 100x44', first["state"]["screen"])
-            self.assertTrue(last["state"]["goal"].endswith("Already done: tapped 'Next'; typed the supplied text; scrolled down"))
-            self.assertNotIn("see you", json.dumps(clef.requests))
+            (path, auth, first), *_, (_, _, last) = api.requests
+            self.assertEqual((path, auth, first["model"]), ("/v1/decisions", "Bearer test-key", "gpt-6-luna"))
+            self.assertTrue(first["input"][0]["content"][1]["image_url"].startswith("data:image/jpeg;base64,"))
+            self.assertIn({"value": "e1", "description": 'Button "Next" @(70,122) 100x44'}, first["questions"][0]["choices"])
+            goal = json.loads(last["input"][0]["content"][0]["text"])["goal"]
+            self.assertTrue(goal.endswith("Already done: tapped 'Next'; typed the supplied text; scrolled down"))
+            self.assertNotIn("see you", json.dumps(api.requests))
             self.finish(proc, base)
 
     def test_goal_stops_before_unapproved_risky_taps_and_never_sends_secure_screens(self):
-        with self.clef() as (clef, config), self.running(config=config) as (proc, server, base):
+        with self.decisions() as (api, config), self.running(config=config) as (proc, server, base):
             server.xml = GOAL_XML
             for bad in ({"approve": ["delete"]}, {"max_steps": 0}, {"observe": "accessibility"}, {"goal": ""}):
                 self.assertEqual(self.request(proc, {"op": "goal", "goal": "Send it", **bad})["reason"], "invalid_request")
-            clef.replies = [(200, {"success": True, "result": r}) for r in (answers("e1"), risk(0.9, "communication"))]
+            api.replies = [(200, r) for r in (step("e1"), check(0.9, "communication"))]
             reply = self.request(proc, {"op": "goal", "goal": "Send it", "approve": ["social_action"]}, timeout=20)
             self.assertEqual((reply["outcome"], reply["reason"], reply["dispatch"], reply["pending"]["label"]),
                              ("needs_approval", "communication", "not_sent", "Next"))
             self.assertFalse(any(path.endswith("/click") for _, path, _ in server.requests))
             self.assertEqual(self.request(proc, {"op": "tap", "target": reply["pending"]["target"]})["dispatch"], "acknowledged")
-            clef.replies = [(401, {"success": False})]
+            api.replies = [(401, {"error": {"message": "bad key"}})]
             reply = self.request(proc, {"op": "goal", "goal": "Send it"}, timeout=20)
             self.assertEqual((reply["outcome"], reply["reason"], reply["error"]["category"]),
                              ("escalate", "navigator_unavailable", "http_401"))
-            asked, server.xml = len(clef.requests), XML  # XML has a secure field
+            asked, server.xml = len(api.requests), XML  # XML has a secure field
             reply = self.request(proc, {"op": "goal", "goal": "Log in"}, timeout=20)
             self.assertEqual((reply["outcome"], reply["reason"], reply["steps"]), ("escalate", "secure_field", []))
-            self.assertEqual(len(clef.requests), asked)
+            self.assertEqual(len(api.requests), asked)
             self.finish(proc, base)
 
     def test_goal_navigation_is_off_by_default(self):

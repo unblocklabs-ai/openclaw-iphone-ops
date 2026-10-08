@@ -44,7 +44,7 @@ Hold onto the process across the workflow. Don't recreate it after each step.
 {"op":"close"}
 ```
 
-`goal` exists only when `ready.capabilities` includes it: optional Clef goal
+`goal` exists only when `ready.capabilities` includes it: optional goal
 navigation, enabled in host config. See [goal navigation](goal.md).
 
 - `observe` returns a screen: AX plus a screenshot when `--allow-images` is set,

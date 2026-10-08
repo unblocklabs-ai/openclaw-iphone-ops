@@ -1,7 +1,7 @@
-"""Optional goal navigation: Clef picks each step, the session performs it. Off unless configured.
+"""Optional goal navigation: OpenAI's Decisions API (gpt-6-luna) picks each step, the session performs it. Off unless
+configured.
 
-Each step's screenshot and on-screen text go to Cloudflare Workers AI. Screens with a secure
-(password) field are never sent.
+Each step's screenshot and on-screen text go to OpenAI. Screens with a secure (password) field are never sent.
 """
 from __future__ import annotations
 
@@ -16,7 +16,6 @@ import tempfile
 import time
 from typing import Callable
 import urllib.error
-import urllib.parse
 import urllib.request
 
 from . import navigator
@@ -24,48 +23,52 @@ from .config import IPhoneConfig
 from .errors import OpenClawIPhoneError, diagnostic
 from .inputs import validate_text
 
-CLOUDFLARE_API = "https://api.cloudflare.com/client/v4"
+OPENAI_API = "https://api.openai.com/v1"
+MODEL = "gpt-6-luna"
+RETRIES = 2
 DEFAULT_STEPS, MAX_STEPS = 14, 30
 TYPED = "typed the supplied text"
 
 
-class Clef:
-    """Cloudflare Workers AI `@cf/cloudflare/clef`."""
+class Decisions:
+    """POST /v1/decisions: typed answers to the navigator's questions."""
 
-    def __init__(self, account_id: str, token: str, *, base_url: str = CLOUDFLARE_API, timeout: float = 30) -> None:
-        self.url = f"{base_url.rstrip('/')}/accounts/{urllib.parse.quote(account_id, safe='')}/ai/run/@cf/cloudflare/clef"
-        self.token, self.timeout = token, timeout
+    def __init__(self, api_key: str, *, base_url: str = OPENAI_API, timeout: float = 30) -> None:
+        self.url = f"{base_url.rstrip('/')}/decisions"
+        self.api_key, self.timeout = api_key, timeout
 
     def ask(self, body: dict) -> dict:
-        request = urllib.request.Request(self.url, data=json.dumps(dict(body, model="clef")).encode(), method="POST",
-                                         headers={"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"})
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                data = json.load(response)
-        except urllib.error.HTTPError as exc:
-            exc.close()
-            raise navigator.Unavailable("Clef refused the request.", category=f"http_{exc.code}") from None
-        except OSError as exc:
-            raise navigator.Unavailable("Clef unreachable.", category="unreachable") from exc
-        except ValueError as exc:
-            raise navigator.Unavailable("Clef reply is not JSON.") from exc
-        if not isinstance(data, dict) or data.get("success") is not True or not isinstance(data.get("result"), dict):
-            raise navigator.Unavailable("Clef returned no answers.")
-        return data["result"]
+        data = json.dumps(dict(body, model=MODEL)).encode()
+        for attempt in range(RETRIES + 1):  # asking has no side effects: rate limits and server errors are retried
+            request = urllib.request.Request(self.url, data=data, method="POST",
+                                             headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    return navigator.answers(json.load(response))
+            except urllib.error.HTTPError as exc:
+                exc.close()
+                if (exc.code == 429 or exc.code >= 500) and attempt < RETRIES:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                raise navigator.Unavailable("The Decisions API refused the request.", category=f"http_{exc.code}") from None
+            except OSError as exc:
+                raise navigator.Unavailable("The Decisions API is unreachable.", category="unreachable") from exc
+            except ValueError as exc:
+                raise navigator.Unavailable("The Decisions API reply is not JSON.") from exc
 
 
 def goal_navigation(config: IPhoneConfig) -> str:
-    """off, on, or incomplete (enabled without an account ID and API token)."""
-    if (config.get("OPENCLAW_IPHONE_CLEF_ENABLED") or "").strip().lower() not in {"1", "true", "yes", "on"}:
+    """off, on, or incomplete (enabled without an OpenAI API key)."""
+    if (config.get("OPENCLAW_IPHONE_GOAL_ENABLED") or "").strip().lower() not in {"1", "true", "yes", "on"}:
         return "off"
-    return "on" if config.get("OPENCLAW_IPHONE_CLEF_ACCOUNT_ID") and config.get("OPENCLAW_IPHONE_CLEF_API_TOKEN") else "incomplete"
+    return "on" if config.get("OPENCLAW_IPHONE_OPENAI_API_KEY") else "incomplete"
 
 
-def clef_from_config(config: IPhoneConfig) -> Clef | None:
+def decisions_from_config(config: IPhoneConfig) -> Decisions | None:
     if goal_navigation(config) != "on":
         return None
-    return Clef(config.get("OPENCLAW_IPHONE_CLEF_ACCOUNT_ID"), config.get("OPENCLAW_IPHONE_CLEF_API_TOKEN"),
-                base_url=config.get("OPENCLAW_IPHONE_CLEF_BASE_URL") or CLOUDFLARE_API)
+    return Decisions(config.get("OPENCLAW_IPHONE_OPENAI_API_KEY"),
+                     base_url=config.get("OPENCLAW_IPHONE_OPENAI_BASE_URL") or OPENAI_API)
 
 
 def jpeg(png: bytes) -> str:
@@ -96,7 +99,7 @@ def settle(shot: Callable[[], bytes]) -> bytes:
     return previous
 
 
-def run(session, clef: Clef, data: dict) -> dict:
+def run(session, decisions: Decisions, data: dict) -> dict:
     """Capture, decide, act until done, an escalation, a risky tap needing approval, or the step limit."""
     if any(key in data for key in ("observe", "masks", "limit", "offset")):
         raise ValueError("Goal replies carry no observation; observe separately.")
@@ -132,10 +135,10 @@ def run(session, clef: Clef, data: dict) -> dict:
             step_goal = goal if not history else f"{goal}\nAlready done: " + "; ".join(history[-4:])
             started = time.monotonic()
             try:
-                d = navigator.decide(clef.ask, screen, step_goal)
+                d = navigator.decide(decisions.ask, screen, step_goal)
                 step = {"app": screen.app, "action": d["action"]}
                 if d["action"] == "dismiss_overlay":
-                    d = navigator.decide(clef.ask, screen, navigator.DISMISS_GOAL)
+                    d = navigator.decide(decisions.ask, screen, navigator.DISMISS_GOAL)
                     step["dismiss"] = d["action"]
             except (navigator.Unavailable, KeyError, TypeError, ValueError) as exc:
                 outcome, reason = "escalate", "navigator_unavailable"

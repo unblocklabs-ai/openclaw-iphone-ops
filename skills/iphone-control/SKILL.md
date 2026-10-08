@@ -46,12 +46,12 @@ model unless the operator enabled goal navigation.
 - Optional `launch.wait_seconds` checks foreground before capture. Optional
   `set.verify` reads back the requested value; `type.verify` compares whole-field replacement privately, returning only
   match/mismatch/unknown. Neither adds mandatory verification or blind retries.
-- If `ready.capabilities` includes `goal`, the operator enabled Clef goal
+- If `ready.capabilities` includes `goal`, the operator enabled goal
   navigation ([goal navigation](../../docs/goal.md)): `goal` runs several steps
   toward a goal you name and returns `done`, `escalate` or `needs_approval`.
   Pre-approve only the effects the user asked for (`approve`), check `done`
   yourself, and handle approvals and escalations directly. It sends screenshots and
-  screen text to Cloudflare. Without the capability, you choose every action.
+  screen text to OpenAI. Without the capability, you choose every action.
 - Inspect unknown/partial outcomes before retrying. The session never replays
   writes; uncertainty does not block subsequent deliberate requests.
 - `close`/EOF releases ownership; exit 0 says nothing about task achievement.
