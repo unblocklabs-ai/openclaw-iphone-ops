@@ -82,8 +82,8 @@ class WDATests(unittest.TestCase):
 
     def test_source_compact_route_leaves_default_raw(self) -> None:
         from unittest.mock import Mock
-        compact = ("/source?format=xml&excluded_attributes=accessible,nativeAccessibilityElement,"
-                   "index,placeholderValue,traits,nativeFrame,minValue,maxValue,customActions,type")
+        compact = ("/source?format=xml&excluded_attributes=visible,accessible,nativeAccessibilityElement,"
+                   "index,placeholderValue,nativeFrame,minValue,maxValue,customActions,type")
         client = WDAClient(url="http://wda.test", timeout=1)
         client._send = Mock(return_value=b'<App />')
         self.assertEqual(client.source(), "<App />")
@@ -92,11 +92,26 @@ class WDATests(unittest.TestCase):
         self.assertTrue(all(call.kwargs["method"] == "GET" for call in client._send.call_args_list))
         self.assertEqual(client.metrics.summary()["counts"], {"wda GET /source": 2})
 
+    def test_source_from_a_restarted_or_foreign_wda_session_is_a_lost_session(self) -> None:
+        from openclaw_iphone.errors import WDATransportUnavailable
+        client = FakeWDAClient({})
+        client._session.identifier = "ours"
+        for active in (b'"ours"', None):  # Matching, or no sessionId in the response at all.
+            client.responses["/source"] = b'{"value":"<App />"' + (b',"sessionId":' + active if active else b"") + b"}"
+            self.assertEqual(client.source(), "<App />")
+        for active in (b"null", b'"theirs"'):  # WDA restarted, or another client reset the settings.
+            client.responses["/source"] = b'{"value":"<App />","sessionId":' + active + b"}"
+            with self.assertRaises(WDATransportUnavailable) as lost:
+                client.source()
+            self.assertEqual(lost.exception.category, "session_lost")
+        client._session.identifier = None
+        self.assertEqual(client.source(), "<App />")  # Sessionless callers have nothing to compare.
+
     def test_compact_xml_retains_observation_semantics(self) -> None:
         attributes = ('accessible="true" nativeAccessibilityElement="noop" index="3" '
                       'placeholderValue="hint" traits="0" nativeFrame="none" '
                       'minValue="0" maxValue="1" customActions="none" type="TextField"')
-        raw = ('<XCUIElementTypeApplication name="Test" visible="true" enabled="true" '
+        raw = ('<XCUIElementTypeApplication name="Test" bundleId="test.app" visible="true" enabled="true" '
                'x="0" y="0" width="400" height="800"><XCUIElementTypeTextField '
                'label="Input" visible="true" enabled="true" focused="true" '
                'x="1" y="50" width="100" height="30" ' + attributes + '/>'
@@ -105,8 +120,8 @@ class WDATests(unittest.TestCase):
                '</XCUIElementTypeApplication>')
         reduced = raw.replace(' ' + attributes, '')
         def parse(xml: str):
-            return parse_observation(xml, generation=1, device_udid="device", app="test.app",
-                                     captured_at="now", started=1, finished=2, process_id=1)
+            return parse_observation(xml, generation=1, device_udid="device",
+                                     captured_at="now", started=1, finished=2)
         full, compact = parse(raw), parse(reduced)
         self.assertEqual(full.secure, compact.secure)
         self.assertTrue(compact.secure)  # Hidden secure nodes still constrain projection.

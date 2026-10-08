@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
+import threading
 from typing import Iterator
 
 from .control_lock import control_lock
@@ -29,6 +30,7 @@ class Connection:
         self._ownership = ExitStack()
         self._sessions = ExitStack()
         self._entered = False
+        self._reconnect = threading.Lock()  # Observation lanes may both find the session gone.
 
     def __enter__(self) -> Connection:
         if self._entered:
@@ -77,12 +79,13 @@ class Connection:
         self.valid = True
 
     def require_active(self) -> WDAClient:
-        if not self.valid:
-            self.reconnects += 1
-            self._close_session()
-            if self.device is None:
-                raise WDAUnavailable("No pinned device.")
-            self._connect(self.device.udid)
+        with self._reconnect:
+            if not self.valid:
+                self.reconnects += 1
+                self._close_session()
+                if self.device is None:
+                    raise WDAUnavailable("No pinned device.")
+                self._connect(self.device.udid)
         if self.wda is None:
             raise WDAUnavailable("No active WDA session.")
         return self.wda
@@ -95,8 +98,10 @@ class Connection:
                 # Advisory metadata must never hide an input acknowledgement.
                 pass
 
-    def invalidate(self) -> None:
-        self.valid = False
+    def invalidate(self, wda: WDAClient | None = None) -> None:
+        with self._reconnect:
+            if wda is None or wda is self.wda:
+                self.valid = False
 
     def _close_session(self) -> None:
         if self.wda is None:
