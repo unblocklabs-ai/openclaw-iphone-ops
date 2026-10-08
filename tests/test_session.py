@@ -34,10 +34,11 @@ BOOTSTRAP = '''
 import json, os, sys
 from pathlib import Path
 from unittest.mock import patch
-from openclaw_iphone import cli
-from openclaw_iphone.devicectl import Device
+from openclaw_iphone import cli, shallow
+from openclaw_iphone.devicectl import App, Device, resolve_app
 from openclaw_iphone.runner import Runner
 base = Path(os.environ["IPHONE_TEST_DIR"])
+shallow.SLOW_SECONDS = float(os.environ.get("IPHONE_TEST_SLOW", shallow.SLOW_SECONDS))
 class CoreDeviceFixture:
     def __init__(self):
         self.runner = Runner(timeout=float(os.environ.get("IPHONE_TEST_TIMEOUT", "2")))
@@ -47,6 +48,8 @@ class CoreDeviceFixture:
         return Device("fixture", "core", "connected", "iPhone", (base / "identity").read_text())
     def coredevice_wda_url(self, identifier):
         return os.environ["IPHONE_TEST_URL"], None
+    def find_app(self, device_id, query):
+        return resolve_app([App("Test", "test.app")], query, device_id)
 ctl = CoreDeviceFixture()
 previous_metrics = ctl.runner.metrics
 cli.client_from_args = lambda args: ctl
@@ -267,7 +270,7 @@ class PhoneHandler(BaseHTTPRequestHandler):
 
 class SessionTests(unittest.TestCase):
     @contextmanager
-    def running(self, *, images=False, seconds=2, read_seconds=None, timeout=2, status_unavailable=False, config=""):
+    def running(self, *, images=False, seconds=2, read_seconds=None, timeout=2, status_unavailable=False, config="", slow=None):
         with tempfile.TemporaryDirectory() as directory, PhoneServer() as server:
             base = Path(directory)
             (base / "identity").write_text("physical")
@@ -283,6 +286,8 @@ class SessionTests(unittest.TestCase):
                        OPENCLAW_IPHONE_WDA_URL="", OPENCLAW_IPHONE_DEVICE="", http_proxy="http://127.0.0.1:1")
             if config:
                 env["no_proxy"] = "127.0.0.1"  # the fake Decisions API
+            if slow is not None:
+                env["IPHONE_TEST_SLOW"] = str(slow)
             args = [sys.executable, "-c", BOOTSTRAP, "--evidence-dir", directory]
             if read_seconds is not None:
                 args.extend(["--read-timeout", str(read_seconds)])
@@ -921,9 +926,10 @@ class SessionTests(unittest.TestCase):
             self.assertEqual([(s["action"], s.get("label"), s.get("dispatch")) for s in reply["steps"]],
                              [("tap", "Next", "acknowledged"), ("type_text", None, "acknowledged"),
                               ("scroll_down", None, "acknowledged"), ("done", None, None)])
-            self.assertTrue(any(path.endswith("/element/field/click") for _, path, _ in server.requests))
+            # the tap goes to the judged element's center (no second lookup); the swipe scrolls
+            tap, swipe = [p["actions"][0]["actions"] for _, path, p in server.requests if path.endswith("/actions")]
+            self.assertEqual([(a["x"], a["y"]) for a in tap if a["type"] == "pointerMove"], [(70, 122)])
             self.assertEqual(server.text, "see you at 5")
-            swipe = next(p for _, path, p in server.requests if path.endswith("/actions"))["actions"][0]["actions"]
             self.assertEqual([(a["x"], a["y"]) for a in swipe if a["type"] == "pointerMove"], [(207, 650), (207, 300)])
             (path, auth, first), *_, (_, _, last) = api.requests
             self.assertEqual((path, auth, first["model"]), ("/v1/decisions", "Bearer test-key", "gpt-6-luna"))
@@ -961,6 +967,37 @@ class SessionTests(unittest.TestCase):
             reply = self.request(proc, {"op": "goal", "goal": "Log in"}, timeout=20)
             self.assertEqual((reply["outcome"], reply["reason"], reply["steps"]), ("escalate", "secure_field", []))
             self.assertEqual(len(api.requests), asked)
+            self.finish(proc, base)
+
+    def test_goal_opens_the_app_first_by_bundle_or_name(self):
+        with self.decisions() as (api, config), self.running(config=config) as (proc, server, base):
+            server.xml = GOAL_XML
+            for app in ("test.app", "Test"):
+                api.replies = [(200, step("done", {"done": 0.9, "e1": 0.1}, progress=2.9, done=0.95))]
+                reply = self.request(proc, {"op": "goal", "goal": "Show the welcome screen", "app": app}, timeout=20)
+                self.assertEqual((reply["outcome"], reply["status"], reply["acknowledged_substeps"]), ("done", "action", 1))
+            launches = [p["bundleId"] for _, path, p in server.requests if path.endswith("/wda/apps/activate")]
+            self.assertEqual(launches, ["test.app", "test.app"])
+            reply = self.request(proc, {"op": "goal", "goal": "Open it", "app": "Nope"}, timeout=20)
+            self.assertEqual((reply["outcome"], reply["reason"], reply["dispatch"]), ("escalate", "app_not_found", "not_sent"))
+            self.assertEqual(self.request(proc, {"op": "goal", "goal": "Open it", "app": ""})["reason"], "invalid_request")
+            self.finish(proc, base)
+
+    def test_slow_apps_are_read_shallow_and_remembered(self):
+        with self.running(slow=0.3) as (proc, server, base):
+            server.xml, server.source_delay = GOAL_XML, 0.5
+            first = self.request(proc, {"op": "observe", "mode": "accessibility"}, timeout=10)["observation"]["accessibility"]
+            self.assertNotIn("tree_depth_limit", first)  # the slow read itself is complete
+            self.assertIn("test.app", json.loads((base / ".openclaw/iphone/shallow-apps.json").read_text()))
+            server.source_delay = 0
+            second = self.request(proc, {"op": "observe", "mode": "accessibility"})["observation"]["accessibility"]
+            self.assertEqual(second["tree_depth_limit"], 22)
+            server.xml = GOAL_XML.replace("test.app", "other.app")  # a light app came to the front: read it in full
+            third = self.request(proc, {"op": "observe", "mode": "accessibility"})["observation"]["accessibility"]
+            self.assertEqual((third["app"], "tree_depth_limit" in third), ("other.app", False))
+            depths = [p["settings"]["snapshotMaxDepth"] for _, path, p in server.requests
+                      if path.endswith("/appium/settings") and "snapshotMaxDepth" in p["settings"]]
+            self.assertEqual(depths, [50, 22, 50])  # explicit at session start, capped, restored
             self.finish(proc, base)
 
     def test_goal_navigation_is_off_by_default(self):

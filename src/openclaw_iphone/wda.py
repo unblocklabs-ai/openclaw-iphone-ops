@@ -36,6 +36,7 @@ class WDAStatus:
 class SessionState:
     identifier: str | None = None
     cleanup_failed: bool = False
+    depth: int = 50  # snapshotMaxDepth set for this WDA session
 
 
 @dataclass(frozen=True)
@@ -316,7 +317,9 @@ class WDAClient:
                 "waitForIdleTimeout": 0, "animationCoolOffTimeout": 0,
                 "shouldUseCompactResponses": False,
                 "elementResponseAttributes": "type,label,attribute/value",
+                "snapshotMaxDepth": 50,  # explicit: a previous client may have left it capped
             }})
+            self._session.depth = 50
             yield session_id
         finally:
             self._session.identifier = None
@@ -328,6 +331,13 @@ class WDAClient:
                     "WDA session cleanup failed; action outcome is unchanged. "
                     "Do not replay completed actions. Check WDA before the next workflow."
                 )
+
+    def snapshot_depth(self, depth: int) -> None:
+        """How many tree levels WDA reads for /source and element lookups (its default is 50)."""
+        with self.session() as session_id:
+            if self._session.depth != depth:
+                self._json_post(f"/session/{session_id}/appium/settings", {"settings": {"snapshotMaxDepth": depth}})
+                self._session.depth = depth
 
     def press_button(self, name: str, *, duration: float | None = None) -> dict[str, Any]:
         payload: dict[str, Any] = {"name": name}

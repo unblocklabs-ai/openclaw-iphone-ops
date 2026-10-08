@@ -200,6 +200,20 @@ class NavigatorTests(unittest.TestCase):
             self.assertEqual(failure.exception.category, category)
 
 
+class ShallowAppsTests(unittest.TestCase):
+    def test_slow_apps_are_remembered_owner_only_and_expire(self):
+        from openclaw_iphone import shallow
+        with tempfile.TemporaryDirectory() as home, mock.patch("pathlib.Path.home", return_value=Path(home)):
+            self.assertEqual(shallow.load(), {"com.atebits.Tweetie2"})  # X is known slow on every host
+            shallow.remember("com.example.slow")
+            self.assertEqual(shallow.load(), {"com.atebits.Tweetie2", "com.example.slow"})
+            self.assertEqual(os.stat(shallow.path()).st_mode & 0o777, 0o600)
+            with mock.patch("time.time", return_value=__import__("time").time() + shallow.KEEP_SECONDS + 1):
+                self.assertEqual(shallow.load(), {"com.atebits.Tweetie2"})  # learned apps are re-measured after two weeks
+            shallow.path().write_text("not json")
+            self.assertEqual(shallow.load(), {"com.atebits.Tweetie2"})
+
+
 class DecisionsServer(ThreadingHTTPServer):
     daemon_threads = True
 
