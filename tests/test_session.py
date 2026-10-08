@@ -949,7 +949,8 @@ class SessionTests(unittest.TestCase):
             reply = self.request(proc, {"op": "goal", "goal": "Send it", "approve": ["social_action"]}, timeout=20)
             self.assertEqual((reply["outcome"], reply["reason"], reply["dispatch"], reply["pending"]["label"]),
                              ("needs_approval", "communication", "not_sent", "Next"))
-            self.assertFalse(any(path.endswith("/click") for _, path, _ in server.requests))
+            # nothing was tapped: no element click and no coordinate tap (goal taps are coordinate taps)
+            self.assertFalse(any(path.endswith("/click") or path.endswith("/actions") for _, path, _ in server.requests))
             self.assertEqual(self.request(proc, {"op": "tap", "target": reply["pending"]["target"]})["dispatch"], "acknowledged")
             api.replies = [(401, {"error": {"message": "bad key"}})]
             reply = self.request(proc, {"op": "goal", "goal": "Send it"}, timeout=20)
