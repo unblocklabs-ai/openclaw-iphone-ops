@@ -63,6 +63,13 @@ navigation, enabled in host config. See [goal navigation](goal.md).
   layout wrappers and duplicate container text are collapsed. `parent` links
   preserve meaningful groups (for example, which account owns a button).
   Full paths and native ancestors stay internal for locating the target.
+- Some apps' trees are too slow to read in full: X's home timeline took 21-38 s per
+  read and sometimes closed the app. A read slower than 3 s marks the app slow in
+  `~/.openclaw/iphone/shallow-apps.json` (owner-only; re-measured after two weeks;
+  X is listed from the start), and later reads of it stop at 22 levels: about 0.2 s,
+  with the menus and tabs still listed. Such observations carry
+  `"tree_depth_limit": 22`; deeper controls are missing from `elements` but visible
+  in the screenshot, so tap them by coordinates. Every other app is read in full.
 - AX pages contain at most 80 screen elements by default (`limit`: positive integer),
   automatically stopping earlier to fit the output budget. `next_offset` tells
   you where to continue with `{"op":"observe","offset":NEXT_OFFSET}`.

@@ -17,7 +17,7 @@ from .connection import Connection
 from .errors import OpenClawIPhoneError, WDAOutcomeUnknown, WDAStaleElement, WDAUnavailable, WDATransportUnavailable, diagnostic
 from .execution import Budget
 from .evidence import artifact_path, write_private
-from . import goal
+from . import goal, shallow
 from .image_evidence import redact_png
 from .inputs import (InputReadbackUnavailable, InputUnavailable, date_components, input_kind,
                      iso_date, pick_value, set_checked, set_date, validate_text, write_text)
@@ -61,6 +61,8 @@ class Session:
         self.image_geometry: tuple[tuple[float, float] | None, tuple[int, int]] | None = None
         self.secrets: set[str] = set()
         self.candidate_ids: set[str] | None = None
+        self.shallow_apps = shallow.load()  # apps too slow to read in full (shallow.py)
+        self.app_hint: str | None = None  # the app the next read expects: last observed or launched
 
     def _read(self, read: Callable[[WDAClient], T]) -> T:
         """One safe retry per read; no lifetime recovery allowance."""
@@ -82,17 +84,45 @@ class Session:
                 raise ValueError("No current ambiguity candidates.")
             return self.snapshot.compact(include_labels=True, limit=limit, offset=offset, redact=self._redact,
                                          ids=self.candidate_ids if candidates else None)
-        def capture(wda: WDAClient) -> Observation:
-            started = time.monotonic()
-            xml = wda.source(compact=True, validate=False)
-            # The application root names the app and process; no separate activeAppInfo read.
-            return parse_observation(xml, generation=0, device_udid=self.connection.device.udid,
-                                     captured_at=datetime.now(timezone.utc).isoformat(),
-                                     started=started, finished=time.monotonic())
+        def capture(depth: int) -> Observation:
+            def read(wda: WDAClient) -> Observation:
+                wda.snapshot_depth(depth)
+                started = time.monotonic()
+                xml = wda.source(compact=True, validate=False)
+                # The application root names the app and process; no separate activeAppInfo read.
+                return parse_observation(xml, generation=0, device_udid=self.connection.device.udid,
+                                         captured_at=datetime.now(timezone.utc).isoformat(),
+                                         started=started, finished=time.monotonic())
+            return self._read(read)
         self.snapshot = None
         self.candidate_ids = None
-        self.snapshot = self._read(capture)
-        return self.snapshot.compact(include_labels=True, limit=limit, offset=offset, redact=self._redact)
+        depth = shallow.DEPTH if self.app_hint in self.shallow_apps else shallow.DEFAULT_DEPTH
+        started = time.monotonic()
+        try:
+            observation = capture(depth)
+        except (WDAStaleElement, WDAUnavailable) as exc:
+            # A full read that ran long and then failed because the tree kept changing or the deadline passed is
+            # the slow-app signature: remember the app and read it shallow instead of repeating the full read.
+            # Lost sessions and reconnects are not: they re-raise as before.
+            slow = isinstance(exc, WDAStaleElement) or getattr(exc, "category", None) == "deadline"
+            if not slow or depth == shallow.DEPTH or self.app_hint is None or time.monotonic() - started < shallow.SLOW_SECONDS:
+                raise
+            self._remember_shallow(self.app_hint)
+            observation = capture(depth := shallow.DEPTH)
+        if depth == shallow.DEFAULT_DEPTH and observation.finished - observation.started > shallow.SLOW_SECONDS:
+            self._remember_shallow(observation.app)  # this read already has the full tree; the next ones are capped
+        elif depth == shallow.DEPTH and observation.app not in self.shallow_apps:
+            observation = capture(depth := shallow.DEFAULT_DEPTH)  # another app is in front now: read it in full
+        self.snapshot, self.app_hint = observation, observation.app
+        view = observation.compact(include_labels=True, limit=limit, offset=offset, redact=self._redact)
+        if depth == shallow.DEPTH:
+            view["tree_depth_limit"] = depth  # deeper controls are missing from `elements`; the screenshot shows all
+        return view
+
+    def _remember_shallow(self, app: str | None) -> None:
+        if app and app not in self.shallow_apps:
+            self.shallow_apps.add(app)
+            shallow.remember(app)
 
     def _image(self, masks: list) -> dict[str, object]:
         started = time.monotonic()
@@ -257,7 +287,7 @@ class Session:
                   "pick": {"target", "value", "order", "max_steps", "offset", "seconds"},
                   "set": {"target", "value", "value_ref", "kind", "components", "month_values", "strategy", "verify"},
                   "press": {"button", "duration"}, "launch": {"bundle_id", "wait_seconds"},
-                  "open_url": {"url"}, "goal": {"goal", "text", "approve", "max_steps"}, "close": set()}
+                  "open_url": {"url"}, "goal": {"goal", "app", "text", "approve", "max_steps"}, "close": set()}
         if not isinstance(op, str) or op not in fields or set(data) - (fields[op] | {"op", "observe", "masks", "limit", "offset"}):
             raise ValueError("Unknown operation or field.")
         required = {"swipe": {"from_x", "from_y", "to_x", "to_y"}, "press": {"button"},
@@ -448,6 +478,7 @@ class Session:
                         send(lambda: wda.press_button(value, duration=data.get("duration")))
                 elif op == "launch":
                     send(lambda: wda.activate_app(value))
+                    self.app_hint = value  # the next read expects this app (and its depth)
                 elif op == "open_url":
                     send(lambda: wda.open_url(value))
                 completed = True

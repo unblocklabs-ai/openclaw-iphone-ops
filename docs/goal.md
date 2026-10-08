@@ -50,13 +50,18 @@ to eligible API organizations).
 ## Request
 
 ```json
-{"op":"goal","goal":"Open Instagram and view bill.epsilon's followers"}
-{"op":"goal","goal":"Message naughtybek from bill.epsilon's followers list","text":"See you at 5","approve":["communication"],"max_steps":14}
+{"op":"goal","goal":"Show bill.epsilon's followers","app":"Instagram"}
+{"op":"goal","goal":"Message naughtybek from bill.epsilon's followers list","app":"com.burbn.instagram","text":"See you at 5","approve":["communication"],"max_steps":14}
 ```
 
 - `goal`: what should be on screen when done. Name things the screen shows
   (`bill.epsilon`, not "Bill"). A single goal is optimized for its end state; when
   the route matters, send ordered goals one request at a time.
+- `app`: optional app name (`"X"`, `"Instagram"`) or bundle identifier to open first.
+  The navigator only taps what is on screen: it can't open an app that isn't on the
+  current home-screen page, and starting from the home screen sends that screen
+  (widgets included) to OpenAI. A name costs one installed-app lookup (~0.3 s);
+  a bundle identifier skips it.
 - `text`: typed with `set` (whole-field replacement) when a focused field needs it.
 - `approve`: risky effects the agent pre-approves: `communication`,
   `social_action`, `purchase_install`, `permission_grant`. Default none.
@@ -80,7 +85,8 @@ The reply has no observation; observe separately when you need the screen.
 - `needs_approval`: the next tap's effect (`reason`) was not pre-approved; nothing
   was tapped. `pending.target` is valid until your next observation: ask, then tap it
   with `{"op":"tap","target":...}` or observe and decide yourself.
-- `escalate`: the navigator or the loop stopped (`reason`): `permission_or_consent_prompt`
+- `escalate`: the navigator or the loop stopped (`reason`): `app_not_found` or
+  `app_not_launched` (for `app`), `permission_or_consent_prompt`
   (never auto-answered), `low_confidence`, `nothing_on_screen_helps`,
   `secure_field`, `text_needed`, `repeated_type`, `no_progress`,
   `cannot_dismiss_overlay_safely`, `navigator_unavailable` (with a safe
@@ -105,8 +111,12 @@ without observing first. Treat these as hints, not decisions.
 
 `dispatch` and `acknowledged_substeps` count inputs actually sent, as in every
 other operation; each step lists its own `dispatch`. Uncertain writes are never
-replayed. Taps use the step's snapshot ID, falling back to the element's center
-only when the ID no longer resolves to one control.
+replayed. Taps go to the chosen element's center on the screen the navigator just
+judged, after one screenshot confirms the screen hasn't moved; if it has, the tap
+finds the element by identity instead. Looking the element up by ID is a second
+tree read: 0.3 s in light apps, and over 30 s (then a timeout) in X's timeline at
+full depth; a coordinate tap took 0.75 s everywhere. Screens of apps measured slow are read only 22 levels deep (see
+[session](session.md)), which keeps menus, tabs and buttons above post contents.
 
 ## How a step works
 

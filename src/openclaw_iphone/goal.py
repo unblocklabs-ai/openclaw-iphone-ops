@@ -25,6 +25,7 @@ from .config import IPhoneConfig
 from .errors import OpenClawIPhoneError, diagnostic
 from .inputs import validate_text
 
+BUNDLE_ID = re.compile(r"[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+")
 OPENAI_API = "https://api.openai.com/v1"
 MODEL = "gpt-6-luna"
 RETRIES = 2
@@ -136,13 +137,18 @@ def jpeg(png: bytes) -> str:
         return "data:image/jpeg;base64," + base64.b64encode(target.read_bytes()).decode()
 
 
+def same(a: bytes, b: bytes) -> bool:
+    """Screenshots of an unchanged screen: identical, or PNG sizes within 0.05% (the status-bar clock, a cursor)."""
+    return a == b or abs(len(a) - len(b)) <= len(b) * 0.0005
+
+
 def settle(shot: Callable[[], bytes]) -> bytes:
     """The first of two screenshots 0.15 s apart that match (at most 3 s), else the latest."""
     started, previous = time.monotonic(), shot()
     while time.monotonic() - started < 3:
         time.sleep(0.15)
         current = shot()
-        if current == previous or abs(len(current) - len(previous)) <= len(previous) * 0.0005:
+        if same(current, previous):
             return current
         previous = current
     return previous
@@ -162,16 +168,36 @@ def run(session, decisions: Decisions, data: dict) -> dict:
     max_steps = data.get("max_steps", DEFAULT_STEPS)
     if type(max_steps) is not int or not 1 <= max_steps <= MAX_STEPS:
         raise ValueError(f"max_steps must be 1-{MAX_STEPS}.")
+    app = data.get("app")
+    if app is not None and (not isinstance(app, str) or not app.strip() or len(app) > 200):
+        raise ValueError("app is an app name or bundle identifier.")
     steps, history, seen = [], [], Counter()
     sent, uncertain, deciding = 0, False, 0.0
     outcome, reason, extra = "step_limit", None, {}
+    if app is not None:  # the navigator only taps what is on screen; opening the app is the session's job
+        try:
+            bundle = app if BUNDLE_ID.fullmatch(app) else session.connection.ctl.find_app(
+                session.connection.device.identifier, app).bundle_identifier
+        except (OpenClawIPhoneError, ValueError) as exc:
+            return {"status": "checked", "dispatch": "not_sent", "acknowledged_substeps": 0, "outcome": "escalate",
+                    "reason": "app_not_found", "steps": [], "error": diagnostic(exc)}
+        reply = session._request({"op": "launch", "bundle_id": bundle})
+        if reply.get("dispatch") != "acknowledged":
+            return {"status": "error", "dispatch": reply.get("dispatch", "not_sent"), "acknowledged_substeps": 0,
+                    "outcome": "escalate", "reason": "app_not_launched", "steps": []}
+        sent = 1
     try:
-        for _ in range(max_steps):
+        for index in range(max_steps):
             try:
                 with session.connection.operation():
                     png = settle(lambda: session._read(lambda wda: wda.screenshot()))
                     session._accessibility(limit=1)
                 obs = session.snapshot
+                if app is not None and index == 0 and obs.app != bundle:  # still launching: one more settle
+                    with session.connection.operation():
+                        png = settle(lambda: session._read(lambda wda: wda.screenshot()))
+                        session._accessibility(limit=1)
+                    obs = session.snapshot
                 if obs.elements[0].bounds is None:
                     raise ValueError("Screen frame unavailable.")
                 if obs.secure:
@@ -218,9 +244,13 @@ def run(session, decisions: Decisions, data: dict) -> dict:
                     outcome, reason = "needs_approval", d["risk"].get("effect", "risk_check_unavailable")
                     extra = {"pending": {"target": target["id"], "label": step["label"], "effect": d["risk"].get("effect")}}
                     break
-                reply = session._request({"op": "tap", "target": target["id"]})
-                if reply.get("dispatch") == "not_sent" and reply.get("reason") == "target_missing_or_ambiguous":
+                # The element's center on the screen just judged: an ID tap would look the element up again, a full
+                # tree read (0.3 s in light apps, 30 s and a timeout in X's timeline). If the screen moved since
+                # (a banner, a list reloading), the point may hold another control: find the element itself.
+                if same(session._read(lambda wda: wda.screenshot()), png):
                     reply = session._request({"op": "tap", "x": target["x"], "y": target["y"]})
+                else:
+                    reply = session._request({"op": "tap", "target": target["id"]})
                 note = f"tapped '{step['label']}'" if step["action"] == "tap" else f"closed an overlay via '{step['label']}'"
             elif d["action"] == "type_text":
                 if text is None or history and history[-1] == TYPED:
