@@ -199,6 +199,8 @@ def run(session, decisions: Decisions, data: dict) -> dict:
             if target:
                 step["label"] = session._redact(target["label"] or "")
             step.update({k: d[k] for k in ("confidence", "reason", "risk") if k in d})
+            if "considered" in d:  # an escalation: what the navigator leaned toward, for the agent to take over from
+                step["considered"] = [c | {"label": session._redact(c["label"])} if "label" in c else c for c in d["considered"]]
             steps.append(step)
             fingerprint = hashlib.sha256(png).digest(), d["action"], target and target["key"]
             seen[fingerprint] += 1

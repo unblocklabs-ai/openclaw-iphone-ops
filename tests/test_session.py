@@ -949,6 +949,14 @@ class SessionTests(unittest.TestCase):
             reply = self.request(proc, {"op": "goal", "goal": "Send it"}, timeout=20)
             self.assertEqual((reply["outcome"], reply["reason"], reply["error"]["category"]),
                              ("escalate", "navigator_unavailable", "http_401"))
+            api.replies = [(200, step("none", {"none": 0.6, "e1": 0.3, "done": 0.1}))]
+            reply = self.request(proc, {"op": "goal", "goal": "Open the inbox"}, timeout=20)
+            self.assertEqual((reply["outcome"], reply["reason"]), ("escalate", "nothing_on_screen_helps"))
+            considered = reply["steps"][-1]["considered"]
+            self.assertEqual([(c.get("option"), c.get("label"), c["probability"]) for c in considered],
+                             [("none", None, 0.6), (None, "Next", 0.3), ("done", None, 0.1)])
+            # the agent can take over from there: an element it leaned toward is tappable as is
+            self.assertEqual(self.request(proc, {"op": "tap", "target": considered[1]["target"]})["dispatch"], "acknowledged")
             asked, server.xml = len(api.requests), XML  # XML has a secure field
             reply = self.request(proc, {"op": "goal", "goal": "Log in"}, timeout=20)
             self.assertEqual((reply["outcome"], reply["reason"], reply["steps"]), ("escalate", "secure_field", []))

@@ -155,9 +155,14 @@ class NavigatorTests(unittest.TestCase):
             if action == "tap":
                 self.assertEqual((d["target"]["label"], d["target"]["key"]), ("Back", key))
                 self.assertEqual(len(bodies), 2)  # the tap check still runs
+            else:  # an escalation lists what next leaned toward: options by name, elements by target and label
+                self.assertEqual(d["considered"], [{"option": "none", "probability": 0.6},
+                                                   {"option": "go_back", "target": back.id, "label": "Back", "probability": 0.22},
+                                                   {"target": s.rows[2].id, "label": "Message", "probability": 0.18}])
         ask, _ = scripted(step("go_back", {"go_back": 0.6, "none": 0.4}))
         d = navigator.decide(ask, navigator.screen(observe(), ""), "Open the home feed")
         self.assertEqual((d["action"], d["reason"]), ("escalate", "nothing_on_screen_helps"))
+        self.assertEqual(d["considered"], [{"option": "go_back", "probability": 0.6}, {"option": "none", "probability": 0.4}])
 
     def test_tap_check_flags_risky_taps_and_closes_overlays_in_the_way(self):
         s = navigator.screen(observe(), "")

@@ -88,6 +88,21 @@ The reply has no observation; observe separately when you need the screen.
   `inspect_before_retry` (a write may have happened), `interrupted`.
 - `step_limit`: `max_steps` ran out.
 
+The navigator stops rather than guess, and the session stays open: take over by
+observing, then act yourself or send a narrower goal (`"Tap Back to the inbox"`).
+When the navigator itself escalated (`permission_or_consent_prompt`, `low_confidence`,
+`nothing_on_screen_helps`), the last step lists what it leaned toward:
+
+```json
+"considered":[{"option":"none","probability":0.36},
+              {"option":"go_back","target":"SNAPSHOT_ID:21","label":"Back","probability":0.14},
+              {"target":"SNAPSHOT_ID:19","label":"Bek,","probability":0.06}]
+```
+
+Options are the navigator's own (`go_back`, `scroll_down`, `none`, ...); an element's
+`target` is valid until your next observation, so `{"op":"tap","target":...}` works
+without observing first. Treat these as hints, not decisions.
+
 `dispatch` and `acknowledged_substeps` count inputs actually sent, as in every
 other operation; each step lists its own `dispatch`. Uncertain writes are never
 replayed. Taps use the step's snapshot ID, falling back to the element's center

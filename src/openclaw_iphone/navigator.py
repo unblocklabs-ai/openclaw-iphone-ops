@@ -192,6 +192,19 @@ def back_control(s: Screen) -> Element | None:
     return min(found, key=lambda e: center(e)[0]) if found else None
 
 
+def considered(s: Screen, probabilities: dict, back: Element | None = None, n: int = 3) -> list[dict]:
+    """What next leaned toward, for an escalation: options by name, elements by snapshot target and label (tappable as is)."""
+    by_key = {element_key(e): e for e in s.rows}
+    out = []
+    for k, p in sorted(probabilities.items(), key=lambda kv: -kv[1])[:n]:
+        e = back if k == "go_back" else by_key.get(k)
+        item = {"option": k} if k in NON_ELEMENT_OPTIONS else {}
+        if e is not None:
+            item |= {"target": e.id, "label": e.label or e.name or e.role.removeprefix("XCUIElementType")}
+        out.append(item | {"probability": round(p, 2)})
+    return out
+
+
 def line(e: Element) -> str:
     parts = [element_key(e), e.role.removeprefix("XCUIElementType")]
     if e.label:
@@ -292,7 +305,7 @@ def decide(ask: Callable[[dict], dict], s: Screen, goal: str, *, check_tap: bool
     out = {"signals": {"blocked": b["choice"], "progress": round(progress, 2), "done": round(a["done"]["probability"], 2),
                        "done2": round(a["done2"]["probability"], 2), "top": [[k, round(p, 3)] for k, p in top]}}
     if b["choice"] == "permission_or_consent" and b["probabilities"][b["choice"]] >= t["consent_prob"]:
-        return out | {"action": "escalate", "reason": "permission_or_consent_prompt"}
+        return out | {"action": "escalate", "reason": "permission_or_consent_prompt", "considered": considered(s, probabilities)}
     votes = n["choice"] == "done" and min(probabilities["done"], a["done"]["probability"]) >= t["done_votes"]
     agree = progress >= t["done_score"] and a["done2"]["probability"] >= t["done2_min"]
     element = max((p for k, p in probabilities.items() if k not in NON_ELEMENT_OPTIONS), default=0)
@@ -308,10 +321,10 @@ def decide(ask: Callable[[dict], dict], s: Screen, goal: str, *, check_tap: bool
             choice = "go_back"  # going back only navigates: worth a try before giving up
     if choice == "go_back":
         if back is None:
-            return out | {"action": "escalate", "reason": "nothing_on_screen_helps"}
+            return out | {"action": "escalate", "reason": "nothing_on_screen_helps", "considered": considered(s, probabilities)}
         choice = element_key(back)
     if choice == "none":
-        return out | {"action": "escalate", "reason": "nothing_on_screen_helps"}
+        return out | {"action": "escalate", "reason": "nothing_on_screen_helps", "considered": considered(s, probabilities, back)}
     if choice in NON_ELEMENT_OPTIONS:
         return out | {"action": choice, "confidence": round(probabilities[choice], 2)}
     by_key = {element_key(o): o for o in s.rows}
@@ -326,7 +339,7 @@ def decide(ask: Callable[[dict], dict], s: Screen, goal: str, *, check_tap: bool
                       "target": {"id": e.id, "key": choice, "role": e.role.removeprefix("XCUIElementType"),
                                  "label": e.label or e.name, "x": round(x), "y": round(y)}}
     if confidence < (t["back_over_none"] if e is back else t["act_confidence"]):
-        return decision | {"action": "escalate", "reason": "low_confidence"}
+        return decision | {"action": "escalate", "reason": "low_confidence", "considered": considered(s, probabilities, back)}
     if not check_tap:
         return decision
     try:
