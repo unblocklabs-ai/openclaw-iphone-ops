@@ -21,6 +21,7 @@ from openclaw_iphone.connection import Connection
 from openclaw_iphone.control_lock import control_lock
 from openclaw_iphone.errors import OpenClawIPhoneError, SessionOutputUnavailable
 from openclaw_iphone.protocol import JsonLineEmitter, read_requests
+from test_goal import ClefServer, answers, risk
 from test_image_evidence import png
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -55,6 +56,12 @@ assert ctl.runner.budget is None, "Caller budget not restored"
 assert ctl.runner.metrics is previous_metrics, "Caller metrics not restored"
 sys.exit(code)
 '''
+
+
+GOAL_XML = '''<XCUIElementTypeApplication bundleId="test.app" name="Test" label="Test" enabled="true" x="0" y="0" width="414" height="896">
+<XCUIElementTypeButton label="Next" enabled="true" x="20" y="100" width="100" height="44"/>
+<XCUIElementTypeStaticText label="Welcome" enabled="true" x="20" y="200" width="200" height="20"/>
+</XCUIElementTypeApplication>'''
 
 
 class PhoneServer(ThreadingHTTPServer):
@@ -260,11 +267,11 @@ class PhoneHandler(BaseHTTPRequestHandler):
 
 class SessionTests(unittest.TestCase):
     @contextmanager
-    def running(self, *, images=False, seconds=2, read_seconds=None, timeout=2, status_unavailable=False):
+    def running(self, *, images=False, seconds=2, read_seconds=None, timeout=2, status_unavailable=False, config=""):
         with tempfile.TemporaryDirectory() as directory, PhoneServer() as server:
             base = Path(directory)
             (base / "identity").write_text("physical")
-            (base / "config.env").write_text("")
+            (base / "config.env").write_text(config)
             if status_unavailable:
                 server.failures["/status"] = 100
             thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
@@ -274,6 +281,8 @@ class SessionTests(unittest.TestCase):
                        IPHONE_TEST_URL=f"http://127.0.0.1:{server.server_port}",
                        OPENCLAW_IPHONE_CONFIG=str(base / "config.env"),
                        OPENCLAW_IPHONE_WDA_URL="", OPENCLAW_IPHONE_DEVICE="", http_proxy="http://127.0.0.1:1")
+            if config:
+                env["no_proxy"] = "127.0.0.1"  # the fake Clef
             args = [sys.executable, "-c", BOOTSTRAP, "--evidence-dir", directory]
             if read_seconds is not None:
                 args.extend(["--read-timeout", str(read_seconds)])
@@ -282,7 +291,8 @@ class SessionTests(unittest.TestCase):
                 args.append("--allow-images")
             proc = subprocess.Popen(args, env=env, cwd=base, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             try:
-                self.assertEqual(self.receive(proc)["status"], "ready")
+                self.ready = self.receive(proc)
+                self.assertEqual(self.ready["status"], "ready")
                 yield proc, server, base
             finally:
                 if proc.poll() is None:
@@ -884,6 +894,72 @@ class SessionTests(unittest.TestCase):
             result = self.request(proc, {"op": "observe", "mode": "image", "masks": [[0, 0, 8, 16]]})
             self.assertIn("image_error", result["observation"])
             self.assertEqual(list(base.rglob("*.png")), [])
+            self.finish(proc, base)
+
+
+    @contextmanager
+    def clef(self):
+        with ClefServer() as clef:
+            thread = threading.Thread(target=clef.serve_forever, kwargs={"poll_interval": 0.01})
+            thread.start()
+            try:
+                yield clef, ("OPENCLAW_IPHONE_CLEF_ENABLED=1\nOPENCLAW_IPHONE_CLEF_ACCOUNT_ID=acct\n"
+                             "OPENCLAW_IPHONE_CLEF_API_TOKEN=test-token\n"
+                             f"OPENCLAW_IPHONE_CLEF_BASE_URL=http://127.0.0.1:{clef.server_port}\n")
+            finally:
+                clef.shutdown()
+                thread.join(timeout=5)
+
+    def test_goal_steps_through_the_session_until_clef_judges_it_done(self):
+        with self.clef() as (clef, config), self.running(config=config) as (proc, server, base):
+            self.assertIn("goal", self.ready["capabilities"])
+            server.xml = GOAL_XML
+            clef.replies = [(200, {"success": True, "result": r}) for r in
+                            (answers("e1"), risk(0.05), answers("type_text"), answers("scroll_down"), answers("e1", progress=2.9))]
+            reply = self.request(proc, {"op": "goal", "goal": "Reply on the next page", "text": "see you at 5"}, timeout=20)
+            self.assertEqual({k: reply[k] for k in ("status", "dispatch", "acknowledged_substeps", "outcome")},
+                             {"status": "action", "dispatch": "acknowledged", "acknowledged_substeps": 3, "outcome": "done"})
+            self.assertEqual([(s["action"], s.get("label"), s.get("dispatch")) for s in reply["steps"]],
+                             [("tap", "Next", "acknowledged"), ("type_text", None, "acknowledged"),
+                              ("scroll_down", None, "acknowledged"), ("done", None, None)])
+            self.assertTrue(any(path.endswith("/element/field/click") for _, path, _ in server.requests))
+            self.assertEqual(server.text, "see you at 5")
+            swipe = next(p for _, path, p in server.requests if path.endswith("/actions"))["actions"][0]["actions"]
+            self.assertEqual([(a["x"], a["y"]) for a in swipe if a["type"] == "pointerMove"], [(207, 650), (207, 300)])
+            (_, auth, first), *_, (_, _, last) = clef.requests
+            self.assertEqual(auth, "Bearer test-token")
+            self.assertTrue(first["images"][0].startswith("data:image/jpeg;base64,"))
+            self.assertIn('e1 Button "Next" @(70,122) 100x44', first["state"]["screen"])
+            self.assertTrue(last["state"]["goal"].endswith("Already done: tapped 'Next'; typed the supplied text; scrolled down"))
+            self.assertNotIn("see you", json.dumps(clef.requests))
+            self.finish(proc, base)
+
+    def test_goal_stops_before_unapproved_risky_taps_and_never_sends_secure_screens(self):
+        with self.clef() as (clef, config), self.running(config=config) as (proc, server, base):
+            server.xml = GOAL_XML
+            for bad in ({"approve": ["delete"]}, {"max_steps": 0}, {"observe": "accessibility"}, {"goal": ""}):
+                self.assertEqual(self.request(proc, {"op": "goal", "goal": "Send it", **bad})["reason"], "invalid_request")
+            clef.replies = [(200, {"success": True, "result": r}) for r in (answers("e1"), risk(0.9, "communication"))]
+            reply = self.request(proc, {"op": "goal", "goal": "Send it", "approve": ["social_action"]}, timeout=20)
+            self.assertEqual((reply["outcome"], reply["reason"], reply["dispatch"], reply["pending"]["label"]),
+                             ("needs_approval", "communication", "not_sent", "Next"))
+            self.assertFalse(any(path.endswith("/click") for _, path, _ in server.requests))
+            self.assertEqual(self.request(proc, {"op": "tap", "target": reply["pending"]["target"]})["dispatch"], "acknowledged")
+            clef.replies = [(401, {"success": False})]
+            reply = self.request(proc, {"op": "goal", "goal": "Send it"}, timeout=20)
+            self.assertEqual((reply["outcome"], reply["reason"], reply["error"]["category"]),
+                             ("escalate", "navigator_unavailable", "http_401"))
+            asked, server.xml = len(clef.requests), XML  # XML has a secure field
+            reply = self.request(proc, {"op": "goal", "goal": "Log in"}, timeout=20)
+            self.assertEqual((reply["outcome"], reply["reason"], reply["steps"]), ("escalate", "secure_field", []))
+            self.assertEqual(len(clef.requests), asked)
+            self.finish(proc, base)
+
+    def test_goal_navigation_is_off_by_default(self):
+        with self.running() as (proc, server, base):
+            self.assertNotIn("goal", self.ready["capabilities"])
+            reply = self.request(proc, {"op": "goal", "goal": "Open Settings"})
+            self.assertEqual((reply["reason"], reply["dispatch"]), ("goal_navigation_disabled", "not_sent"))
             self.finish(proc, base)
 
 

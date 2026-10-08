@@ -17,6 +17,7 @@ from .connection import Connection
 from .errors import OpenClawIPhoneError, WDAOutcomeUnknown, WDAStaleElement, WDAUnavailable, WDATransportUnavailable, diagnostic
 from .execution import Budget
 from .evidence import artifact_path, write_private
+from . import goal
 from .image_evidence import redact_png
 from .inputs import (InputReadbackUnavailable, InputUnavailable, date_components, input_kind,
                      iso_date, pick_value, set_checked, set_date, validate_text, write_text)
@@ -52,8 +53,9 @@ class TargetUnavailable(OpenClawIPhoneError):
 
 class Session:
     def __init__(self, connection: Connection, *, allow_images: bool = False,
-                 evidence_base: str | None = None) -> None:
+                 evidence_base: str | None = None, clef: goal.Clef | None = None) -> None:
         self.connection, self.allow_images, self.evidence_base = connection, allow_images, evidence_base
+        self.clef = clef
         self.closed = False
         self.snapshot: Observation | None = None
         self.image_geometry: tuple[tuple[float, float] | None, tuple[int, int]] | None = None
@@ -255,7 +257,7 @@ class Session:
                   "pick": {"target", "value", "order", "max_steps", "offset", "seconds"},
                   "set": {"target", "value", "value_ref", "kind", "components", "month_values", "strategy", "verify"},
                   "press": {"button", "duration"}, "launch": {"bundle_id", "wait_seconds"},
-                  "open_url": {"url"}, "close": set()}
+                  "open_url": {"url"}, "goal": {"goal", "text", "approve", "max_steps"}, "close": set()}
         if not isinstance(op, str) or op not in fields or set(data) - (fields[op] | {"op", "observe", "masks", "limit", "offset"}):
             raise ValueError("Unknown operation or field.")
         required = {"swipe": {"from_x", "from_y", "to_x", "to_y"}, "press": {"button"},
@@ -283,6 +285,11 @@ class Session:
         if op == "close":
             self.closed = True
             return {"status": "closed"}
+        if op == "goal":
+            # Many operations, each with its own deadline; Clef deliberation runs between them.
+            if self.clef is None:
+                return {"status": "error", "dispatch": "not_sent", "reason": "goal_navigation_disabled"}
+            return goal.run(self, self.clef, data)
         acknowledged = 0
         action_started = False
         completed = False

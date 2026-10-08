@@ -1,0 +1,93 @@
+# Goal navigation (optional)
+
+Off by default. When enabled, the session's `goal` operation hands navigation to
+Cloudflare's Clef model: each step captures the screen, Clef picks the next tap,
+text entry or scroll, and the session performs it, until the goal looks done or
+something needs the agent. The agent still owns the task: it supplies the goal,
+any text to type and which risky effects are pre-approved, and it checks the result.
+
+## Enable
+
+Add to `~/.openclaw/iphone/config.env`, keep the file owner-only (`chmod 600`), and
+restart any running `session`:
+
+```sh
+OPENCLAW_IPHONE_CLEF_ENABLED="1"
+OPENCLAW_IPHONE_CLEF_ACCOUNT_ID="<Cloudflare account ID>"
+OPENCLAW_IPHONE_CLEF_API_TOKEN="<API token with Workers AI access>"
+# Optional: an API-compatible proxy instead of https://api.cloudflare.com/client/v4
+# OPENCLAW_IPHONE_CLEF_BASE_URL="https://proxy.example/cloudflare"
+```
+
+`openclaw-iphone doctor` reports `goal-navigation: on|off|incomplete`. When it is
+on, the session's `ready.capabilities` includes `goal`.
+
+**Privacy:** every step sends a screenshot and the screen's text (labels, names)
+to Cloudflare Workers AI. Text supplied with `text` is typed on the phone, not sent.
+A screen with a password field is never sent; the goal stops instead. Enable this
+only where sending screen contents to Cloudflare is acceptable.
+
+## Request
+
+```json
+{"op":"goal","goal":"Open Instagram and view bill.epsilon's followers"}
+{"op":"goal","goal":"Message naughtybek from bill.epsilon's followers list","text":"See you at 5","approve":["communication"],"max_steps":14}
+```
+
+- `goal`: what should be on screen when done. Name things the screen shows
+  (`bill.epsilon`, not "Bill"). A single goal is optimized for its end state; when
+  the route matters, send ordered goals one request at a time.
+- `text`: typed with `set` (whole-field replacement) when a focused field needs it.
+- `approve`: risky effects the agent pre-approves: `communication`,
+  `social_action`, `purchase_install`, `permission_grant`. Default none.
+- `max_steps`: 1-30, default 14.
+
+The reply has no observation; observe separately when you need the screen.
+
+## Reply
+
+```json
+{"status":"action","dispatch":"acknowledged","acknowledged_substeps":3,"outcome":"needs_approval",
+ "reason":"communication","pending":{"target":"SNAPSHOT_ID:42","label":"Send","effect":"communication"},
+ "steps":[{"app":"com.burbn.instagram","action":"tap","label":"Message","confidence":0.97,
+           "risk":{"risky":0.02,"effect":"navigate"},"dispatch":"acknowledged"}],
+ "snapshot_id":"SNAPSHOT_ID","navigator_seconds":7.8}
+```
+
+`outcome`:
+
+- `done`: Clef judges the goal complete on screen. A judgment, not proof: check it.
+- `needs_approval`: the next tap's effect (`reason`) was not pre-approved; nothing
+  was tapped. `pending.target` is valid until your next observation: ask, then tap it
+  with `{"op":"tap","target":...}` or observe and decide yourself.
+- `escalate`: Clef or the loop stopped (`reason`): `permission_or_consent_prompt`
+  (never auto-answered), `low_confidence`, `nothing_on_screen_helps`,
+  `secure_field`, `text_needed`, `repeated_type`, `no_progress`,
+  `cannot_dismiss_overlay_safely`, `navigator_unavailable` (with a safe
+  `error.category`, e.g. `http_401`), `capture_failed`, `action_not_sent`,
+  `inspect_before_retry` (a write may have happened), `interrupted`.
+- `step_limit`: `max_steps` ran out.
+
+`dispatch` and `acknowledged_substeps` count inputs actually sent, as in every
+other operation; each step lists its own `dispatch`. Uncertain writes are never
+replayed. Taps use the step's snapshot ID, falling back to the element's center
+only when the ID no longer resolves to one control.
+
+## How a step works
+
+1. Wait until two screenshots 0.15 s apart match (at most 3 s), then read the AX source.
+2. Build candidates: on-screen controls and text, without scroll bars, keyboard keys,
+   empty containers, controls under the tab bar, keyboard or status bar, or text that
+   repeats its control's label.
+3. One Clef call asks five independent questions (next option, done, blocked,
+   progress, done with criteria). Code decides: a consent/permission prompt escalates;
+   progress >= 2.5 (or next = done with both done signals >= 0.7) is done; a tap
+   needs >= 0.35 combined probability on options under the same point.
+4. A tap gets a second call: would it send, post, follow, buy, call, delete or grant
+   something? Risky taps need approval unless their effect was pre-approved.
+
+Thresholds and question wording are in `src/openclaw_iphone/navigator.py`.
+Validated offline on 155 labeled screens from a dedicated iPhone (Instagram, App
+Store, Settings, system prompts): 98.1% of steps correct, 0 consent prompts acted
+on, the safety gate caught 19/19 risky taps with no false alarms on 117 safe ones.
+In lab runs through this controller a step took about 5 s, about 2.6 s of it in Clef.
