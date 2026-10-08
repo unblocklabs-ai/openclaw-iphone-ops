@@ -71,13 +71,20 @@ class WDAClient:
         return WDAStatus(url=self.url, payload=payload, ready=parse_ready(payload))
 
     def source(self, *, compact: bool = False, validate: bool = True) -> str:
+        # `visible` makes WDA ask the app about every node (~20 ms each, ~90% of a full read);
+        # compact callers judge visibility from bounds. `traits` is free and carries Selected.
         path = ("/source?format=xml&excluded_attributes="
-                "accessible,nativeAccessibilityElement,index,placeholderValue,traits,"
+                "visible,accessible,nativeAccessibilityElement,index,placeholderValue,"
                 "nativeFrame,minValue,maxValue,customActions,type") if compact else "/source"
         body = self._request(path)
         parsed = parse_json_bytes(body)
         if isinstance(parsed, dict):
             check_response(parsed, "/source")
+            own = self._session.identifier
+            if own is not None and parsed.get("sessionId", own) != own:
+                # WDA restarted or another client opened a session: either way it reset the
+                # idle/animation waits to 10s/2s. Reconnecting re-applies the zero settings.
+                raise WDATransportUnavailable("Native session expired.", category="session_lost", phase="response")
             value = parsed.get("value")
             if isinstance(value, str):
                 body = value.encode("utf-8")
@@ -223,8 +230,8 @@ class WDAClient:
             return element_identifier(self._json_request(f"/session/{session_id}/element/active").get("value"))
 
     def window_size(self) -> tuple[float, float]:
-        with self.session() as session_id:
-            value = self._json_request(f"/session/{session_id}/window/size").get("value")
+        # Sessionless, so a concurrent observation lane never touches the WDA session.
+        value = self._json_request("/window/size").get("value")
         if (not isinstance(value, dict) or any(type(value.get(k)) not in (int, float)
                 or not math.isfinite(value[k]) or value[k] <= 0 for k in ("width", "height"))):
             raise WDAUnavailable("Device window geometry is unavailable.")
@@ -253,6 +260,14 @@ class WDAClient:
             path = f"/session/{session_id}/element/{urllib.parse.quote(element_id, safe='')}/attribute/placeholderValue"
             value = self._json_request(path).get("value")
         return value if isinstance(value, str) and value else None
+
+    def element_displayed(self, element_id: str) -> bool:
+        """WDA's visibility verdict for one element (one AX query, unlike @visible in XPath)."""
+        with self.session() as session_id:
+            value = self._json_request(f"/session/{session_id}/element/{urllib.parse.quote(element_id, safe='')}/displayed").get("value")
+        if not isinstance(value, bool):
+            raise WDAReadUnavailable("Native element visibility unavailable.")
+        return value
 
     def element_type(self, element_id: str) -> str:
         with self.session() as session_id:

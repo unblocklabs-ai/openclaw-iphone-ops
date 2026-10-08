@@ -17,6 +17,7 @@ import time
 import unittest
 import zlib
 
+from openclaw_iphone.connection import Connection
 from openclaw_iphone.control_lock import control_lock
 from openclaw_iphone.errors import OpenClawIPhoneError, SessionOutputUnavailable
 from openclaw_iphone.protocol import JsonLineEmitter, read_requests
@@ -72,6 +73,10 @@ class PhoneServer(ThreadingHTTPServer):
         self.action_entered = threading.Event()
         self.release_action = threading.Event()
         self.source_delay = 0
+        self.image_delay = 0
+        self.lost_sources = 0
+        self.hidden = set()
+        self.stale = set()
         self.element_types = {"field": "XCUIElementTypeTextField", "wheel": "XCUIElementTypePickerWheel"}
         self.picker_values = ["One", "Two", "Three"]
         self.picker_index = 0
@@ -147,7 +152,10 @@ class PhoneHandler(BaseHTTPRequestHandler):
                 value = self.server.xml
             elif path == "/screenshot":
                 import base64
+                time.sleep(self.server.image_delay)
                 value = base64.b64encode(self.server.image).decode()
+            elif path.endswith("/displayed"):
+                value = path.split("/element/")[1].split("/")[0] not in self.server.hidden
             elif path.endswith("/window/size"):
                 value = self.server.size
             elif path.endswith("/elements"):
@@ -226,6 +234,11 @@ class PhoneHandler(BaseHTTPRequestHandler):
                 self.server.submit_count += sum(action.get("value") == "\ue007" and action["type"] == "keyDown"
                     for source in payload["actions"] for action in source["actions"])
             body = {"value": value}
+            if path == "/source" and self.server.lost_sources:
+                self.server.lost_sources -= 1  # As after a WDA restart: no active session.
+                body["sessionId"] = None
+            if path.endswith("/displayed") and path.split("/element/")[1].split("/")[0] in self.server.stale:
+                body, status = {"value": {"error": "stale element reference", "message": "gone"}}, 404
             if path in self.server.mutate_then_fail:
                 body, status = {"value": {"error": "unknown error", "message": "SERVER-PRIVATE"}}, 500
             if path == "/session" and self.command == "POST":
@@ -651,7 +664,7 @@ class SessionTests(unittest.TestCase):
             controls = ''.join(f'<XCUIElementTypeButton label="Option {i}" {attrs}/>' for i in range(35))
             controls += (f'<XCUIElementTypeButton {attrs}/><XCUIElementTypeTextField focused="true" {attrs}/>'
                          f'<XCUIElementTypeSwitch label="Airplane" value="1" {attrs}/>'
-                         f'<XCUIElementTypeButton label="Tab" selected="true" {attrs}/>')
+                         f'<XCUIElementTypeButton label="Tab" traits="Selected, Button" {attrs}/>')
             server.xml = (f'<XCUIElementTypeApplication bundleId="test.app" {attrs}>'
                 + f'<XCUIElementTypeOther {attrs}>' * 38 + rows + controls
                 + '</XCUIElementTypeOther>' * 38 + '</XCUIElementTypeApplication>')
@@ -710,17 +723,52 @@ class SessionTests(unittest.TestCase):
     def test_repeated_read_recovery_stays_pinned_and_refuses_replacement(self):
         with self.running() as (proc, server, base):
             for _ in range(3):
-                server.failures["/wda/activeAppInfo"] = 1
+                server.lost_sources = 1
                 self.assertIn("accessibility", self.request(proc, {"op": "observe"})["observation"])
             selectors = [json.loads(line) for line in (base / "selectors").read_text().splitlines()]
             self.assertEqual(selectors, ["physical"] * 4)
+            # Each new session re-applies the zero idle/animation waits a restarted WDA forgot.
+            settings = [p["settings"] for _, path, p in server.requests if path.endswith("/appium/settings")]
+            self.assertEqual(len(settings), server.sessions)
+            self.assertTrue(all(s["waitForIdleTimeout"] == 0 and s["animationCoolOffTimeout"] == 0 for s in settings))
+            self.assertFalse(any(path == "/wda/activeAppInfo" for _, path, _ in server.requests))
             old_sessions = server.sessions
             (base / "identity").write_text("replacement")
-            server.failures["/wda/activeAppInfo"] = 1
+            server.lost_sources = 1
             self.assertIn("accessibility_error", self.request(proc, {"op": "observe"})["observation"])
             self.assertEqual(self.request(proc, {"op": "press", "button": "home"})["dispatch"], "not_sent")
             self.assertEqual(server.sessions, old_sessions)
             self.assertFalse(any(path.endswith("/wda/pressButton") for _, path, _ in server.requests))
+            self.finish(proc, base)
+
+    def test_screen_capture_runs_both_lanes_at_once_and_xpath_targets_skip_hidden_matches(self):
+        with self.running(images=True) as (proc, server, base):
+            server.source_delay = server.image_delay = 0.3
+            started = time.monotonic()
+            view = self.request(proc, {"op": "observe"})["observation"]
+            self.assertLess(time.monotonic() - started, 0.55)
+            self.assertEqual(set(view), {"image", "accessibility"})
+            self.assertEqual(view["accessibility"]["app"], "test.app")
+            server.source_delay = server.image_delay = 0
+            self.assertEqual(self.request(proc, {"op": "tap", "target": view["accessibility"]["elements"][0]["id"]})["dispatch"], "acknowledged")
+            self.assertFalse(any(path == "/wda/activeAppInfo" for _, path, _ in server.requests))
+            server.elements, server.hidden, server.stale = ["gone", "one", "two"], {"one"}, {"gone"}
+            target = {"role": "XCUIElementTypeButton", "label": "Disconnect", "ancestor_label": "Work"}
+            self.assertEqual(self.request(proc, {"op": "tap", "target": target})["dispatch"], "acknowledged")
+            query = next(p["value"] for _, path, p in server.requests if path.endswith("/elements") and p["using"] == "xpath")
+            self.assertNotIn("@visible", query)
+            self.assertEqual(sum(path.endswith("/displayed") for _, path, _ in server.requests), 3)
+            self.assertTrue(any(path.endswith("/element/two/click") for _, path, _ in server.requests))
+            server.hidden = {"one", "two"}
+            self.assertEqual(self.request(proc, {"op": "tap", "target": target})["dispatch"], "not_sent")
+            self.finish(proc, base)
+
+    def test_masked_image_is_captured_before_the_source_read(self):
+        with self.running(images=True) as (proc, server, base):
+            self.request(proc, {"op": "observe", "mode": "both", "masks": [[0, 0, 4, 4]]})
+            routes = [path for _, path, _ in server.requests]
+            self.assertLess(max(routes.index("/screenshot"), next(i for i, r in enumerate(routes) if r.endswith("/window/size"))),
+                            routes.index("/source"))
             self.finish(proc, base)
 
     def test_image_only_masking_reusable_coordinates_and_optional_read_failure(self):
@@ -837,6 +885,20 @@ class SessionTests(unittest.TestCase):
             self.assertIn("image_error", result["observation"])
             self.assertEqual(list(base.rglob("*.png")), [])
             self.finish(proc, base)
+
+
+class ConnectionTests(unittest.TestCase):
+    def test_invalidate_ignores_a_late_failure_from_a_replaced_client(self):
+        connection = Connection(object())
+        old, current = object(), object()
+        connection.wda, connection.valid = current, True
+        connection.invalidate(old)
+        self.assertTrue(connection.valid)
+        connection.invalidate(current)
+        self.assertFalse(connection.valid)
+        connection.valid = True
+        connection.invalidate()
+        self.assertFalse(connection.valid)
 
 
 class ProtocolTests(unittest.TestCase):

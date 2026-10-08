@@ -55,8 +55,12 @@ class Selector:
             raise ValueError("Selector labels must be non-empty strings.")
 
     def xpath(self) -> str:
-        """Live predicate lookup, not a durable action reference."""
-        checks = ["@visible='true'", "@enabled='true'"]
+        """Live predicate lookup, not a durable action reference.
+
+        No @visible: in XPath it makes WDA compute visibility for every node. Callers
+        check visibility on the matches instead.
+        """
+        checks = ["@enabled='true'"]
         checks += [f"@{key}={xpath_literal(value)}" for key, value in
                    (("name", self.name), ("label", self.label)) if value is not None]
         if self.ancestor_label is not None:
@@ -66,10 +70,11 @@ class Selector:
     def locator(self) -> tuple[str, str]:
         if self.ancestor_label is not None:
             return "xpath", self.xpath()
-        checks = [f"type == {predicate_literal(self.role)}", "visible == 1", "enabled == 1"]
+        # AND short-circuits: visibility (one AX query per node) is asked only of matches.
+        checks = [f"type == {predicate_literal(self.role)}", "enabled == 1"]
         checks += [f"{key} == {predicate_literal(value)}" for key, value in
                    (("name", self.name), ("label", self.label)) if value is not None]
-        return "predicate string", " AND ".join(checks)
+        return "predicate string", " AND ".join(checks + ["visible == 1"])
 
 
 @dataclass(frozen=True)
@@ -106,12 +111,12 @@ class Element:
             parts = [step(role, [("name", name), ("label", label)])
                      for role, name, label in self.ancestors[1:]]
             parts.append(step(self.role, [("name", self.name), ("label", self.label),
-                                          ("visible", 1), ("enabled", 1)]))
+                                          ("enabled", 1), ("visible", 1)]))
             return "class chain", "/".join(parts)
-        checks = [f"type == {predicate_literal(self.role)}", "visible == 1", "enabled == 1"]
+        checks = [f"type == {predicate_literal(self.role)}", "enabled == 1"]
         checks += [f"{key} == {predicate_literal(value)}" for key, value in
                    (("name", self.name), ("label", self.label)) if value]
-        return "predicate string", " AND ".join(checks)
+        return "predicate string", " AND ".join(checks + ["visible == 1"])
 
 
 @dataclass(frozen=True)
@@ -149,7 +154,7 @@ class Observation:
                     continue
                 checks.append(f"@{key}={xpath_literal(value)}" if value else f"(not(@{key}) or @{key}='')")
             if index == len(parts) - 1:
-                checks.extend(["@visible='true'", "@enabled='true'"])
+                checks.append("@enabled='true'")
             if checks:
                 parts[index] += "[" + " and ".join(checks) + "]"
         return "xpath", "//" + "/".join(parts)
@@ -212,8 +217,8 @@ class Observation:
                 row["parent"] = parent
             if element.focused is not None:
                 row["focused"] = element.focused
-            if element.selected is not None:
-                row["selected"] = element.selected
+            if element.selected:
+                row["selected"] = True
             if element.role in CHECKABLE and (checked := boolean(element.value)) is not None:
                 row["checked"] = checked
             if include_labels and element.role != "XCUIElementTypeSecureTextField":
@@ -239,9 +244,22 @@ class Observation:
                 "values_included": False}
 
 
+def element_bounds(attrs: dict[str, str]) -> tuple[float, float, float, float] | None:
+    try:
+        bounds = tuple(float(attrs[key]) for key in ("x", "y", "width", "height"))
+    except (KeyError, ValueError):
+        return None
+    return bounds if all(math.isfinite(v) for v in bounds) and min(bounds[2:]) > 0 else None
+
+
 def parse_observation(source: str, *, generation: int, device_udid: str,
-                      app: str, captured_at: str, started: float, finished: float,
-                      process_id: int | None = None) -> Observation:
+                      captured_at: str, started: float, finished: float) -> Observation:
+    """The application root's bundleId/processId identify the app.
+
+    A source read without `visible` (see WDAClient.source(compact=True)) gets visibility from
+    geometry: on screen means the bounds overlap the application's frame. Content covered by a
+    sheet or a stacked screen then counts as visible; the screenshot shows what is on top.
+    """
     if len(source.encode("utf-8")) > 2_000_000 or "<!DOCTYPE" in source or "<!ENTITY" in source:
         raise ObservationRejected("Accessibility source exceeds safe parsing limits.")
     try:
@@ -249,14 +267,17 @@ def parse_observation(source: str, *, generation: int, device_udid: str,
     except ET.ParseError as exc:
         raise ObservationRejected("Invalid accessibility XML.") from exc
     application = root[0] if root.tag == "AppiumAUT" and len(root) == 1 else root
+    screen = app = process_id = None
     if application.tag == "XCUIElementTypeApplication":
-        bundle = application.get("bundleId")
-        if bundle is not None and bundle != app:
-            raise ObservationRejected("Accessibility source contradicts foreground app identity.")
+        app = application.get("bundleId")
         pid = application.get("processId")
-        if pid is not None and (len(pid) > 20 or not pid.isascii() or not pid.isdecimal() or
-                                int(pid) <= 0 or process_id is not None and int(pid) != process_id):
-            raise ObservationRejected("Accessibility source contradicts foreground process identity.")
+        if pid is not None and (len(pid) > 20 or not pid.isascii() or not pid.isdecimal() or int(pid) <= 0):
+            raise ObservationRejected("Accessibility source has an invalid process identity.")
+        if pid is not None:
+            process_id = int(pid)
+        screen = element_bounds(application.attrib)
+    if not app:
+        raise ObservationRejected("Foreground app identity is unavailable.")
     snapshot_id = uuid.uuid4().hex[:12]
     elements: list[Element] = []
     secure = False
@@ -273,16 +294,15 @@ def parse_observation(source: str, *, generation: int, device_udid: str,
         secure |= is_secure  # Even a hidden secure field prevents cloud inference.
         name, label = (None, None) if is_secure else (attrs.get("name"), attrs.get("label"))
         value = None if is_secure else attrs.get("value")
-        try:
-            bounds = tuple(float(attrs[key]) for key in ("x", "y", "width", "height"))
-            if not all(math.isfinite(v) for v in bounds) or min(bounds[2:]) <= 0:
-                bounds = None
-        except (KeyError, ValueError):
-            bounds = None
+        bounds = element_bounds(attrs)
+        visible = boolean(attrs.get("visible"))
+        if "visible" not in attrs and screen is not None:
+            visible = bounds is not None and (bounds[0] < screen[0] + screen[2] and screen[0] < bounds[0] + bounds[2]
+                                              and bounds[1] < screen[1] + screen[3] and screen[1] < bounds[1] + bounds[3])
+        selected = "Selected" in (attrs.get("traits") or "").split(", ")
         elements.append(Element(f"{snapshot_id}:{len(elements)}", role, name, label, value,
-                                boolean(attrs.get("visible")), boolean(attrs.get("enabled")),
-                                boolean(attrs.get("focused")), bounds, ancestors, path,
-                                boolean(attrs.get("selected"))))
+                                visible, boolean(attrs.get("enabled")),
+                                boolean(attrs.get("focused")), bounds, ancestors, path, selected))
         siblings: dict[str, int] = {}
         for child in node:
             siblings[child.tag] = siblings.get(child.tag, 0) + 1

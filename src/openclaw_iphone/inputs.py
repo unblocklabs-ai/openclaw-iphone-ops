@@ -138,7 +138,7 @@ def month_number(value: str, month_values: list[str] | None) -> int | None:
     return number if number is not None and 1 <= number <= 12 else None
 
 
-WHEELS = "**/XCUIElementTypePickerWheel[`visible == 1 AND enabled == 1`]"
+WHEELS = "**/XCUIElementTypePickerWheel[`enabled == 1 AND visible == 1`]"
 
 
 def date_components(wda: WDAClient, ref: str | None, components: dict | None,

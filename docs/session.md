@@ -47,10 +47,15 @@ Hold onto the process across the workflow. Don't recreate it after each step.
   otherwise AX only. Explicit `mode` still selects either independently.
   `image` and coordinate `swipe`/`tap` do
   not require accessibility. `both` reports each component independently.
-  Combined capture is image-first so failed/slow AX cannot starve the image.
-  Each capture has its own timestamp; these are sequential, not atomic.
+  The image and AX captures run concurrently (masked images are captured first,
+  since masking reads `/window/size` on the source queue), so failed/slow AX
+  cannot starve the image. Each capture has its own timestamp; they are not an atomic pair.
 - AX shows readable content and controls, including unnamed controls, their
-  bounds, enabled/focus/selection state and short snapshot-local IDs. Empty
+  bounds, enabled/selection state and short snapshot-local IDs. On-screen means
+  the bounds overlap the screen: WDA's per-element visibility verdict costs about
+  20 ms per element, so it is not read. Content covered by a sheet or a stacked
+  screen is therefore listed; the screenshot shows what is on top. The app and
+  process come from the source's application root. Empty
   layout wrappers and duplicate container text are collapsed. `parent` links
   preserve meaningful groups (for example, which account owns a button).
   Full paths and native ancestors stay internal for locating the target.
@@ -75,8 +80,10 @@ Hold onto the process across the workflow. Don't recreate it after each step.
   element. Ambiguity returns current candidates with their meaningful groups.
   Snapshot IDs come from the last
   AX observation; they resolve current identity and ancestor context, not stored
-  coordinates or value. New observations replace the ID map. Cross-app ID use
-  is rejected; ordinary app transitions do not change session permissions.
+  coordinates or value. New observations replace the ID map. IDs are not
+  checked against the foreground app (that read costs 0.12 s per tap); after an
+  app switch, observe again, because a control with the same role, names and
+  ancestors in the new app would match.
   Otherwise indistinguishable IDs use their exact captured hierarchy position,
   not geometry. A same-app reorder can change positional intent: observe again
   when the list changes. Named, unique controls still use semantic identity.
@@ -159,7 +166,7 @@ Hold onto the process across the workflow. Don't recreate it after each step.
   read at request time; symlinks and oversized files are rejected. One trailing
   newline is removed. Paths, text, and exception bodies are never echoed.
   AX text values are omitted; known Boolean checkbox/switch state is returned as
-  `checked`, and native selection as `selected`. Secure fields' names/labels are omitted; supplied
+  `checked`, and the native Selected trait as `selected: true`. Secure fields' names/labels are omitted; supplied
   input is suppressed in subsequent label projections. Images require separate
   disclosure approval and explicit masks where needed.
 
@@ -177,8 +184,10 @@ Inspect before retrying uncertain input. The session never replays writes or
 permanently blocks subsequent deliberate requests. A safe read can reconnect
 and retry once per request on the same pinned physical UDID; another read may
 recover again. Source-specific deadlines, malformed AX and read protocol errors
-do not recreate the session. Genuine transport/session loss may reconnect. It
-never switches devices, unlocks, restarts WDA or broadens
+do not recreate the session. Genuine transport/session loss may reconnect. An AX
+read whose reply shows WDA no longer holds this session (WDA restarted, or another
+client opened one and reset WDA's idle/animation waits to 10 s/2 s) counts as
+session loss: the new session re-applies zero waits. It never switches devices, unlocks, restarts WDA or broadens
 app/account permissions automatically. A changed physical identity rejects the
 request without dispatch.
 

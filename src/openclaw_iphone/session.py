@@ -1,8 +1,10 @@
 """Direct controls. The caller decides what to do and whether it worked."""
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from contextlib import contextmanager, nullcontext
+from itertools import islice
 import math
 import os
 from pathlib import Path
@@ -12,7 +14,7 @@ import time
 from typing import Callable, TypeVar
 
 from .connection import Connection
-from .errors import OpenClawIPhoneError, WDAOutcomeUnknown, WDAUnavailable, WDATransportUnavailable, diagnostic
+from .errors import OpenClawIPhoneError, WDAOutcomeUnknown, WDAStaleElement, WDAUnavailable, WDATransportUnavailable, diagnostic
 from .execution import Budget
 from .evidence import artifact_path, write_private
 from .image_evidence import redact_png
@@ -61,10 +63,11 @@ class Session:
     def _read(self, read: Callable[[WDAClient], T]) -> T:
         """One safe retry per read; no lifetime recovery allowance."""
         for attempt in range(2):
+            wda = self.connection.require_active()
             try:
-                return read(self.connection.require_active())
+                return read(wda)
             except WDATransportUnavailable:
-                self.connection.invalidate()
+                self.connection.invalidate(wda)
                 if attempt:
                     raise
         raise AssertionError("Unreachable read retry state.")
@@ -79,11 +82,11 @@ class Session:
                                          ids=self.candidate_ids if candidates else None)
         def capture(wda: WDAClient) -> Observation:
             started = time.monotonic()
-            app = wda.active_app()
             xml = wda.source(compact=True, validate=False)
+            # The application root names the app and process; no separate activeAppInfo read.
             return parse_observation(xml, generation=0, device_udid=self.connection.device.udid,
-                                     app=app["bundleId"], captured_at=datetime.now(timezone.utc).isoformat(),
-                                     started=started, finished=time.monotonic(), process_id=app.get("pid"))
+                                     captured_at=datetime.now(timezone.utc).isoformat(),
+                                     started=started, finished=time.monotonic())
         self.snapshot = None
         self.candidate_ids = None
         self.snapshot = self._read(capture)
@@ -114,14 +117,17 @@ class Session:
                 "processing_seconds": time.monotonic() - captured}
 
     def _observe(self, mode: str, masks: list, *, limit: int, offset: int, candidates: bool = False) -> dict[str, object]:
-        result: dict[str, object] = {}
+        lanes = {name: capture for name, capture in (("image", lambda: self._image(masks)), ("accessibility", lambda: self._accessibility(limit=limit, offset=offset, candidates=candidates)))
+                 if mode in (name, "both")}
         # A slow AX lane cannot starve a healthy image fallback. Captures are
-        # independent and timestamped, not an atomic screen pair.
-        for name, capture in (("image", lambda: self._image(masks)), ("accessibility", lambda: self._accessibility(limit=limit, offset=offset, candidates=candidates))):
-            if mode not in (name, "both"):
-                continue
+        # independent and timestamped, not an atomic screen pair, so both run at once.
+        # Masking reads /window/size, which shares /source's queue, so masked images go first.
+        with ThreadPoolExecutor(max_workers=1 if masks else len(lanes)) as pool:
+            futures = {name: pool.submit(capture) for name, capture in lanes.items()}
+        result: dict[str, object] = {}
+        for name, future in futures.items():
             try:
-                result[name] = capture()
+                result[name] = future.result()
             except (OpenClawIPhoneError, OSError, ValueError, TypeError, OverflowError, RecursionError) as exc:
                 result[name + "_error"] = diagnostic(exc)
         return result
@@ -132,14 +138,22 @@ class Session:
             matches = [e for e in self.snapshot.elements or () if e.id == target] if self.snapshot else []
             if len(matches) != 1:
                 raise TargetUnavailable([])
-            element = matches[0]
-            if self._read(lambda w: w.active_app())["bundleId"] != self.snapshot.app:
-                raise TargetUnavailable([])
-            using, query = self.snapshot.locator(element)
+            using, query = self.snapshot.locator(matches[0])
         else:
             selector = Selector(**target)
             using, query = selector.locator()
-        refs = self._read(lambda w: w.find_elements(query, using=using))
+        def lookup(wda: WDAClient) -> list[NativeElement]:
+            refs = wda.find_elements(query, using=using)
+            if using != "xpath":
+                return refs
+            # XPath queries leave out @visible (a full visibility pass); ask about the matches only.
+            def displayed(ref: NativeElement) -> bool:
+                try:
+                    return wda.element_displayed(ref.ref)
+                except WDAStaleElement:
+                    return False
+            return list(islice(filter(displayed, refs), 2))
+        refs = self._read(lookup)
         if len(refs) != 1:
             self._accessibility()
             ids = None
