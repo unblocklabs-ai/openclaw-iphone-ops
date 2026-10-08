@@ -100,10 +100,12 @@ class Session:
         started = time.monotonic()
         try:
             observation = capture(depth)
-        except (WDAStaleElement, WDATransportUnavailable):
-            # A full read that ran long and then failed (the tree kept changing, or the deadline passed) is the
-            # slow-app signature: remember the app and read it shallow instead of repeating the full read.
-            if depth == shallow.DEPTH or self.app_hint is None or time.monotonic() - started < shallow.SLOW_SECONDS:
+        except (WDAStaleElement, WDAUnavailable) as exc:
+            # A full read that ran long and then failed because the tree kept changing or the deadline passed is
+            # the slow-app signature: remember the app and read it shallow instead of repeating the full read.
+            # Lost sessions and reconnects are not: they re-raise as before.
+            slow = isinstance(exc, WDAStaleElement) or getattr(exc, "category", None) == "deadline"
+            if not slow or depth == shallow.DEPTH or self.app_hint is None or time.monotonic() - started < shallow.SLOW_SECONDS:
                 raise
             self._remember_shallow(self.app_hint)
             observation = capture(depth := shallow.DEPTH)
