@@ -167,7 +167,9 @@ and signing expiry still require operator attention.
 
 The installers pre-create owner-only logs and both plists set umask `077`.
 Existing logs are preserved and restricted, not erased. Configure host-local
-rotation/retention; neither logs nor evidence are automatically pruned. The
+rotation/retention; neither logs nor evidence are automatically pruned. Routine
+device checks (each watchdog pass, each session start) keep no files; only
+commands that print an `evidence:` path, and session screenshots, write evidence. The
 watchdog and foreground CLI mutations use one per-user control lock; busy
 watchdog passes exit without device actions.
 

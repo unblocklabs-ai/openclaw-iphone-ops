@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import tempfile
 import unittest
 
 from pathlib import Path
@@ -94,6 +96,28 @@ class DeviceCtlJsonTests(unittest.TestCase):
             client.find_app("phone", "insta")
         for call in client.list_apps.call_args_list:
             self.assertEqual(call.args, ("phone",))
+
+    def test_devicectl_json_is_kept_only_when_the_caller_shows_it(self) -> None:
+        class Runner:
+            def __init__(self) -> None:
+                self.outputs: list[Path] = []
+
+            def run(self, command: list[str]) -> None:
+                output = Path(command[command.index("--json-output") + 1])
+                output.write_text(json.dumps({"result": {"devices": [{"identifier": "core", "deviceProperties": {"name": "phone"}}]}}))
+                self.outputs.append(output)
+
+        with tempfile.TemporaryDirectory() as evidence:
+            client = DeviceCtl(evidence_base=evidence)
+            client.runner = Runner()
+            devices, output = client.list_devices()
+            self.assertEqual(([d.identifier for d in devices], output), (["core"], None))
+            self.assertFalse(client.runner.outputs[-1].exists())
+            self.assertFalse(client.runner.outputs[-1].parent.exists())  # routine checks leave no folder behind
+            self.assertEqual(list(Path(evidence).iterdir()), [])
+            devices, output = client.list_devices(keep=True)
+            self.assertEqual(output, client.runner.outputs[-1])
+            self.assertTrue(output.exists() and output.is_relative_to(evidence))
 
     def test_url_host_wraps_ipv6_for_urls(self) -> None:
         self.assertEqual(url_host("fdaa:8372:5daf::1"), "[fdaa:8372:5daf::1]")

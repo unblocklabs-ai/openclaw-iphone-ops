@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import tempfile
 from typing import Any
 
 from .errors import AppNotFound, DeviceSelectionError
@@ -46,21 +47,29 @@ class DeviceCtl:
         self.runner = Runner(env=env, timeout=timeout)
         self.evidence_base = evidence_base
 
-    def list_devices(self) -> tuple[list[Device], Path]:
-        data, output = self._json(["list", "devices"], "devices")
+    def list_devices(self, *, keep: bool = False) -> tuple[list[Device], Path | None]:
+        data, output = self._json(["list", "devices"], "devices", keep=keep)
         devices = [_device_from_json(item) for item in find_list(data, "devices")]
         return devices, output
 
-    def device_details(self, device_id: str) -> tuple[dict[str, Any], Path]:
-        return self._json(["device", "info", "details", "--device", device_id], "device-details")
+    def device_details(self, device_id: str, *, keep: bool = False) -> tuple[dict[str, Any], Path | None]:
+        return self._json(["device", "info", "details", "--device", device_id], "device-details", keep=keep)
 
-    def _json(self, arguments: list[str], name: str) -> tuple[dict[str, Any], Path]:
-        output = artifact_path(name, base=self.evidence_base)
-        self.runner.run(["xcrun", "devicectl", *arguments, "--json-output", str(output)])
-        return read_json(output), output
+    def _json(self, arguments: list[str], name: str, *, keep: bool) -> tuple[dict[str, Any], Path | None]:
+        """devicectl's JSON output is kept as evidence only when the caller shows its path (`keep`); otherwise it is
+        read from a private temporary directory that is removed, so routine checks (every watchdog pass, every
+        session start) leave nothing behind."""
+        if keep:
+            output = artifact_path(name, base=self.evidence_base)
+            self.runner.run(["xcrun", "devicectl", *arguments, "--json-output", str(output)])
+            return read_json(output), output
+        with tempfile.TemporaryDirectory(prefix="openclaw-iphone-devicectl-") as scratch:
+            output = Path(scratch) / f"{name}.json"
+            self.runner.run(["xcrun", "devicectl", *arguments, "--json-output", str(output)])
+            return read_json(output), None
 
-    def coredevice_wda_url(self, device_id: str, *, port: int = 8100) -> tuple[str, Path]:
-        data, output = self.device_details(device_id)
+    def coredevice_wda_url(self, device_id: str, *, port: int = 8100, keep: bool = False) -> tuple[str, Path | None]:
+        data, output = self.device_details(device_id, keep=keep)
         result = data.get("result", {})
         if not isinstance(result, dict):
             raise DeviceSelectionError("CoreDevice details response did not include a result object.")
@@ -118,10 +127,10 @@ class DeviceCtl:
             f"or pass --device where supported. Candidates: {names}"
         )
 
-    def lock_state(self, device_id: str) -> tuple[dict[str, Any], Path]:
-        return self._json(["device", "info", "lockState", "--device", device_id], "lock-state")
+    def lock_state(self, device_id: str, *, keep: bool = False) -> tuple[dict[str, Any], Path | None]:
+        return self._json(["device", "info", "lockState", "--device", device_id], "lock-state", keep=keep)
 
-    def list_apps(self, device_id: str, *, include_all: bool = True) -> tuple[list[App], Path]:
+    def list_apps(self, device_id: str, *, include_all: bool = True, keep: bool = False) -> tuple[list[App], Path | None]:
         command = [
             "device",
             "info",
@@ -131,7 +140,7 @@ class DeviceCtl:
         ]
         if include_all:
             command.append("--include-all-apps")
-        data, output = self._json(command, "apps")
+        data, output = self._json(command, "apps", keep=keep)
         result = data.get("result")
         entries = result.get("apps") if isinstance(result, dict) else None
         if not isinstance(entries, list) or any(not isinstance(item, dict) for item in entries):

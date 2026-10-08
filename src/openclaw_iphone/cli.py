@@ -243,7 +243,7 @@ def device_selector_from_args(args: argparse.Namespace, *, config: IPhoneConfig 
     return config.device
 
 def handle_devices_list(args: argparse.Namespace) -> int:
-    devices, artifact = client_from_args(args).list_devices()
+    devices, artifact = client_from_args(args).list_devices(keep=True)
     for device in devices:
         print(f"{device.name}\t{device.identifier}\t{device.state}\t{device.model}")
     print(f"evidence: {artifact}")
@@ -263,7 +263,7 @@ def handle_doctor(args: argparse.Namespace) -> int:
     print(f"device: {device.name} ({device.identifier})")
 
     try:
-        lock_data, lock_artifact = client.lock_state(device.identifier)
+        lock_data, lock_artifact = client.lock_state(device.identifier, keep=True)
     except (OpenClawIPhoneError, ValueError) as exc:
         print("passcode-required: unknown")
         print("result: lock-state-failed")
@@ -413,7 +413,7 @@ def runtime_provenance(config: IPhoneConfig) -> dict[str, str]:
 def handle_apps_list(args: argparse.Namespace) -> int:
     client = client_from_args(args)
     device = selected_device(args, client)
-    apps, artifact = client.list_apps(device.identifier, include_all=not args.no_all)
+    apps, artifact = client.list_apps(device.identifier, include_all=not args.no_all, keep=True)
     for app in apps:
         print(f"{app.name}\t{app.bundle_identifier}\t{app.version}\t{app.bundle_version}")
     print(f"evidence: {artifact}")
@@ -463,7 +463,7 @@ def handle_wda_status(args: argparse.Namespace) -> int:
 def handle_wda_url(args: argparse.Namespace) -> int:
     client = client_from_args(args)
     device = selected_device(args, client)
-    url, artifact = client.coredevice_wda_url(device.identifier, port=args.port)
+    url, artifact = client.coredevice_wda_url(device.identifier, port=args.port, keep=True)
     print(f"url: {url}")
     print(f"device: {device.name} ({device.identifier})")
     print(f"evidence: {artifact}")
@@ -486,7 +486,7 @@ def handle_wda_unlock(args: argparse.Namespace) -> int:
     if locked is not None:
         print(f"wda-locked: {str(locked).lower()}")
     if args.verify:
-        data, artifact = client.lock_state(device.identifier)
+        data, artifact = client.lock_state(device.identifier, keep=True)
         passcode_required = passcode_required_from_lock_state(data)
         print(f"passcode-required: {bool_value(passcode_required)}")
         print(f"evidence: {artifact}")
@@ -558,7 +558,7 @@ def handle_watchdog_once(args: argparse.Namespace) -> int:
     passcode_required = None
     if not args.no_verify:
         try:
-            data, artifact = client.lock_state(device.identifier)
+            data, artifact = client.lock_state(device.identifier, keep=True)
         except (OpenClawIPhoneError, ValueError) as exc:
             print("passcode-required: unknown")
             print("result: lock-state-failed")

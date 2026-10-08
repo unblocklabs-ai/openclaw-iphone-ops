@@ -31,10 +31,10 @@ class FakeDeviceCtl:
             udid="physical-udid",
         )
 
-    def coredevice_wda_url(self, device_id: str, *, port: int = 8100) -> tuple[str, Path]:
+    def coredevice_wda_url(self, device_id: str, *, port: int = 8100, keep: bool = False) -> tuple[str, Path]:
         return (f"http://[fdaa::1]:{port}", Path("/tmp/device-details.json"))
 
-    def lock_state(self, device_id: str) -> tuple[dict, Path]:
+    def lock_state(self, device_id: str, *, keep: bool = False) -> tuple[dict, Path]:
         if self.lock_state_error:
             raise self.lock_state_error
         return self.lock_state_payload, Path("/tmp/lock-state.json")
