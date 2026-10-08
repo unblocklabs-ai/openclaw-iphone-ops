@@ -21,6 +21,7 @@
     "snippets/launchd/*.sh",
     "snippets/launchd/*.plist.template",
     "docs/session.md",
+    "docs/goal.md",
     "docs/mechanics.md",
     "docs/troubleshooting.md",
     "docs/launchagent-service.md",

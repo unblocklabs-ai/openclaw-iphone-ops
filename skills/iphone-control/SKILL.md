@@ -12,7 +12,8 @@ when an installed operator workflow is inconvenient.
 
 Read [the session protocol](../../docs/session.md), then retain **one** `session`
 process and its pipes across requests. The agent chooses actions and judges
-completion. No task file, grants, second model, quota or reconciliation step.
+completion. No task file, grants, quota or reconciliation step, and no second
+model unless the operator enabled goal navigation.
 
 - `observe` returns AX and a screenshot when `--allow-images` is enabled,
   otherwise AX only. Choose an explicit mode when only one is needed. AX shows
@@ -45,6 +46,12 @@ completion. No task file, grants, second model, quota or reconciliation step.
 - Optional `launch.wait_seconds` checks foreground before capture. Optional
   `set.verify` reads back the requested value; `type.verify` compares whole-field replacement privately, returning only
   match/mismatch/unknown. Neither adds mandatory verification or blind retries.
+- If `ready.capabilities` includes `goal`, the operator enabled Clef goal
+  navigation ([goal navigation](../../docs/goal.md)): `goal` runs several steps
+  toward a goal you name and returns `done`, `escalate` or `needs_approval`.
+  Pre-approve only the effects the user asked for (`approve`), check `done`
+  yourself, and handle approvals and escalations directly. It sends screenshots and
+  screen text to Cloudflare. Without the capability, you choose every action.
 - Inspect unknown/partial outcomes before retrying. The session never replays
   writes; uncertainty does not block subsequent deliberate requests.
 - `close`/EOF releases ownership; exit 0 says nothing about task achievement.

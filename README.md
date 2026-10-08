@@ -2,7 +2,8 @@
 
 A small Python controller for a dedicated USB-connected physical iPhone.
 The agent plans and judges results; this package owns the phone connection and
-executes direct WebDriverAgent controls. No second model or runtime dependencies.
+executes direct WebDriverAgent controls. No runtime dependencies, and no second
+model unless optional goal navigation is enabled.
 
 Use one persistent `session` for observation, taps, swipes, desired-value inputs
 and app transitions. `set` fills text, a native wheel date, a picker option or a
@@ -52,6 +53,15 @@ completion verdicts, mandatory readbacks, or reconciliation permissions. Unknown
 writes are never replayed automatically. The caller may inspect and choose a
 subsequent action. Optional observation failure does not erase acknowledgment.
 
+## Optional goal navigation
+
+Hosts can enable a `goal` operation that hands multi-step navigation to
+Cloudflare's Clef model: the agent names a goal, the session taps, types and
+scrolls until it looks done, stopping for consent prompts, low confidence and
+risky taps the agent hasn't pre-approved. It is off unless
+`OPENCLAW_IPHONE_CLEF_ENABLED` and Cloudflare credentials are set, and it sends
+screenshots and screen text to Cloudflare. See [goal navigation](docs/goal.md).
+
 ## Diagnosis and setup
 
 ```sh
@@ -68,6 +78,7 @@ and recovery.
 Close the session before separate mutating commands.
 
 - [Service setup](docs/launchagent-service.md)
+- [Goal navigation](docs/goal.md) (optional)
 - [Mechanics](docs/mechanics.md) and [troubleshooting](docs/troubleshooting.md)
 - [Supervised App Store installation](docs/app-store-installs.md)
 

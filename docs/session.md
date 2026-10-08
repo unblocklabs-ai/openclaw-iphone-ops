@@ -40,8 +40,12 @@ Hold onto the process across the workflow. Don't recreate it after each step.
 {"op":"launch","bundle_id":"com.apple.mobilesafari","observe":"image"}
 {"op":"launch","bundle_id":"com.apple.mobilesafari","wait_seconds":2,"observe":"image"}
 {"op":"open_url","url":"https://example.com","observe":"accessibility"}
+{"op":"goal","goal":"Open Settings and show Wi-Fi","approve":[]}
 {"op":"close"}
 ```
+
+`goal` exists only when `ready.capabilities` includes it: optional Clef goal
+navigation, enabled in host config. See [goal navigation](goal.md).
 
 - `observe` returns a screen: AX plus a screenshot when `--allow-images` is set,
   otherwise AX only. Explicit `mode` still selects either independently.
