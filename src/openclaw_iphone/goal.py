@@ -1,7 +1,7 @@
-"""Optional goal navigation: Clef picks each step, the session performs it. Off unless configured.
+"""Optional goal navigation: OpenAI's Decisions API (gpt-6-luna) picks each step, the session performs it. Off unless
+configured.
 
-Each step's screenshot and on-screen text go to Cloudflare Workers AI. Screens with a secure
-(password) field are never sent.
+Each step's screenshot and on-screen text go to OpenAI. Screens with a secure (password) field are never sent.
 """
 from __future__ import annotations
 
@@ -9,14 +9,15 @@ import base64
 from collections import Counter
 import hashlib
 import json
+import os
 from pathlib import Path
+import re
 import struct
 import subprocess
 import tempfile
 import time
-from typing import Callable
+from typing import Callable, Mapping
 import urllib.error
-import urllib.parse
 import urllib.request
 
 from . import navigator
@@ -24,48 +25,99 @@ from .config import IPhoneConfig
 from .errors import OpenClawIPhoneError, diagnostic
 from .inputs import validate_text
 
-CLOUDFLARE_API = "https://api.cloudflare.com/client/v4"
+OPENAI_API = "https://api.openai.com/v1"
+MODEL = "gpt-6-luna"
+RETRIES = 2
+UNEXPANDED = re.compile(r"\$\{?[A-Za-z_][A-Za-z0-9_]*\}?")  # a $VAR reference whose variable was not set
+NO_KEY = ("no OpenAI API key: run `openclaw-iphone goal setup --key-stdin` or `--key-file PATH`, "
+          "or export OPENAI_API_KEY")
+CHECK = {"input": "The sky is blue.",  # `goal check`: proves key and access without any screen data
+         "questions": [{"type": "predicate", "name": "check", "instructions": "Is this sentence about the sky?"}]}
 DEFAULT_STEPS, MAX_STEPS = 14, 30
 TYPED = "typed the supplied text"
 
 
-class Clef:
-    """Cloudflare Workers AI `@cf/cloudflare/clef`."""
+class Decisions:
+    """POST /v1/decisions: typed answers to the navigator's questions."""
 
-    def __init__(self, account_id: str, token: str, *, base_url: str = CLOUDFLARE_API, timeout: float = 30) -> None:
-        self.url = f"{base_url.rstrip('/')}/accounts/{urllib.parse.quote(account_id, safe='')}/ai/run/@cf/cloudflare/clef"
-        self.token, self.timeout = token, timeout
+    def __init__(self, api_key: str, *, base_url: str = OPENAI_API, timeout: float = 30) -> None:
+        self.url = f"{base_url.rstrip('/')}/decisions"
+        self.api_key, self.timeout = api_key, timeout
 
     def ask(self, body: dict) -> dict:
-        request = urllib.request.Request(self.url, data=json.dumps(dict(body, model="clef")).encode(), method="POST",
-                                         headers={"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"})
+        data = json.dumps(dict(body, model=MODEL)).encode()
+        for attempt in range(RETRIES + 1):  # asking has no side effects: rate limits and server errors are retried
+            request = urllib.request.Request(self.url, data=data, method="POST",
+                                             headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    return navigator.answers(json.load(response))
+            except urllib.error.HTTPError as exc:
+                exc.close()
+                if (exc.code == 429 or exc.code >= 500) and attempt < RETRIES:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                raise navigator.Unavailable("The Decisions API refused the request.", category=f"http_{exc.code}") from None
+            except OSError as exc:
+                raise navigator.Unavailable("The Decisions API is unreachable.", category="unreachable") from exc
+            except ValueError as exc:
+                raise navigator.Unavailable("The Decisions API reply is not JSON.") from exc
+
+
+def enabled(config: IPhoneConfig) -> bool:
+    return (config.get("OPENCLAW_IPHONE_GOAL_ENABLED") or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def read_key_file(path: Path) -> str | None:
+    """A bare key, or the value of an OPENAI_API_KEY= line (so an existing .env file can be pointed at)."""
+    text = path.read_text(encoding="utf-8")
+    for line in text.splitlines():
+        name, equals, value = line.strip().removeprefix("export ").partition("=")
+        if equals and name.strip() in {"OPENAI_API_KEY", "OPENCLAW_IPHONE_OPENAI_API_KEY"}:
+            return value.strip().strip("'\"") or None
+    token = text.strip()
+    return token if token and not any(c.isspace() for c in token) else None
+
+
+def api_key(config: IPhoneConfig, env: Mapping[str, str] | None = None) -> tuple[str | None, str]:
+    """The OpenAI API key and where it came from (never the key itself), first match wins:
+    OPENCLAW_IPHONE_OPENAI_API_KEY, the file named by OPENCLAW_IPHONE_OPENAI_API_KEY_FILE, then OPENAI_API_KEY."""
+    env = os.environ if env is None else env
+    def loose(path: Path | None) -> str:
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                data = json.load(response)
-        except urllib.error.HTTPError as exc:
-            exc.close()
-            raise navigator.Unavailable("Clef refused the request.", category=f"http_{exc.code}") from None
-        except OSError as exc:
-            raise navigator.Unavailable("Clef unreachable.", category="unreachable") from exc
-        except ValueError as exc:
-            raise navigator.Unavailable("Clef reply is not JSON.") from exc
-        if not isinstance(data, dict) or data.get("success") is not True or not isinstance(data.get("result"), dict):
-            raise navigator.Unavailable("Clef returned no answers.")
-        return data["result"]
+            return " (readable by others: chmod 600)" if path and path.stat().st_mode & 0o077 else ""
+        except OSError:
+            return ""
+    value = (config.get("OPENCLAW_IPHONE_OPENAI_API_KEY") or "").strip()
+    if value and not UNEXPANDED.fullmatch(value):
+        if env.get("OPENCLAW_IPHONE_OPENAI_API_KEY"):
+            return value, "OPENCLAW_IPHONE_OPENAI_API_KEY in the environment"
+        return value, f"OPENCLAW_IPHONE_OPENAI_API_KEY in {config.path}{loose(config.path)}"
+    if config.get("OPENCLAW_IPHONE_OPENAI_API_KEY_FILE"):
+        path = Path(config.get("OPENCLAW_IPHONE_OPENAI_API_KEY_FILE")).expanduser()
+        try:
+            key = read_key_file(path)
+        except (OSError, UnicodeDecodeError):
+            return None, f"key file {path} is unreadable"
+        return (key, f"key file {path}{loose(path)}") if key else (None, f"no key found in {path}")
+    if (env.get("OPENAI_API_KEY") or "").strip():
+        return env["OPENAI_API_KEY"].strip(), "OPENAI_API_KEY in the environment"
+    return None, NO_KEY
 
 
-def goal_navigation(config: IPhoneConfig) -> str:
-    """off, on, or incomplete (enabled without an account ID and API token)."""
-    if (config.get("OPENCLAW_IPHONE_CLEF_ENABLED") or "").strip().lower() not in {"1", "true", "yes", "on"}:
+def goal_navigation(config: IPhoneConfig, env: Mapping[str, str] | None = None) -> str:
+    """For doctor: off, on (model and where the key comes from), or incomplete (what is missing)."""
+    if not enabled(config):
         return "off"
-    return "on" if config.get("OPENCLAW_IPHONE_CLEF_ACCOUNT_ID") and config.get("OPENCLAW_IPHONE_CLEF_API_TOKEN") else "incomplete"
+    key, source = api_key(config, env)
+    return f"on ({MODEL} via OpenAI's Decisions API; key: {source})" if key else f"incomplete ({source})"
 
 
-def clef_from_config(config: IPhoneConfig) -> Clef | None:
-    if goal_navigation(config) != "on":
+def decisions_from_config(config: IPhoneConfig, env: Mapping[str, str] | None = None) -> Decisions | None:
+    key = api_key(config, env)[0] if enabled(config) else None
+    if key is None:
         return None
-    return Clef(config.get("OPENCLAW_IPHONE_CLEF_ACCOUNT_ID"), config.get("OPENCLAW_IPHONE_CLEF_API_TOKEN"),
-                base_url=config.get("OPENCLAW_IPHONE_CLEF_BASE_URL") or CLOUDFLARE_API)
+    return Decisions(key, base_url=config.get("OPENCLAW_IPHONE_OPENAI_BASE_URL") or OPENAI_API)
 
 
 def jpeg(png: bytes) -> str:
@@ -96,7 +148,7 @@ def settle(shot: Callable[[], bytes]) -> bytes:
     return previous
 
 
-def run(session, clef: Clef, data: dict) -> dict:
+def run(session, decisions: Decisions, data: dict) -> dict:
     """Capture, decide, act until done, an escalation, a risky tap needing approval, or the step limit."""
     if any(key in data for key in ("observe", "masks", "limit", "offset")):
         raise ValueError("Goal replies carry no observation; observe separately.")
@@ -132,10 +184,10 @@ def run(session, clef: Clef, data: dict) -> dict:
             step_goal = goal if not history else f"{goal}\nAlready done: " + "; ".join(history[-4:])
             started = time.monotonic()
             try:
-                d = navigator.decide(clef.ask, screen, step_goal)
+                d = navigator.decide(decisions.ask, screen, step_goal)
                 step = {"app": screen.app, "action": d["action"]}
                 if d["action"] == "dismiss_overlay":
-                    d = navigator.decide(clef.ask, screen, navigator.DISMISS_GOAL)
+                    d = navigator.decide(decisions.ask, screen, navigator.DISMISS_GOAL)
                     step["dismiss"] = d["action"]
             except (navigator.Unavailable, KeyError, TypeError, ValueError) as exc:
                 outcome, reason = "escalate", "navigator_unavailable"

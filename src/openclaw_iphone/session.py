@@ -53,9 +53,9 @@ class TargetUnavailable(OpenClawIPhoneError):
 
 class Session:
     def __init__(self, connection: Connection, *, allow_images: bool = False,
-                 evidence_base: str | None = None, clef: goal.Clef | None = None) -> None:
+                 evidence_base: str | None = None, decisions: goal.Decisions | None = None) -> None:
         self.connection, self.allow_images, self.evidence_base = connection, allow_images, evidence_base
-        self.clef = clef
+        self.decisions = decisions
         self.closed = False
         self.snapshot: Observation | None = None
         self.image_geometry: tuple[tuple[float, float] | None, tuple[int, int]] | None = None
@@ -286,10 +286,10 @@ class Session:
             self.closed = True
             return {"status": "closed"}
         if op == "goal":
-            # Many operations, each with its own deadline; Clef deliberation runs between them.
-            if self.clef is None:
+            # Many operations, each with its own deadline; the navigator's calls run between them.
+            if self.decisions is None:
                 return {"status": "error", "dispatch": "not_sent", "reason": "goal_navigation_disabled"}
-            return goal.run(self, self.clef, data)
+            return goal.run(self, self.decisions, data)
         acknowledged = 0
         action_started = False
         completed = False

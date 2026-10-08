@@ -56,11 +56,13 @@ subsequent action. Optional observation failure does not erase acknowledgment.
 ## Optional goal navigation
 
 Hosts can enable a `goal` operation that hands multi-step navigation to
-Cloudflare's Clef model: the agent names a goal, the session taps, types and
-scrolls until it looks done, stopping for consent prompts, low confidence and
-risky taps the agent hasn't pre-approved. It is off unless
-`OPENCLAW_IPHONE_CLEF_ENABLED` and Cloudflare credentials are set, and it sends
-screenshots and screen text to Cloudflare. See [goal navigation](docs/goal.md).
+OpenAI's Decisions API (`gpt-6-luna`): the agent names a goal, the session taps,
+types and scrolls until it looks done, stopping for consent prompts, low
+confidence and risky taps the agent hasn't pre-approved. It is off unless
+`OPENCLAW_IPHONE_GOAL_ENABLED` and an OpenAI API key are set, and it sends
+screenshots and screen text to OpenAI. `openclaw-iphone goal setup` stores the
+key or points to where it is; `openclaw-iphone goal check` tests it. See
+[goal navigation](docs/goal.md).
 
 ## Diagnosis and setup
 

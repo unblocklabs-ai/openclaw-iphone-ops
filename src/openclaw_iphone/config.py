@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import tempfile
 
 
 CONFIG_ENV_VAR = "OPENCLAW_IPHONE_CONFIG"
@@ -19,10 +20,10 @@ CONFIG_KEYS = {
     "OPENCLAW_IPHONE_DEVELOPMENT_TEAM",
     "OPENCLAW_IPHONE_DESTINATION_TIMEOUT",
     "OPENCLAW_IPHONE_WDA_URL",
-    "OPENCLAW_IPHONE_CLEF_ENABLED",
-    "OPENCLAW_IPHONE_CLEF_ACCOUNT_ID",
-    "OPENCLAW_IPHONE_CLEF_API_TOKEN",
-    "OPENCLAW_IPHONE_CLEF_BASE_URL",
+    "OPENCLAW_IPHONE_GOAL_ENABLED",
+    "OPENCLAW_IPHONE_OPENAI_API_KEY",
+    "OPENCLAW_IPHONE_OPENAI_API_KEY_FILE",
+    "OPENCLAW_IPHONE_OPENAI_BASE_URL",
 }
 
 
@@ -115,6 +116,34 @@ def parse_env_file(path: Path) -> dict[str, str]:
             continue
         values[key] = parse_env_value(raw_value.strip(), path=path, line_number=line_number)
     return values
+
+
+def update_config_file(path: Path, updates: dict[str, str | None]) -> None:
+    """Set (or, with None, remove) keys in a KEY=value config file, keeping every other line.
+
+    Written atomically and owner-only (it may hold an API key)."""
+    path = path.resolve()
+    lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    pending, out = dict(updates), []
+    for raw in lines:
+        line = raw.strip()
+        name = line.removeprefix("export ").split("=", 1)[0].strip() if "=" in line and not line.startswith("#") else None
+        if name not in updates:
+            out.append(raw)
+        elif name in pending:  # the first occurrence is replaced in place, later ones dropped
+            value = pending.pop(name)
+            if value is not None:
+                out.append(f"{name}={shlex.quote(value)}")
+    out += [f"{name}={shlex.quote(value)}" for name, value in pending.items() if value is not None]
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")  # created 0600
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write("\n".join(out) + "\n")
+        os.replace(temporary, path)
+    except BaseException:
+        Path(temporary).unlink(missing_ok=True)
+        raise
 
 
 def parse_env_value(raw_value: str, *, path: Path, line_number: int) -> str:

@@ -46,12 +46,20 @@ model unless the operator enabled goal navigation.
 - Optional `launch.wait_seconds` checks foreground before capture. Optional
   `set.verify` reads back the requested value; `type.verify` compares whole-field replacement privately, returning only
   match/mismatch/unknown. Neither adds mandatory verification or blind retries.
-- If `ready.capabilities` includes `goal`, the operator enabled Clef goal
+- If `ready.capabilities` includes `goal`, the operator enabled goal
   navigation ([goal navigation](../../docs/goal.md)): `goal` runs several steps
   toward a goal you name and returns `done`, `escalate` or `needs_approval`.
   Pre-approve only the effects the user asked for (`approve`), check `done`
   yourself, and handle approvals and escalations directly. It sends screenshots and
-  screen text to Cloudflare. Without the capability, you choose every action.
+  screen text to OpenAI. Without the capability, you choose every action.
+- Enable goal navigation only when the operator asks, since it sends screens to
+  OpenAI. If they give you an OpenAI API key, store it with
+  `printf '%s' "$KEY" | openclaw-iphone goal setup --key-stdin` (never as an
+  argument, in logs or in replies); if they say where it is, use
+  `openclaw-iphone goal setup --key-file PATH`; if `OPENAI_API_KEY` is already
+  in the session's environment, plain `openclaw-iphone goal setup`. Then run
+  `openclaw-iphone goal check` and restart the session. `goal setup --disable`
+  turns it off.
 - Inspect unknown/partial outcomes before retrying. The session never replays
   writes; uncertainty does not block subsequent deliberate requests.
 - `close`/EOF releases ownership; exit 0 says nothing about task achievement.
