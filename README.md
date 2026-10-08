@@ -86,8 +86,8 @@ Close the session before separate mutating commands.
 
 ## Distribution
 
-This is a CLI/skills bundle, not a native OpenClaw plugin. Install v0.8.0 with
-`npm install -g @unblocklabs/openclaw-iphone-ops@0.8.0`.
+This is a CLI/skills bundle, not a native OpenClaw plugin. Install v0.9.0 with
+`npm install -g @unblocklabs/openclaw-iphone-ops@0.9.0`.
 The package ships the CLI, skills, docs and snippets; register its `skills/` directory with
 the agent explicitly. The launcher supports `OPENCLAW_IPHONE_PYTHON` to select
 an absolute Python interpreter. Configuration/evidence belong outside the package.
