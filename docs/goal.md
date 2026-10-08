@@ -8,18 +8,38 @@ any text to type and which risky effects are pre-approved, and it checks the res
 
 ## Enable
 
-Add to `~/.openclaw/iphone/config.env`, keep the file owner-only (`chmod 600`), and
-restart any running `session`:
+Goal navigation needs an OpenAI API key with Decisions API access. Either store
+the key, or point to where it already is:
 
 ```sh
-OPENCLAW_IPHONE_GOAL_ENABLED="1"
-OPENCLAW_IPHONE_OPENAI_API_KEY="<OpenAI API key with Decisions API access>"
+# store it in the config file (written owner-only; the key is read from stdin, never echoed)
+printf '%s' "$KEY" | openclaw-iphone goal setup --key-stdin
+# or point to a file that holds it: a bare key, or a .env file with an OPENAI_API_KEY= line
+openclaw-iphone goal setup --key-file ~/.secrets/openai.env
+# or only turn it on and use OPENAI_API_KEY from the session's environment
+openclaw-iphone goal setup
+
+openclaw-iphone goal check            # one tiny call, no screen data: proves key and access
+openclaw-iphone goal setup --disable  # off again; key settings are kept
+```
+
+`goal setup` edits the config file the CLI reads (`OPENCLAW_IPHONE_CONFIG`, else
+`~/.openclaw/iphone/config.env`), keeps its other settings and leaves it owner-only.
+Restart any running `session` afterwards. The same settings by hand:
+
+```sh
+OPENCLAW_IPHONE_GOAL_ENABLED="1"                         # the toggle
+OPENCLAW_IPHONE_OPENAI_API_KEY="sk-..."                  # 1. the key itself
+OPENCLAW_IPHONE_OPENAI_API_KEY_FILE="~/.secrets/openai"  # 2. or where it is
+# 3. otherwise OPENAI_API_KEY from the environment
 # Optional: an API-compatible proxy instead of https://api.openai.com/v1
 # OPENCLAW_IPHONE_OPENAI_BASE_URL="https://proxy.example/v1"
 ```
 
-`openclaw-iphone doctor` reports `goal-navigation: on|off|incomplete`. When it is
-on, the session's `ready.capabilities` includes `goal`.
+The first key found in that order is used. `openclaw-iphone doctor` and `goal check`
+report `goal-navigation: off`, `on (gpt-6-luna via OpenAI's Decisions API; key: <where>)`
+or `incomplete (<what is missing>)`, never the key. When it is on, the session's
+`ready.capabilities` includes `goal`.
 
 **Privacy:** every step sends a screenshot and the screen's text (labels, names)
 to OpenAI. Text supplied with `text` is typed on the phone, not sent. A screen with

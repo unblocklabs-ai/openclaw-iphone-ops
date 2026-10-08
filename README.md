@@ -60,7 +60,9 @@ OpenAI's Decisions API (`gpt-6-luna`): the agent names a goal, the session taps,
 types and scrolls until it looks done, stopping for consent prompts, low
 confidence and risky taps the agent hasn't pre-approved. It is off unless
 `OPENCLAW_IPHONE_GOAL_ENABLED` and an OpenAI API key are set, and it sends
-screenshots and screen text to OpenAI. See [goal navigation](docs/goal.md).
+screenshots and screen text to OpenAI. `openclaw-iphone goal setup` stores the
+key or points to where it is; `openclaw-iphone goal check` tests it. See
+[goal navigation](docs/goal.md).
 
 ## Diagnosis and setup
 

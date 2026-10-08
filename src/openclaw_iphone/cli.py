@@ -4,18 +4,22 @@ import argparse
 from contextlib import nullcontext
 import json
 import math
+import os
 import plistlib
 from pathlib import Path
 import sys
+import time
 
 from . import __version__
-from .config import IPhoneConfig, load_config
+from .config import (CONFIG_ENV_VAR, IPhoneConfig, config_path, default_config_path, expand_user_path, load_config,
+                     update_config_file)
 from .connection import Connection
 from .control_lock import control_lock
 from .devicectl import Device, DeviceCtl
 from .evidence import artifact_path, write_private
 from .errors import OpenClawIPhoneError, SessionOutputUnavailable, WDAUnavailable, diagnostic
-from .goal import decisions_from_config, goal_navigation
+from .goal import CHECK, decisions_from_config, goal_navigation, read_key_file
+from .navigator import Unavailable
 from .protocol import json_line_emitter, read_requests, serve
 from .session import Session
 from .wda import DEFAULT_WDA_PORT, WDAClient, WDARunConfig, resolve_wda_path, run_wda
@@ -175,6 +179,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     watchdog_once.set_defaults(handler=handle_watchdog_once)
 
+    goal = subcommands.add_parser("goal", help="Optional goal navigation (OpenAI Decisions API, gpt-6-luna).")
+    goal_subcommands = goal.add_subparsers(dest="goal_command")
+    goal_setup = goal_subcommands.add_parser("setup", help="Turn goal navigation on (or off) and record where the OpenAI API key is.")
+    key = goal_setup.add_mutually_exclusive_group()
+    key.add_argument("--key-stdin", action="store_true", help="Read the API key from stdin and store it in the config file (owner-only).")
+    key.add_argument("--key-file", help="Use the key in this file (a bare key or an OPENAI_API_KEY= line); the key is not copied.")
+    key.add_argument("--disable", action="store_true", help="Turn goal navigation off; key settings are kept.")
+    goal_setup.set_defaults(handler=handle_goal_setup)
+    goal_check = goal_subcommands.add_parser("check", help="Report the setting and make one tiny Decisions call (no screen data).")
+    goal_check.set_defaults(handler=handle_goal_check)
+
     session = subcommands.add_parser("session", help="Direct controls over persistent stdin/stdout JSON lines.")
     add_device_arg(session)
     session.add_argument("--operation-timeout", type=float, default=30, help="Per-operation deadline; idle deliberation is unlimited.")
@@ -298,6 +313,43 @@ def handle_doctor(args: argparse.Namespace) -> int:
         print("screen-read: ok")
     print(f"result: {'ok' if healthy else 'attention-required'}")
     return 0 if healthy else 1
+
+def handle_goal_setup(args: argparse.Namespace) -> int:
+    explicit = os.environ.get(CONFIG_ENV_VAR)  # else the file the CLI reads now, else the default location
+    path = expand_user_path(explicit, os.environ) if explicit else config_path(os.environ) or default_config_path(os.environ)
+    updates: dict[str, str | None] = {"OPENCLAW_IPHONE_GOAL_ENABLED": "0" if args.disable else "1"}
+    if args.key_stdin:
+        key = sys.stdin.read().strip()
+        if not key or any(c.isspace() for c in key):
+            raise ValueError("Expected exactly one API key on stdin.")
+        updates |= {"OPENCLAW_IPHONE_OPENAI_API_KEY": key, "OPENCLAW_IPHONE_OPENAI_API_KEY_FILE": None}
+    elif args.key_file:
+        key_file = Path(args.key_file).expanduser().resolve()
+        if read_key_file(key_file) is None:
+            raise ValueError(f"No API key found in {key_file}.")
+        updates |= {"OPENCLAW_IPHONE_OPENAI_API_KEY_FILE": str(key_file), "OPENCLAW_IPHONE_OPENAI_API_KEY": None}
+    update_config_file(path, updates)
+    print(f"config: {path}")
+    print(f"goal-navigation: {goal_navigation(load_config())}")
+    print("Restart any running session to apply it; `openclaw-iphone goal check` tests the key.")
+    return 0
+
+
+def handle_goal_check(args: argparse.Namespace) -> int:
+    config = load_config()
+    print(f"goal-navigation: {goal_navigation(config)}")
+    decisions = decisions_from_config(config)
+    if decisions is None:
+        return 1
+    started = time.monotonic()
+    try:
+        decisions.ask(CHECK)
+    except Unavailable as exc:
+        print(f"goal-check: failed ({exc.category})")
+        return 1
+    print(f"goal-check: ok ({time.monotonic() - started:.2f} s; no screen data sent)")
+    return 0
+
 
 def runtime_provenance(config: IPhoneConfig) -> dict[str, str]:
     """Report source/config/runner paths without claiming process provenance.

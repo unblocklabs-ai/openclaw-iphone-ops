@@ -1,14 +1,20 @@
 """Goal navigation offline: candidate rules, decision rules, the Decisions API client and config gating."""
 import base64
+import contextlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import io
 import json
+import os
+from pathlib import Path
 import struct
+import tempfile
 import threading
 import unittest
+from unittest import mock
 
-from openclaw_iphone import navigator
+from openclaw_iphone import cli, navigator
 from openclaw_iphone.config import IPhoneConfig
-from openclaw_iphone.goal import Decisions, decisions_from_config, goal_navigation, jpeg
+from openclaw_iphone.goal import Decisions, api_key, decisions_from_config, goal_navigation, jpeg
 from openclaw_iphone.observations import parse_observation
 from test_image_evidence import png
 
@@ -215,14 +221,85 @@ class DecisionsTests(unittest.TestCase):
                 thread.join(timeout=5)
 
     def test_goal_navigation_is_off_unless_enabled_with_a_key(self):
-        self.assertEqual(goal_navigation(IPhoneConfig({})), "off")
+        on = {"OPENCLAW_IPHONE_GOAL_ENABLED": "1"}
+        self.assertEqual(goal_navigation(IPhoneConfig({}), env={"OPENAI_API_KEY": "k"}), "off")
         self.assertEqual(goal_navigation(IPhoneConfig({"OPENCLAW_IPHONE_GOAL_ENABLED": "0",
-                                                       "OPENCLAW_IPHONE_OPENAI_API_KEY": "k"})), "off")
-        self.assertEqual(goal_navigation(IPhoneConfig({"OPENCLAW_IPHONE_GOAL_ENABLED": "1"})), "incomplete")
-        self.assertIsNone(decisions_from_config(IPhoneConfig({"OPENCLAW_IPHONE_GOAL_ENABLED": "1"})))
+                                                       "OPENCLAW_IPHONE_OPENAI_API_KEY": "k"}), env={}), "off")
+        self.assertTrue(goal_navigation(IPhoneConfig(on), env={}).startswith("incomplete (no OpenAI API key"))
+        self.assertIsNone(decisions_from_config(IPhoneConfig(on), env={}))
+        # an unset $VAR reference left in the config file is not a key
+        self.assertIsNone(decisions_from_config(IPhoneConfig(on | {"OPENCLAW_IPHONE_OPENAI_API_KEY": "$OPENAI_API_KEY"}), env={}))
         client = decisions_from_config(IPhoneConfig({"OPENCLAW_IPHONE_GOAL_ENABLED": "true",
-                                                     "OPENCLAW_IPHONE_OPENAI_API_KEY": "k"}))
-        self.assertEqual(client.url, "https://api.openai.com/v1/decisions")
+                                                     "OPENCLAW_IPHONE_OPENAI_API_KEY": "k"}), env={})
+        self.assertEqual((client.url, client.api_key), ("https://api.openai.com/v1/decisions", "k"))
+        self.assertEqual(goal_navigation(IPhoneConfig(on), env={"OPENAI_API_KEY": "env-key"}),
+                         "on (gpt-6-luna via OpenAI's Decisions API; key: OPENAI_API_KEY in the environment)")
+
+    def test_the_key_can_live_in_config_in_a_key_file_or_in_the_environment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bare, dotenv, empty = Path(tmp, "openai.key"), Path(tmp, ".env"), Path(tmp, "empty")
+            bare.write_text("sk-file\n")
+            dotenv.write_text("OTHER=1\nexport OPENAI_API_KEY='sk-dotenv'\n")
+            empty.write_text("")
+            for path in (bare, dotenv):
+                path.chmod(0o600)
+            env = {"OPENAI_API_KEY": "sk-env"}
+            def key(values, env=env):
+                return api_key(IPhoneConfig(values, path=Path(tmp, "config.env")), env)
+            self.assertEqual(key({"OPENCLAW_IPHONE_OPENAI_API_KEY": "sk-inline", "OPENCLAW_IPHONE_OPENAI_API_KEY_FILE": str(bare)}),
+                             ("sk-inline", f"OPENCLAW_IPHONE_OPENAI_API_KEY in {tmp}/config.env"))
+            self.assertEqual(key({"OPENCLAW_IPHONE_OPENAI_API_KEY_FILE": str(bare)}), ("sk-file", f"key file {bare}"))
+            self.assertEqual(key({"OPENCLAW_IPHONE_OPENAI_API_KEY_FILE": str(dotenv)})[0], "sk-dotenv")
+            self.assertEqual(key({"OPENCLAW_IPHONE_OPENAI_API_KEY_FILE": str(empty)}), (None, f"no key found in {empty}"))
+            self.assertEqual(key({"OPENCLAW_IPHONE_OPENAI_API_KEY_FILE": f"{tmp}/missing"})[0], None)
+            self.assertEqual(key({}), ("sk-env", "OPENAI_API_KEY in the environment"))
+            bare.chmod(0o644)
+            self.assertTrue(key({"OPENCLAW_IPHONE_OPENAI_API_KEY_FILE": str(bare)})[1].endswith("(readable by others: chmod 600)"))
+
+    def test_goal_setup_records_the_key_owner_only_and_goal_check_proves_it(self):
+        with tempfile.TemporaryDirectory() as tmp, DecisionsServer() as server:
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
+            thread.start()
+            config = Path(tmp, "config.env")
+            config.write_text('OPENCLAW_IPHONE_DEVICE="Bill iPhone"\nOPENCLAW_IPHONE_GOAL_ENABLED="0"\n'
+                              f'OPENCLAW_IPHONE_OPENAI_BASE_URL=http://127.0.0.1:{server.server_port}/v1\n')
+            key_file = Path(tmp, "openai.key")
+            key_file.write_text("sk-from-file\n")
+            env = {"HOME": tmp, "OPENCLAW_IPHONE_CONFIG": str(config), "no_proxy": "127.0.0.1"}
+            def run(*argv, stdin=""):
+                out = io.StringIO()
+                with mock.patch.dict(os.environ, env, clear=True), mock.patch("sys.stdin", io.StringIO(stdin)), \
+                     contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                    return cli.main(list(argv)), out.getvalue()
+            try:
+                code, out = run("goal", "setup", "--key-stdin", stdin="sk-secret-123\n")
+                self.assertEqual(code, 0)
+                self.assertNotIn("sk-secret-123", out)
+                self.assertIn(f"goal-navigation: on (gpt-6-luna via OpenAI's Decisions API; key: "
+                              f"OPENCLAW_IPHONE_OPENAI_API_KEY in {config})", out)
+                self.assertEqual(config.stat().st_mode & 0o777, 0o600)
+                text = config.read_text()
+                self.assertIn('OPENCLAW_IPHONE_DEVICE="Bill iPhone"', text)
+                self.assertIn("OPENCLAW_IPHONE_GOAL_ENABLED=1\nOPENCLAW_IPHONE_OPENAI_BASE_URL", text)  # replaced in place
+                self.assertIn("OPENCLAW_IPHONE_OPENAI_API_KEY=sk-secret-123", text)
+                self.assertEqual(run("goal", "check")[0], 0)
+                path, auth, body = server.requests[-1]
+                self.assertEqual((path, auth, body["input"]), ("/v1/decisions", "Bearer sk-secret-123", "The sky is blue."))
+                code, out = run("goal", "setup", "--key-file", str(key_file))
+                self.assertIn(f"key: key file {key_file.resolve()}", out)
+                self.assertNotIn("sk-secret-123", config.read_text())  # the stored key gives way to the file
+                server.replies = [(401, {})]
+                code, out = run("goal", "check")
+                self.assertEqual((code, out.splitlines()[-1]), (1, "goal-check: failed (http_401)"))
+                self.assertEqual(server.requests[-1][1], "Bearer sk-from-file")
+                code, out = run("goal", "setup", "--disable")
+                self.assertIn("goal-navigation: off", out)
+                self.assertIn("OPENCLAW_IPHONE_OPENAI_API_KEY_FILE=", config.read_text())
+                self.assertEqual(run("goal", "check")[0], 1)
+                self.assertEqual(run("goal", "setup", "--key-stdin", stdin="two words")[0], 1)
+            finally:
+                server.shutdown()
+                thread.join(timeout=5)
 
     def test_screenshot_is_sent_as_jpeg_no_larger_than_1024(self):
         def size(url):
