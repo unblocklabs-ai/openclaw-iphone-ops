@@ -77,6 +77,7 @@ class PhoneServer(ThreadingHTTPServer):
         self.elements = ["field"]
         self.size = {"width": 8, "height": 16}
         self.image = png()
+        self.image_sequence = []  # screenshots to return first, one per request, before `image`
         self.sessions = 0
         self.text = ""
         self.delay_action = False
@@ -163,7 +164,8 @@ class PhoneHandler(BaseHTTPRequestHandler):
             elif path == "/screenshot":
                 import base64
                 time.sleep(self.server.image_delay)
-                value = base64.b64encode(self.server.image).decode()
+                image = self.server.image_sequence.pop(0) if self.server.image_sequence else self.server.image
+                value = base64.b64encode(image).decode()
             elif path.endswith("/displayed"):
                 value = path.split("/element/")[1].split("/")[0] not in self.server.hidden
             elif path.endswith("/window/size"):
@@ -968,6 +970,19 @@ class SessionTests(unittest.TestCase):
             reply = self.request(proc, {"op": "goal", "goal": "Log in"}, timeout=20)
             self.assertEqual((reply["outcome"], reply["reason"], reply["steps"]), ("escalate", "secure_field", []))
             self.assertEqual(len(api.requests), asked)
+            self.finish(proc, base)
+
+    def test_goal_taps_by_element_when_the_screen_moved_after_it_was_judged(self):
+        with self.decisions() as (api, config), self.running(config=config) as (proc, server, base):
+            server.xml = GOAL_XML
+            moved = png(width=64, height=64)  # a different screen
+            server.image_sequence = [server.image, server.image, moved]  # settle matches; the pre-tap shot differs
+            api.replies = [(200, r) for r in (step("e1"), check(0.05), step("done", {"done": 0.9, "e1": 0.1}, progress=2.9, done=0.95))]
+            reply = self.request(proc, {"op": "goal", "goal": "Go to the next page"}, timeout=20)
+            self.assertEqual((reply["outcome"], reply["acknowledged_substeps"]), ("done", 1))
+            routes = [path for _, path, _ in server.requests]
+            self.assertTrue(any(r.endswith("/element/field/click") for r in routes))  # found by identity
+            self.assertFalse(any(r.endswith("/actions") for r in routes))  # no blind coordinate tap
             self.finish(proc, base)
 
     def test_goal_opens_the_app_first_by_bundle_or_name(self):

@@ -137,13 +137,18 @@ def jpeg(png: bytes) -> str:
         return "data:image/jpeg;base64," + base64.b64encode(target.read_bytes()).decode()
 
 
+def same(a: bytes, b: bytes) -> bool:
+    """Screenshots of an unchanged screen: identical, or PNG sizes within 0.05% (the status-bar clock, a cursor)."""
+    return a == b or abs(len(a) - len(b)) <= len(b) * 0.0005
+
+
 def settle(shot: Callable[[], bytes]) -> bytes:
     """The first of two screenshots 0.15 s apart that match (at most 3 s), else the latest."""
     started, previous = time.monotonic(), shot()
     while time.monotonic() - started < 3:
         time.sleep(0.15)
         current = shot()
-        if current == previous or abs(len(current) - len(previous)) <= len(previous) * 0.0005:
+        if same(current, previous):
             return current
         previous = current
     return previous
@@ -240,8 +245,12 @@ def run(session, decisions: Decisions, data: dict) -> dict:
                     extra = {"pending": {"target": target["id"], "label": step["label"], "effect": d["risk"].get("effect")}}
                     break
                 # The element's center on the screen just judged: an ID tap would look the element up again, a full
-                # tree read (0.3 s in light apps, 30 s and a timeout in X's timeline).
-                reply = session._request({"op": "tap", "x": target["x"], "y": target["y"]})
+                # tree read (0.3 s in light apps, 30 s and a timeout in X's timeline). If the screen moved since
+                # (a banner, a list reloading), the point may hold another control: find the element itself.
+                if same(session._read(lambda wda: wda.screenshot()), png):
+                    reply = session._request({"op": "tap", "x": target["x"], "y": target["y"]})
+                else:
+                    reply = session._request({"op": "tap", "target": target["id"]})
                 note = f"tapped '{step['label']}'" if step["action"] == "tap" else f"closed an overlay via '{step['label']}'"
             elif d["action"] == "type_text":
                 if text is None or history and history[-1] == TYPED:
