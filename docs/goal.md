@@ -112,9 +112,10 @@ without observing first. Treat these as hints, not decisions.
 `dispatch` and `acknowledged_substeps` count inputs actually sent, as in every
 other operation; each step lists its own `dispatch`. Uncertain writes are never
 replayed. Taps go to the chosen element's center on the screen the navigator just
-judged. Looking the element up again by ID is a second tree read: 0.3 s in light
-apps, and over 30 s (then a timeout) in X's timeline; a coordinate tap took 0.75 s
-everywhere. Screens of apps measured slow are read only 22 levels deep (see
+judged, after one screenshot confirms the screen hasn't moved; if it has, the tap
+finds the element by identity instead. Looking the element up by ID is a second
+tree read: 0.3 s in light apps, and over 30 s (then a timeout) in X's timeline at
+full depth; a coordinate tap took 0.75 s everywhere. Screens of apps measured slow are read only 22 levels deep (see
 [session](session.md)), which keeps menus, tabs and buttons above post contents.
 
 ## How a step works
