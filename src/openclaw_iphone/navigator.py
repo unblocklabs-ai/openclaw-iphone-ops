@@ -3,7 +3,8 @@ become one step.
 
 Questions, options and cut-offs live at the top for review. Validated on 155 labeled screens from a dedicated iPhone
 plus 16 probe cases: 150/155 steps (28/31 held out), 16/16 probes, the tap check flagged 19/19 risky taps with 0/117
-false alarms. Pure: `decide` takes an `ask(request) -> answers` callable and never touches the phone.
+false alarms; and on 42 screens that start away from the goal (Back or a tab needed, or another app): 25/27, 13/15 held
+out. Pure: `decide` takes an `ask(request) -> answers` callable and never touches the phone.
 """
 from __future__ import annotations
 
@@ -26,6 +27,7 @@ THRESHOLDS = {
     "covered": 0.5,           # tap check: target covered by an overlay -> dismiss_overlay
     "overlay": 0.5,           # blocked is a menu/sheet or popup with this much probability ...
     "part": 0.5,              # ... and the target is not part of it -> dismiss_overlay
+    "back_over_none": 0.25,   # go_back (with the back button's own share) beats none at this much; a back tap's floor
 }
 RISKY_EFFECTS = frozenset({"social_action", "communication", "purchase_install", "permission_grant"})
 OVERLAYS = ("menu_or_sheet", "feature_popup")
@@ -36,6 +38,8 @@ NON_ELEMENT_OPTIONS = {
     "done": "The goal is already complete on this screen; nothing needs to be tapped.",
     "scroll_down": ("Scroll down (swipe up): reveals more of the page when the needed control is not visible, and moves to "
                     "the next item in a full-screen feed such as Reels, Stories or a video player."),
+    "go_back": ("Go back to the previous screen (its Back button): what the goal needs is not on this screen and no control "
+                "here leads to it, but an earlier screen in this app does."),
     "dismiss_overlay": "A popup, menu or sheet covers the needed control and must be closed first.",
     "none": "Nothing on this screen helps with the goal.",
     "type_text": "A text field is already focused (keyboard open) and the goal needs text typed into it now.",
@@ -89,6 +93,7 @@ DISMISS_GOAL = ("Close the popup, menu or sheet that covers the screen without a
                 "following, buying or sending anything")
 
 SCROLLBAR = re.compile(r"^(Vertical|Horizontal) scroll bar")
+BACK = re.compile(r"back(?!ground)", re.I)
 KEYBOARD = "XCUIElementTypeKeyboard"
 CONTAINERS = frozenset({"XCUIElementTypeOther", "XCUIElementTypeCollectionView", "XCUIElementTypeScrollView",
                         "XCUIElementTypeTable", "XCUIElementTypeWebView", "XCUIElementTypeGroup", "XCUIElementTypeCell",
@@ -178,6 +183,13 @@ def screen(obs: Observation, image: str) -> Screen:
     rows = [e for e in rows if not repeats_control(e)]
     notes = ("An on-screen keyboard is open (individual keys omitted).",) if keyboard else ()
     return Screen(obs.app, tuple(rows), notes, image)
+
+
+def back_control(s: Screen) -> Element | None:
+    """The screen's back button: a top-left Button named or labeled back (Settings labels it with the previous page)."""
+    found = [e for e in s.rows if e.role == "XCUIElementTypeButton" and e.bounds and center(e)[0] < 100
+             and center(e)[1] < 140 and (BACK.search(e.name or "") or (e.label or "").strip().casefold() == "back")]
+    return min(found, key=lambda e: center(e)[0]) if found else None
 
 
 def line(e: Element) -> str:
@@ -287,6 +299,17 @@ def decide(ask: Callable[[dict], dict], s: Screen, goal: str, *, check_tap: bool
     if (agree or votes) and element < t["done_veto"]:
         return out | {"action": "done", "confidence": round(progress / 3, 2)}
     choice = n["choice"] if n["choice"] != "done" else max((k for k in probabilities if k != "done"), key=probabilities.get)
+    back = back_control(s)
+    if back is not None:  # going back is one option however it was picked: go_back or the Back button itself
+        probabilities = dict(probabilities)
+        probabilities["go_back"] = probabilities.get("go_back", 0) + probabilities.pop(element_key(back), 0)
+        choice = max((k for k in probabilities if k != "done"), key=probabilities.get)
+        if choice == "none" and probabilities["go_back"] >= t["back_over_none"]:
+            choice = "go_back"  # going back only navigates: worth a try before giving up
+    if choice == "go_back":
+        if back is None:
+            return out | {"action": "escalate", "reason": "nothing_on_screen_helps"}
+        choice = element_key(back)
     if choice == "none":
         return out | {"action": "escalate", "reason": "nothing_on_screen_helps"}
     if choice in NON_ELEMENT_OPTIONS:
@@ -296,11 +319,13 @@ def decide(ask: Callable[[dict], dict], s: Screen, goal: str, *, check_tap: bool
     # Options whose centers fall inside the chosen element (or vice versa) land the same tap.
     confidence = sum(p for k, p in probabilities.items()
                      if k in by_key and (inside(center(by_key[k]), e) or inside(center(e), by_key[k])))
+    if e is back:
+        confidence += probabilities["go_back"]
     x, y = center(e)
     decision = out | {"action": "tap", "confidence": round(confidence, 2),
                       "target": {"id": e.id, "key": choice, "role": e.role.removeprefix("XCUIElementType"),
                                  "label": e.label or e.name, "x": round(x), "y": round(y)}}
-    if confidence < t["act_confidence"]:
+    if confidence < (t["back_over_none"] if e is back else t["act_confidence"]):
         return decision | {"action": "escalate", "reason": "low_confidence"}
     if not check_tap:
         return decision
