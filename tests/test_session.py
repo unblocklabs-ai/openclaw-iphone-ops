@@ -326,10 +326,12 @@ class SessionTests(unittest.TestCase):
 
     def finish(self, proc, base):
         self.assertEqual(self.request(proc, {"op": "close"})["status"], "closed")
-        # communicate consumes any TextIO/BufferedReader-prefetched session_end.
         proc.stdin.close()
         proc.stdin = None
-        output, errors = proc.communicate(timeout=5)
+        proc.wait(timeout=5)
+        # Read through the buffered readers: the readline() for "closed" may already hold session_end, and
+        # communicate() reads the raw pipe, so it would miss that line (seen as StopIteration on loaded runners).
+        output, errors = proc.stdout.read(), proc.stderr.read()
         self.assertEqual(proc.returncode, 0, errors.decode())
         self.assertNotIn(b"SERVER-PRIVATE", errors + output)
         with control_lock(base / ".openclaw/iphone/control.lock"):
