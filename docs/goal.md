@@ -88,6 +88,21 @@ The reply has no observation; observe separately when you need the screen.
   `inspect_before_retry` (a write may have happened), `interrupted`.
 - `step_limit`: `max_steps` ran out.
 
+The navigator stops rather than guess, and the session stays open: take over by
+observing, then act yourself or send a narrower goal (`"Tap Back to the inbox"`).
+When the navigator itself escalated (`permission_or_consent_prompt`, `low_confidence`,
+`nothing_on_screen_helps`), the last step lists what it leaned toward:
+
+```json
+"considered":[{"option":"none","probability":0.36},
+              {"option":"go_back","target":"SNAPSHOT_ID:21","label":"Back","probability":0.14},
+              {"target":"SNAPSHOT_ID:19","label":"Bek,","probability":0.06}]
+```
+
+Options are the navigator's own (`go_back`, `scroll_down`, `none`, ...); an element's
+`target` is valid until your next observation, so `{"op":"tap","target":...}` works
+without observing first. Treat these as hints, not decisions.
+
 `dispatch` and `acknowledged_substeps` count inputs actually sent, as in every
 other operation; each step lists its own `dispatch`. Uncertain writes are never
 replayed. Taps use the step's snapshot ID, falling back to the element's center
@@ -104,6 +119,10 @@ only when the ID no longer resolves to one control.
    the goal is done when progress >= 2.5 and the criteria-based done check agree (or
    next = done with both done signals >= 0.7), unless next still gives one control
    >= 0.6; a tap needs >= 0.35 combined probability on options under the same point.
+   Going back is one option: next's `go_back` plus the screen's own Back button (a
+   top-left button named or labeled back). It taps that button, and is preferred
+   over giving up (`none`) when it has >= 0.25, since it only navigates; with no
+   back button it escalates like `none`.
 4. A tap gets one more call, the tap check: would it send, post, follow, buy, call,
    delete or grant something, and is the control covered by (or not part of) an open
    popup or menu? A covered control means close the overlay first; risky taps need
@@ -113,6 +132,9 @@ Questions, thresholds and wording are in `src/openclaw_iphone/navigator.py`.
 Validated offline on 155 labeled screens from a dedicated iPhone (Instagram, App
 Store, Settings, system prompts) and 16 probe cases: 150/155 steps correct (28/31
 on held-out cases), 16/16 probes, 0 consent prompts acted on; the tap check caught
-19/19 risky taps with no false alarms on 117 safe ones. A Decisions call takes about
+19/19 risky taps with no false alarms on 117 safe ones. On 42 more screens that start
+away from the goal (inside a chat thread, someone else's profile, a deep Settings page,
+or another app entirely): 25/27, and 13/15 on screens held out until the end (both
+held-out misses go back once when the goal is in a different app). A Decisions call takes about
 0.25-0.3 s from a home connection (about 0.1 s of it server time); a step's capture
 takes about 1 s on an iPhone 11.

@@ -105,7 +105,8 @@ class NavigatorTests(unittest.TestCase):
                           ("score", "progress")])
         choices = body["questions"][0]["choices"]
         self.assertEqual([c["value"] for c in choices],
-                         ["e3", "e4", "e6", "e8", "e13", "done", "scroll_down", "dismiss_overlay", "none", "type_text"])
+                         ["e3", "e4", "e6", "e8", "e13", "done", "scroll_down", "go_back", "dismiss_overlay", "none",
+                          "type_text"])
         self.assertEqual(choices[1]["description"], 'Button "Message" @(70,122) 100x44 in "Profile"')
         self.assertIn("\nTrue: ", body["questions"][3]["instructions"])
         self.assertEqual([lv["label"] for lv in body["questions"][4]["levels"]], ["0", "1", "2", "3"])
@@ -134,6 +135,34 @@ class NavigatorTests(unittest.TestCase):
             ask, _ = scripted(reply, check(0.05))
             d = navigator.decide(ask, s, "Message bek")
             self.assertEqual((d["action"], d.get("reason")), (action, reason), reply)
+
+    def test_go_back_taps_the_back_button(self):
+        xml = SCREEN.replace('<XCUIElementTypeOther label="Profile"', '<XCUIElementTypeButton name="BackButton" label="Back" '
+                             'enabled="true" x="16" y="50" width="36" height="44"/>\n<XCUIElementTypeOther label="Profile"')
+        s = navigator.screen(observe(xml), "")
+        back = navigator.back_control(s)
+        self.assertEqual((back.label, back.name), ("Back", "BackButton"))
+        self.assertIsNone(navigator.back_control(navigator.screen(observe(), "")))
+        key = navigator.element_key(back)
+        # go_back and the Back button count together; Back beats none at 0.25, and a back tap needs only that much
+        for reply, action, confidence in ((step("go_back", {"go_back": 0.5, key: 0.1, "none": 0.4}), "tap", 0.6),
+                                          (step("none", {"none": 0.38, "go_back": 0.2, key: 0.06, "e5": 0.36}), "tap", 0.26),
+                                          (step("e5", {"e5": 0.3, "go_back": 0.25, key: 0.05, "none": 0.4}), "tap", 0.3),
+                                          (step("none", {"none": 0.6, "go_back": 0.2, key: 0.02, "e5": 0.18}), "escalate", None)):
+            ask, bodies = scripted(reply, check(0.05))
+            d = navigator.decide(ask, s, "Open the home feed")
+            self.assertEqual((d["action"], d.get("confidence")), (action, confidence), reply)
+            if action == "tap":
+                self.assertEqual((d["target"]["label"], d["target"]["key"]), ("Back", key))
+                self.assertEqual(len(bodies), 2)  # the tap check still runs
+            else:  # an escalation lists what next leaned toward: options by name, elements by target and label
+                self.assertEqual(d["considered"], [{"option": "none", "probability": 0.6},
+                                                   {"option": "go_back", "target": back.id, "label": "Back", "probability": 0.22},
+                                                   {"target": s.rows[2].id, "label": "Message", "probability": 0.18}])
+        ask, _ = scripted(step("go_back", {"go_back": 0.6, "none": 0.4}))
+        d = navigator.decide(ask, navigator.screen(observe(), ""), "Open the home feed")
+        self.assertEqual((d["action"], d["reason"]), ("escalate", "nothing_on_screen_helps"))
+        self.assertEqual(d["considered"], [{"option": "go_back", "probability": 0.6}, {"option": "none", "probability": 0.4}])
 
     def test_tap_check_flags_risky_taps_and_closes_overlays_in_the_way(self):
         s = navigator.screen(observe(), "")

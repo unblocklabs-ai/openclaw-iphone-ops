@@ -49,9 +49,17 @@ model unless the operator enabled goal navigation.
 - If `ready.capabilities` includes `goal`, the operator enabled goal
   navigation ([goal navigation](../../docs/goal.md)): `goal` runs several steps
   toward a goal you name and returns `done`, `escalate` or `needs_approval`.
-  Pre-approve only the effects the user asked for (`approve`), check `done`
-  yourself, and handle approvals and escalations directly. It sends screenshots and
-  screen text to OpenAI. Without the capability, you choose every action.
+  Pre-approve only the effects the user asked for (`approve`) and check `done`
+  yourself. It sends screenshots and screen text to OpenAI. Without the
+  capability, you choose every action.
+  - `escalate`: the navigator stopped instead of guessing; the session stays
+    open. Observe, then act yourself or send a narrower goal ("Tap Back to the
+    inbox"). The last step's `considered` lists what it leaned toward, with
+    targets you can tap as is. Never answer a `permission_or_consent_prompt`
+    without the user. After `inspect_before_retry`, observe first: a tap may
+    have happened.
+  - `needs_approval`: nothing was tapped. Ask the user, then tap
+    `pending.target` (valid until your next observation).
 - Enable goal navigation only when the operator asks, since it sends screens to
   OpenAI. If they give you an OpenAI API key, store it with
   `printf '%s' "$KEY" | openclaw-iphone goal setup --key-stdin` (never as an
