@@ -37,7 +37,12 @@ openclaw-iphone d1 serve                                      # or install snipp
 openclaw-iphone d1 status
 openclaw-iphone goal check
 
-# 2) Hosted Liquid AI d1.2 (or --model d1.2-ultra) with Box visual grounding
+# 2) Hosted Liquid AI d1.2 via codex-lb / OpenRouter Decisions (inline images, array state)
+openclaw-iphone goal setup --provider liquid --base-url https://codex.unblocklabs.ai/v1/decisions \
+  --model liquid/d1.2-ultra --key-file ~/.openclaw/secrets/codex-lb.env
+openclaw-iphone goal check
+
+# 3) Direct hosted Liquid AI d1.2 (or --model d1.2-ultra) with Box visual grounding
 openclaw-iphone goal setup --provider liquid --key-file ~/.secrets/liquid.env --model d1.2
 openclaw-iphone goal check
 

@@ -14,7 +14,7 @@ from unittest import mock
 
 from openclaw_iphone import cli, navigator
 from openclaw_iphone.config import IPhoneConfig, load_config
-from openclaw_iphone.goal import (Decisions, LiquidDecisions, TypeSafeDecisions, api_key, decisions_from_config,
+from openclaw_iphone.goal import (CHECK, Decisions, LiquidDecisions, TypeSafeDecisions, api_key, decisions_from_config,
                                   goal_navigation, jpeg, local_guard_from_config, read_key_file, same)
 from openclaw_iphone.observations import parse_observation
 from test_image_evidence import png
@@ -510,6 +510,64 @@ class DecisionsTests(unittest.TestCase):
             # Non-loopback local guard URL is rejected to prevent accidental remote leakage.
             with self.assertRaises(ValueError):
                 local_guard_from_config(IPhoneConfig({"OPENCLAW_IPHONE_LOCAL_GUARD_URL": "https://evil.example/v1"}))
+
+    def test_liquid_openrouter_codex_lb_decisions_contract(self):
+        # OpenRouter / codex-lb Decisions endpoint uses /decisions, array-wrapped state, inline image_url, and supports_box=False.
+        with DecisionsServer() as server:
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
+            thread.start()
+            try:
+                base_url = f"http://127.0.0.1:{server.server_port}/v1/decisions"
+                # Force non-loopback detection by testing explicit /decisions path via proxy host + direct HTTP test:
+                client = LiquidDecisions("codex-key", base_url="https://codex.unblocklabs.ai/v1/decisions", model="liquid/d1.2-ultra")
+                self.assertEqual(client.url, "https://codex.unblocklabs.ai/v1/decisions")
+                self.assertTrue(client._openrouter_decisions)
+                self.assertFalse(client.supports_box)
+
+                # Route through local test server while keeping _openrouter_decisions=True to verify exact JSON wire body.
+                client.url = base_url
+                s = navigator.screen(observe(), "data:image/jpeg;base64,AA==")
+                req = navigator.request(s, "Open the profile")
+                opts = req["questions"][0]["choices"]
+                next_probs = {c["value"]: 1.0 if c["value"] == "done" else 0.0 for c in opts}
+                blocked_probs = {k: 1.0 if k == "none" else 0.0 for k in navigator.BLOCKED_OPTIONS}
+                server.replies = [(200, {
+                    "model": "liquid/d1.2-ultra-20261116",
+                    "answers": {
+                        "next": {"type": "choice", "choice": "done", "probabilities": next_probs, "confidence": 0.99},
+                        "done": {"type": "noul", "noul": 0.98},
+                        "blocked": {"type": "choice", "choice": "none", "probabilities": blocked_probs, "confidence": 0.99},
+                        "done2": {"type": "noul", "noul": 0.97},
+                        "progress": {"type": "score", "score": 2.95, "legend": {"0": "a", "1": "b", "2": "c", "3": "d"}, "probabilities": {"0": 0.0, "1": 0.0, "2": 0.05, "3": 0.95}, "confidence": 0.95},
+                    },
+                })]
+                self.assertEqual(navigator.decide(client.ask, s, "Open the profile")["action"], "done")
+                path, auth, body = server.requests[-1]
+                self.assertEqual((path, auth, body["model"]), ("/v1/decisions", "Bearer codex-key", "liquid/d1.2-ultra"))
+                self.assertNotIn("assets", body)
+                self.assertIn({"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AA=="}}, body["state"])
+
+                # Bare string input (like CHECK) is also wrapped in a list for codex-lb/OpenRouter Decisions.
+                server.replies = [(200, {"model": "liquid/d1.2-ultra-20261116", "answers": {"check": {"type": "noul", "noul": 0.99}}})]
+                out = client.ask(CHECK)
+                self.assertAlmostEqual(out["check"]["probability"], 0.99)
+                _, _, check_body = server.requests[-1]
+                self.assertEqual(check_body["state"], ["The sky is blue."])
+
+                # CODEX_LB_API_KEY env fallback works for codex.unblocklabs.ai liquid configs.
+                codex_cfg = IPhoneConfig({
+                    "OPENCLAW_IPHONE_GOAL_ENABLED": "1",
+                    "OPENCLAW_IPHONE_GOAL_PROVIDER": "liquid",
+                    "OPENCLAW_IPHONE_GOAL_MODEL": "liquid/d1.2-ultra",
+                    "OPENCLAW_IPHONE_LIQUID_BASE_URL": "https://codex.unblocklabs.ai/v1/decisions",
+                })
+                resolved = decisions_from_config(codex_cfg, env={"CODEX_LB_API_KEY": "codex-env-key"})
+                self.assertIsInstance(resolved, LiquidDecisions)
+                self.assertEqual((resolved.api_key, resolved.url, resolved.model),
+                                 ("codex-env-key", "https://codex.unblocklabs.ai/v1/decisions", "liquid/d1.2-ultra"))
+            finally:
+                server.shutdown()
+                thread.join(timeout=5)
 
     def test_same_distinguishes_different_screens_with_identical_byte_length(self):
         a = png(16, 16)

@@ -24,7 +24,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
-from . import navigator
+from . import __version__, navigator
 from .config import IPhoneConfig
 from .errors import OpenClawIPhoneError, diagnostic
 from .inputs import validate_text
@@ -74,7 +74,11 @@ class Decisions:
 
     def _post(self, body: dict, *, headers: dict[str, str] | None = None) -> dict:
         data = json.dumps(body).encode()
-        req_headers = {"Content-Type": "application/json", **(headers or {})}
+        req_headers = {
+            "Content-Type": "application/json",
+            "User-Agent": f"openclaw-iphone/{__version__}",
+            **(headers or {}),
+        }
         if self.api_key:
             req_headers["Authorization"] = f"Bearer {self.api_key}"
         for attempt in range(RETRIES + 1):  # asking has no side effects: rate limits and server errors are retried
@@ -95,13 +99,15 @@ class Decisions:
 
 
 class SystemOneDecisions(Decisions):
-    """Shared System One wire adapter (POST .../systemone) for TypeSafe Jev and Liquid AI LFM-d1."""
+    """Shared System One / OpenRouter Decisions wire adapter for TypeSafe Jev and Liquid AI LFM-d1."""
 
     endpoint = "systemone"
     image_headers: dict[str, str] = {}
+    _openrouter_decisions = False
 
     def ask(self, body: dict) -> dict:
         state, assets, questions = body["input"], {}, {}
+        inline_images = bool(getattr(self, "_openrouter_decisions", False))
         if isinstance(state, list):
             state = []
             for message in body["input"]:
@@ -112,11 +118,17 @@ class SystemOneDecisions(Decisions):
                         prefix, separator, data = part["image_url"].partition(",")
                         if not separator or prefix != "data:image/jpeg;base64":
                             raise navigator.Unavailable("Unsupported navigator image.", category="bad_request")
-                        ref = str(uuid.uuid4())
-                        assets[ref] = {"type": "image", "format": "jpg", "data_base64": data}
-                        state.append({"screenshot": ref})
+                        if inline_images:
+                            state.append({"type": "image_url", "image_url": {"url": part["image_url"]}})
+                        else:
+                            ref = str(uuid.uuid4())
+                            assets[ref] = {"type": "image", "format": "jpg", "data_base64": data}
+                            state.append({"screenshot": ref})
                     else:
                         raise navigator.Unavailable("Unsupported navigator input.", category="bad_request")
+        elif inline_images:
+            # OpenRouter / codex-lb Decisions rejects bare objects and accepts array-wrapped state.
+            state = [state]
         for question in body["questions"]:
             kind = question["type"]
             mapped: dict[str, object] = {
@@ -207,8 +219,32 @@ class TypeSafeDecisions(SystemOneDecisions):
         super().__init__(api_key, base_url=base_url, model=model, timeout=timeout, local_guard=local_guard)
 
 
+def _is_codex_decisions_url(base_url: str) -> bool:
+    try:
+        parsed = urllib.parse.urlsplit(base_url)
+    except ValueError:
+        return False
+    return (parsed.hostname or "").lower() == "codex.unblocklabs.ai"
+
+
+def _uses_openrouter_decisions(base_url: str, model: str) -> bool:
+    try:
+        parsed = urllib.parse.urlsplit(base_url)
+    except ValueError:
+        return False
+    path = parsed.path.rstrip("/")
+    host = (parsed.hostname or "").lower()
+    if path.endswith("/systemone") or is_loopback_url(base_url):
+        return False
+    return (
+        path.endswith("/decisions")
+        or host in {"codex.unblocklabs.ai", "openrouter.ai"}
+        or model.strip().lower().startswith("liquid/")
+    )
+
+
 class LiquidDecisions(SystemOneDecisions):
-    """Liquid AI LFM-d1 (hosted d1.2 / d1.2-ultra or local MLX d1-omni-600M/2B) via System One."""
+    """Liquid AI LFM-d1 via direct System One, OpenRouter/codex-lb Decisions, or local MLX d1-omni."""
 
     model = LIQUID_MODEL
     provider = "Liquid AI (LFM-d1)"
@@ -219,11 +255,20 @@ class LiquidDecisions(SystemOneDecisions):
                  timeout: float = 30, local_guard: Decisions | None = None,
                  supports_box: bool | None = None) -> None:
         super().__init__(api_key, base_url=base_url, model=model, timeout=timeout, local_guard=local_guard)
+        self._openrouter_decisions = _uses_openrouter_decisions(base_url, self.model)
+        root = base_url.rstrip("/")
+        if self._openrouter_decisions:
+            self.url = root if root.endswith("/decisions") else f"{root}/decisions"
+        else:
+            self.url = root if root.endswith("/systemone") else f"{root}/systemone"
         if supports_box is not None:
             self.supports_box = supports_box
+        elif self._openrouter_decisions:
+            # OpenRouter/codex-lb Liquid Decisions rejects `box` questions (HTTP 400); allow explicit override.
+            self.supports_box = False
         else:
-            # Hosted d1.2/d1.2-ultra models support native Box grounding; open-weight
-            # d1-omni-600M/2B MLX models evaluate noul/choice/score natively (override via OPENCLAW_IPHONE_GOAL_VISION_BOX).
+            # Direct hosted d1.2/d1.2-ultra supports native Box grounding; open-weight
+            # d1-omni-600M/2B MLX evaluates noul/choice/score natively (override via OPENCLAW_IPHONE_GOAL_VISION_BOX).
             self.supports_box = self.model.strip().lower().startswith("d1.2")
 
 
@@ -243,6 +288,8 @@ def read_key_file(path: Path, *, provider: str = "openai") -> str | None:
     """A bare key or the selected provider's dotenv field; never use another provider's key."""
     text = path.read_text(encoding="utf-8")
     accepted = {f"{provider.upper()}_API_KEY", f"OPENCLAW_IPHONE_{provider.upper()}_API_KEY"}
+    if provider == "liquid":
+        accepted.add("CODEX_LB_API_KEY")
     for line in text.splitlines():
         name, equals, value = line.strip().removeprefix("export ").partition("=")
         if equals and name.strip() in accepted:
@@ -283,6 +330,8 @@ def api_key(config: IPhoneConfig, env: Mapping[str, str] | None = None) -> tuple
         base_url = (config.get("OPENCLAW_IPHONE_LIQUID_BASE_URL") or "").strip()
         if base_url and is_loopback_url(base_url):
             return "", f"local loopback endpoint {base_url} (no key required)"
+        if base_url and _is_codex_decisions_url(base_url) and (env.get("CODEX_LB_API_KEY") or "").strip():
+            return env["CODEX_LB_API_KEY"].strip(), "CODEX_LB_API_KEY in the environment"
         return None, "no Liquid API key: use goal setup --provider liquid --key-file PATH or --key-stdin"
     return None, NO_KEY if provider == "openai" else "no TypeSafe API key: use goal setup --provider typesafe --key-file PATH"
 

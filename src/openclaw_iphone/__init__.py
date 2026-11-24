@@ -1,3 +1,3 @@
 """Reusable iPhone control primitives for OpenClaw agents."""
 
-__version__ = "0.10.0"
+__version__ = "0.10.1"
