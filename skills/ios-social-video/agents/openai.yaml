@@ -1,0 +1,5 @@
+interface:
+  display_name: "iOS Social Video"
+  short_description: "Copy Instagram/TikTok links from iPhone and download .mp4 for video analysis"
+  brand_color: "#E1306C"
+  default_prompt: "Use $ios-social-video to copy the Instagram/TikTok share link via pasteboard, download the .mp4 with `openclaw-iphone media fetch`, analyze it with `video-understand`, and clean up the temporary file."

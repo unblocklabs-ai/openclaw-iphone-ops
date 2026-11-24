@@ -71,6 +71,9 @@ Templates and wrappers live under `snippets/launchd/`:
 - `openclaw-iphone-watchdog.sh`
 - `install-watchdog-launchagent.sh`
 - `com.openclaw.iphone-watchdog.plist.template`
+- `openclaw-iphone-d1-serve.sh` (optional local Apple Silicon MLX `d1-omni-600M` server)
+- `install-d1-serve-launchagent.sh`
+- `com.openclaw.iphone-d1-serve.plist.template`
 
 The wrappers set `PATH` and `PYTHONPATH` before executing the repo CLI. The CLI
 reads `~/.openclaw/iphone/config.env` or a repo-local `.env`. The install
@@ -100,6 +103,21 @@ launchctl enable "gui/$(id -u)/com.openclaw.iphone-wda-run"
 launchctl kickstart -k "gui/$(id -u)/com.openclaw.iphone-wda-run"
 ```
 
+### Fast WDA restarts (`build-for-testing` / `test-without-building`)
+
+To avoid recompiling `WebDriverAgentRunner` on every launchd restart (20-45 s -> ~3 s),
+prebuild once and save the `.xctestrun` path into `~/.openclaw/iphone/config.env`:
+
+```sh
+openclaw-iphone wda build --allow-provisioning-updates --save-config
+```
+
+Once `OPENCLAW_IPHONE_WDA_XCTESTRUN` is set, `wda run` (including the LaunchAgent)
+automatically uses `xcodebuild test-without-building`. Re-run `wda build` after Xcode
+or WDA updates. Run `wda build` from the logged-in macOS GUI session (or after
+unlocking the login keychain); non-GUI SSH sessions can fail `codesign` with
+`errSecInternalComponent`.
+
 ### Optional watchdog
 
 Install only when you want between-session lock recovery. It deliberately skips
@@ -114,6 +132,22 @@ launchctl enable "gui/$(id -u)/com.openclaw.iphone-watchdog"
 
 The watchdog interval defaults to 120 seconds. Override at install time with
 `OPENCLAW_IPHONE_WATCHDOG_INTERVAL=300 snippets/launchd/install-watchdog-launchagent.sh`.
+To let the watchdog automatically kickstart `com.openclaw.iphone-wda-run` after
+consecutive WDA failures (e.g. a hung runner), set `OPENCLAW_IPHONE_WATCHDOG_RESTART_AFTER=3`
+in `~/.openclaw/iphone/config.env` (disabled by default: `0`).
+
+### Optional local MLX `d1-omni-600M` service
+
+On Apple Silicon hosts, run `d1-omni-600M` as an always-on loopback service on `127.0.0.1:8781`:
+
+```sh
+openclaw-iphone d1 install --prefetch --configure-navigator   # or --configure-guard
+snippets/launchd/install-d1-serve-launchagent.sh
+launchctl bootout "gui/$(id -u)" ~/Library/LaunchAgents/com.openclaw.iphone-d1-serve.plist 2>/dev/null || true
+launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.openclaw.iphone-d1-serve.plist
+launchctl enable "gui/$(id -u)/com.openclaw.iphone-d1-serve"
+openclaw-iphone d1 status
+```
 
 For every unattended host, set `OPENCLAW_IPHONE_DEVICE` in
 `~/.openclaw/iphone/config.env`. The value can be the device name, CoreDevice
@@ -160,14 +194,17 @@ Restart the runner when signing, trust, Xcode state, or phone state changes.
 
 The runner replaces its Python process with `xcodebuild`, so launchd supervises
 the actual long-lived process. KeepAlive restarts exited processes, **not hung
-ones**. The watchdog checks lock state but does not restart WDA,
-repair trust/signing, unlock a passcode, or guarantee recovery after reboot.
+ones**. By default (`OPENCLAW_IPHONE_WATCHDOG_RESTART_AFTER=0`), the watchdog
+checks lock state without restarting WDA; when opted in (`>= 1`), it kickstarts
+`com.openclaw.iphone-wda-run` after that many consecutive WDA failures. It never
+repairs trust/signing, unlocks a passcode, or guarantees recovery after reboot.
 These are per-user GUI LaunchAgents: the user must be logged in. Provisioning
 and signing expiry still require operator attention.
 
-The installers pre-create owner-only logs and both plists set umask `077`.
-Existing logs are preserved and restricted, not erased. Configure host-local
-rotation/retention; neither logs nor evidence are automatically pruned. Routine
+The installers pre-create owner-only logs and all plists set umask `077`.
+Existing logs are preserved and restricted, not erased; the `wda-run` and
+`d1-serve` wrappers rotate logs over 20 MiB on startup (keeping one `.1` backup),
+while evidence files are not automatically pruned. Routine
 device checks (each watchdog pass, each session start) keep no files; only
 commands that print an `evidence:` path, and session screenshots, write evidence. The
 watchdog and foreground CLI mutations use one per-user control lock; busy
@@ -178,8 +215,10 @@ watchdog passes exit without device actions.
 ```sh
 launchctl bootout "gui/$(id -u)" ~/Library/LaunchAgents/com.openclaw.iphone-wda-run.plist
 launchctl bootout "gui/$(id -u)" ~/Library/LaunchAgents/com.openclaw.iphone-watchdog.plist
-rm ~/Library/LaunchAgents/com.openclaw.iphone-wda-run.plist
-rm ~/Library/LaunchAgents/com.openclaw.iphone-watchdog.plist
+launchctl bootout "gui/$(id -u)" ~/Library/LaunchAgents/com.openclaw.iphone-d1-serve.plist 2>/dev/null || true
+rm -f ~/Library/LaunchAgents/com.openclaw.iphone-wda-run.plist \
+      ~/Library/LaunchAgents/com.openclaw.iphone-watchdog.plist \
+      ~/Library/LaunchAgents/com.openclaw.iphone-d1-serve.plist
 ```
 
 ## OpenClaw Prompt

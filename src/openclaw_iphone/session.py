@@ -53,9 +53,11 @@ class TargetUnavailable(OpenClawIPhoneError):
 
 class Session:
     def __init__(self, connection: Connection, *, allow_images: bool = False,
-                 evidence_base: str | None = None, decisions: goal.Decisions | None = None) -> None:
+                 evidence_base: str | None = None, decisions: goal.Decisions | None = None,
+                 runner_bundle_id: str | None = None) -> None:
         self.connection, self.allow_images, self.evidence_base = connection, allow_images, evidence_base
         self.decisions = decisions
+        self.runner_bundle_id = runner_bundle_id
         self.closed = False
         self.snapshot: Observation | None = None
         self.image_geometry: tuple[tuple[float, float] | None, tuple[int, int]] | None = None
@@ -84,11 +86,13 @@ class Session:
                 raise ValueError("No current ambiguity candidates.")
             return self.snapshot.compact(include_labels=True, limit=limit, offset=offset, redact=self._redact,
                                          ids=self.candidate_ids if candidates else None)
-        def capture(depth: int) -> Observation:
+        def capture(depth: int, *, timeout: float | None = None) -> Observation:
             def read(wda: WDAClient) -> Observation:
                 wda.snapshot_depth(depth)
                 started = time.monotonic()
-                xml = wda.source(compact=True, validate=False)
+                scope = self._within(wda, timeout) if timeout is not None else nullcontext()
+                with scope:
+                    xml = wda.source(compact=True, validate=False)
                 # The application root names the app and process; no separate activeAppInfo read.
                 return parse_observation(xml, generation=0, device_udid=self.connection.device.udid,
                                          captured_at=datetime.now(timezone.utc).isoformat(),
@@ -97,9 +101,16 @@ class Session:
         self.snapshot = None
         self.candidate_ids = None
         depth = shallow.DEPTH if self.app_hint in self.shallow_apps else shallow.DEFAULT_DEPTH
+        # Cap an uncached full read when the operation budget leaves enough room for a shallow fallback.
+        budget = getattr(self.connection.ctl.runner, "budget", None)
+        remaining = budget.remaining() if budget is not None else None
+        full_timeout = (shallow.FULL_READ_TIMEOUT
+                        if depth == shallow.DEFAULT_DEPTH and self.app_hint is not None
+                        and (remaining is None or remaining > shallow.FULL_READ_TIMEOUT + 2.0)
+                        else None)
         started = time.monotonic()
         try:
-            observation = capture(depth)
+            observation = capture(depth, timeout=full_timeout)
         except (WDAStaleElement, WDAUnavailable) as exc:
             # A full read that ran long and then failed because the tree kept changing or the deadline passed is
             # the slow-app signature: remember the app and read it shallow instead of repeating the full read.
@@ -287,7 +298,9 @@ class Session:
                   "pick": {"target", "value", "order", "max_steps", "offset", "seconds"},
                   "set": {"target", "value", "value_ref", "kind", "components", "month_values", "strategy", "verify"},
                   "press": {"button", "duration"}, "launch": {"bundle_id", "wait_seconds"},
-                  "open_url": {"url"}, "goal": {"goal", "app", "text", "approve", "max_steps"}, "close": set()}
+                  "open_url": {"url"},
+                  "pasteboard": {"content_type", "foreground_runner", "runner_bundle_id", "return_app"},
+                  "goal": {"goal", "app", "text", "approve", "max_steps", "grounding"}, "close": set()}
         if not isinstance(op, str) or op not in fields or set(data) - (fields[op] | {"op", "observe", "masks", "limit", "offset"}):
             raise ValueError("Unknown operation or field.")
         required = {"swipe": {"from_x", "from_y", "to_x", "to_y"}, "press": {"button"},
@@ -350,6 +363,53 @@ class Session:
             with self.connection.operation():
                 if op == "observe":
                     return {"status": "observed", "observation": self._observe(mode, masks, limit=limit, offset=offset, candidates=candidates)}
+                if op == "pasteboard":
+                    content_type = data.get("content_type", "plaintext")
+                    foreground_runner = data.get("foreground_runner", True)
+                    runner_override = data.get("runner_bundle_id")
+                    return_app = data.get("return_app")
+                    if content_type not in {"plaintext", "url"} or type(foreground_runner) is not bool:
+                        raise ValueError("Invalid pasteboard options.")
+                    for opt in (runner_override, return_app):
+                        if opt is not None and (not isinstance(opt, str) or not opt or any(ord(c) < 32 for c in opt)):
+                            raise ValueError("Invalid bundle identifier.")
+                    # Safe initial read reconnects if the WDA session was lost.
+                    text = self._read(lambda wda: wda.pasteboard(content_type=content_type))
+                    swapped = False
+                    restored_app = None
+                    restore_warning = False
+                    runner_id = runner_override or self.runner_bundle_id
+                    if not text and foreground_runner and runner_id:
+                        wda = self.connection.require_active()
+                        read = wda.read_pasteboard(
+                            content_type=content_type,
+                            runner_bundle_id=runner_id,
+                            return_app=return_app,
+                            fallback_app=self.app_hint,
+                            foreground_runner=True,
+                            skip_initial_read=True,
+                        )
+                        text = read["text"]
+                        swapped = bool(read["swapped_app"])
+                        restored_app = read["restored_app"]
+                        restore_warning = bool(read["restore_warning"])
+                        if restored_app:
+                            self.app_hint = restored_app
+                    redacted = self._redact(text)
+                    truncated = len(redacted) > 32_768
+                    result: dict[str, object] = {
+                        "status": "checked",
+                        "text": redacted[:32_768],
+                        "truncated": truncated,
+                        "swapped_app": swapped,
+                    }
+                    if restored_app:
+                        result["restored_app"] = restored_app
+                    if restore_warning:
+                        result["restore_warning"] = True
+                    if mode:
+                        result["observation"] = self._observe(mode, masks, limit=limit, offset=offset)
+                    return result
                 target = data.get("target")
                 if target is not None and not isinstance(target, (str, dict)):
                     raise ValueError("Invalid target.")

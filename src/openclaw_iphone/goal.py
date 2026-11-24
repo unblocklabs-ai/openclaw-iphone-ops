@@ -1,14 +1,16 @@
-"""Optional goal navigation: OpenAI's Decisions API (gpt-6-luna) picks each step, the session performs it. Off unless
-configured.
+"""Optional goal navigation: OpenAI, TypeSafe, or Liquid AI (LFM-d1) picks each step; the session performs it.
 
-Each step's screenshot and on-screen text go to OpenAI. Screens with a secure (password) field are never sent.
+Off unless configured. Each step's screenshot (and screen text in AX mode) goes to the selected provider.
+Secure fields are never sent; an optional local d1-omni guard can screen every screenshot before any cloud upload.
 """
 from __future__ import annotations
 
 import base64
 from collections import Counter
 import hashlib
+import io
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -18,7 +20,9 @@ import tempfile
 import time
 from typing import Callable, Mapping
 import urllib.error
+import urllib.parse
 import urllib.request
+import uuid
 
 from . import navigator
 from .config import IPhoneConfig
@@ -27,7 +31,11 @@ from .inputs import validate_text
 
 BUNDLE_ID = re.compile(r"[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+")
 OPENAI_API = "https://api.openai.com/v1"
+TYPESAFE_API = "https://api.typesafe.ai/v1"
+LIQUID_API = "https://api.liquid.ai/decisions/v1"
 MODEL = "gpt-6-luna"
+LIQUID_MODEL = "d1.2"
+LOCAL_GUARD_MODEL = "d1-omni-600M"
 RETRIES = 2
 UNEXPANDED = re.compile(r"\$\{?[A-Za-z_][A-Za-z0-9_]*\}?")  # a $VAR reference whose variable was not set
 NO_KEY = ("no OpenAI API key: run `openclaw-iphone goal setup --key-stdin` or `--key-file PATH`, "
@@ -36,23 +44,44 @@ CHECK = {"input": "The sky is blue.",  # `goal check`: proves key and access wit
          "questions": [{"type": "predicate", "name": "check", "instructions": "Is this sentence about the sky?"}]}
 DEFAULT_STEPS, MAX_STEPS = 14, 30
 TYPED = "typed the supplied text"
+PROVIDER_ALIASES = {"openai": "openai", "typesafe": "typesafe", "liquid": "liquid", "d1": "liquid", "lfm-d1": "liquid"}
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def is_loopback_url(url: str) -> bool:
+    parsed = urllib.parse.urlparse(url)
+    return parsed.scheme in {"http", "https"} and (parsed.hostname or "").lower() in LOOPBACK_HOSTS
 
 
 class Decisions:
     """POST /v1/decisions: typed answers to the navigator's questions."""
 
-    def __init__(self, api_key: str, *, base_url: str = OPENAI_API, timeout: float = 30) -> None:
-        self.url = f"{base_url.rstrip('/')}/decisions"
+    endpoint = "decisions"
+    model = MODEL
+    provider = "OpenAI's Decisions API"
+    supports_box = False
+
+    def __init__(self, api_key: str, *, base_url: str = OPENAI_API, model: str | None = None,
+                 timeout: float = 30, local_guard: Decisions | None = None) -> None:
+        self.url = f"{base_url.rstrip('/')}/{self.endpoint}"
         self.api_key, self.timeout = api_key, timeout
+        if model:
+            self.model = model
+        self.local_guard = local_guard
 
     def ask(self, body: dict) -> dict:
-        data = json.dumps(dict(body, model=MODEL)).encode()
+        return navigator.answers(self._post(dict(body, model=self.model)))
+
+    def _post(self, body: dict, *, headers: dict[str, str] | None = None) -> dict:
+        data = json.dumps(body).encode()
+        req_headers = {"Content-Type": "application/json", **(headers or {})}
+        if self.api_key:
+            req_headers["Authorization"] = f"Bearer {self.api_key}"
         for attempt in range(RETRIES + 1):  # asking has no side effects: rate limits and server errors are retried
-            request = urllib.request.Request(self.url, data=data, method="POST",
-                                             headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"})
+            request = urllib.request.Request(self.url, data=data, method="POST", headers=req_headers)
             try:
                 with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                    return navigator.answers(json.load(response))
+                    return json.load(response)
             except urllib.error.HTTPError as exc:
                 exc.close()
                 if (exc.code == 429 or exc.code >= 500) and attempt < RETRIES:
@@ -65,67 +94,276 @@ class Decisions:
                 raise navigator.Unavailable("The Decisions API reply is not JSON.") from exc
 
 
+class SystemOneDecisions(Decisions):
+    """Shared System One wire adapter (POST .../systemone) for TypeSafe Jev and Liquid AI LFM-d1."""
+
+    endpoint = "systemone"
+    image_headers: dict[str, str] = {}
+
+    def ask(self, body: dict) -> dict:
+        state, assets, questions = body["input"], {}, {}
+        if isinstance(state, list):
+            state = []
+            for message in body["input"]:
+                for part in message["content"]:
+                    if part["type"] == "input_text":
+                        state.append({"text": part["text"]})
+                    elif part["type"] == "input_image":
+                        prefix, separator, data = part["image_url"].partition(",")
+                        if not separator or prefix != "data:image/jpeg;base64":
+                            raise navigator.Unavailable("Unsupported navigator image.", category="bad_request")
+                        ref = str(uuid.uuid4())
+                        assets[ref] = {"type": "image", "format": "jpg", "data_base64": data}
+                        state.append({"screenshot": ref})
+                    else:
+                        raise navigator.Unavailable("Unsupported navigator input.", category="bad_request")
+        for question in body["questions"]:
+            kind = question["type"]
+            mapped: dict[str, object] = {
+                "type": "noul" if kind == "predicate" else kind,
+                "instructions": question["instructions"],
+            }
+            if kind == "choice":
+                mapped["criteria"] = {c["value"]: c["description"] for c in question["choices"]}
+            elif kind == "score":
+                mapped["criteria"] = [level["description"] for level in question["levels"]]
+            elif kind not in {"predicate", "box", "boxes", "text"}:
+                raise navigator.Unavailable("Unsupported navigator question.", category="bad_request")
+            questions[question["name"]] = mapped
+        request: dict[str, object] = {"model": self.model, "state": state, "questions": questions}
+        if assets:
+            request["assets"] = assets
+        headers = dict(self.image_headers) if assets and self.image_headers else None
+        reply = self._post(request, headers=headers)
+
+        def number(value: object, maximum: float = 1.0) -> float:
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 <= value <= maximum:
+                raise ValueError("Invalid decision number.")
+            return float(value)
+
+        def parse_box(raw: object) -> dict[str, float]:
+            if not isinstance(raw, dict):
+                raise ValueError("Invalid box.")
+            coords = {k: number(raw[k]) for k in ("top", "bottom", "left", "right")}
+            if not (coords["left"] < coords["right"] and coords["top"] < coords["bottom"]):
+                raise ValueError("Degenerate box.")
+            return coords
+
+        answers: dict[str, object] = {}
+        try:
+            for name, question in questions.items():
+                answer = reply["answers"][name]
+                qtype = question["type"]
+                if answer["type"] != qtype:
+                    raise ValueError("Wrong answer type.")
+                if qtype == "noul":
+                    answers[name] = {"probability": number(answer["noul"])}
+                elif qtype == "choice":
+                    probabilities = answer["probabilities"]
+                    if set(probabilities) != set(question["criteria"]) or answer["choice"] not in probabilities:
+                        raise ValueError("Wrong answer options.")
+                    answers[name] = {"choice": answer["choice"],
+                                     "probabilities": {k: number(v) for k, v in probabilities.items()}}
+                elif qtype == "score":
+                    answers[name] = {"score": number(answer["score"], len(question["criteria"]) - 1)}
+                elif qtype == "box":
+                    raw_box = answer.get("box")
+                    parsed = parse_box(raw_box) if raw_box is not None else None
+                    conf = number(answer.get("confidence", 1.0 if parsed is not None else 0.0))
+                    answers[name] = {"box": parsed, "confidence": conf}
+                elif qtype == "boxes":
+                    raw_items = answer.get("boxes")
+                    if not isinstance(raw_items, list):
+                        raise ValueError("Invalid boxes.")
+                    parsed_items = []
+                    for item in raw_items:
+                        if not isinstance(item, dict):
+                            raise ValueError("Invalid box item.")
+                        coords = parse_box(item.get("box", item))
+                        conf = number(item.get("confidence", 1.0))
+                        parsed_items.append({"box": coords, "confidence": conf})
+                    answers[name] = {"boxes": parsed_items}
+                elif qtype == "text":
+                    raw_text = answer.get("text")
+                    cleaned = None if raw_text is None or str(raw_text).strip().lower() == "not found" else str(raw_text)
+                    answers[name] = {"text": cleaned}
+                else:
+                    raise ValueError("Unsupported answer type.")
+        except (KeyError, TypeError, ValueError):
+            raise navigator.Unavailable(f"Unexpected {self.provider} reply.") from None
+        return answers
+
+
+class TypeSafeDecisions(SystemOneDecisions):
+    """Translate the navigator's questions to TypeSafe's native System One contract."""
+
+    model = "jev-1.14.0"
+    provider = "TypeSafe (experimental images)"
+    image_headers = {"TypeSafe-Danger-Zone-Images": "true"}
+    supports_box = False
+
+    def __init__(self, api_key: str, *, base_url: str = TYPESAFE_API, model: str | None = None,
+                 timeout: float = 30, local_guard: Decisions | None = None) -> None:
+        super().__init__(api_key, base_url=base_url, model=model, timeout=timeout, local_guard=local_guard)
+
+
+class LiquidDecisions(SystemOneDecisions):
+    """Liquid AI LFM-d1 (hosted d1.2 / d1.2-ultra or local MLX d1-omni-600M/2B) via System One."""
+
+    model = LIQUID_MODEL
+    provider = "Liquid AI (LFM-d1)"
+    image_headers = {}
+    supports_box = True
+
+    def __init__(self, api_key: str = "", *, base_url: str = LIQUID_API, model: str | None = None,
+                 timeout: float = 30, local_guard: Decisions | None = None,
+                 supports_box: bool | None = None) -> None:
+        super().__init__(api_key, base_url=base_url, model=model, timeout=timeout, local_guard=local_guard)
+        if supports_box is not None:
+            self.supports_box = supports_box
+        else:
+            # Hosted d1.2/d1.2-ultra models support native Box grounding; open-weight
+            # d1-omni-600M/2B MLX models evaluate noul/choice/score natively (override via OPENCLAW_IPHONE_GOAL_VISION_BOX).
+            self.supports_box = self.model.strip().lower().startswith("d1.2")
+
+
+def goal_provider(config: IPhoneConfig) -> str:
+    raw = (config.get("OPENCLAW_IPHONE_GOAL_PROVIDER") or "openai").strip().lower()
+    provider = PROVIDER_ALIASES.get(raw)
+    if provider is None:
+        raise ValueError("OPENCLAW_IPHONE_GOAL_PROVIDER must be openai, typesafe, or liquid.")
+    return provider
+
+
 def enabled(config: IPhoneConfig) -> bool:
     return (config.get("OPENCLAW_IPHONE_GOAL_ENABLED") or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-def read_key_file(path: Path) -> str | None:
-    """A bare key, or the value of an OPENAI_API_KEY= line (so an existing .env file can be pointed at)."""
+def read_key_file(path: Path, *, provider: str = "openai") -> str | None:
+    """A bare key or the selected provider's dotenv field; never use another provider's key."""
     text = path.read_text(encoding="utf-8")
+    accepted = {f"{provider.upper()}_API_KEY", f"OPENCLAW_IPHONE_{provider.upper()}_API_KEY"}
     for line in text.splitlines():
         name, equals, value = line.strip().removeprefix("export ").partition("=")
-        if equals and name.strip() in {"OPENAI_API_KEY", "OPENCLAW_IPHONE_OPENAI_API_KEY"}:
+        if equals and name.strip() in accepted:
             return value.strip().strip("'\"") or None
     token = text.strip()
-    return token if token and not any(c.isspace() for c in token) else None
+    return token if token and "=" not in token and not any(c.isspace() for c in token) else None
 
 
 def api_key(config: IPhoneConfig, env: Mapping[str, str] | None = None) -> tuple[str | None, str]:
-    """The OpenAI API key and where it came from (never the key itself), first match wins:
-    OPENCLAW_IPHONE_OPENAI_API_KEY, the file named by OPENCLAW_IPHONE_OPENAI_API_KEY_FILE, then OPENAI_API_KEY."""
+    """The selected provider's key and source (never the key itself), without cross-provider fallback."""
     env = os.environ if env is None else env
+    provider = goal_provider(config)
+    key_name = f"OPENCLAW_IPHONE_{provider.upper()}_API_KEY"
+    file_name = key_name + "_FILE"
+    env_name = f"{provider.upper()}_API_KEY"
+
     def loose(path: Path | None) -> str:
         try:
             return " (readable by others: chmod 600)" if path and path.stat().st_mode & 0o077 else ""
         except OSError:
             return ""
-    value = (config.get("OPENCLAW_IPHONE_OPENAI_API_KEY") or "").strip()
+
+    value = (config.get(key_name) or "").strip()
     if value and not UNEXPANDED.fullmatch(value):
-        if env.get("OPENCLAW_IPHONE_OPENAI_API_KEY"):
-            return value, "OPENCLAW_IPHONE_OPENAI_API_KEY in the environment"
-        return value, f"OPENCLAW_IPHONE_OPENAI_API_KEY in {config.path}{loose(config.path)}"
-    if config.get("OPENCLAW_IPHONE_OPENAI_API_KEY_FILE"):
-        path = Path(config.get("OPENCLAW_IPHONE_OPENAI_API_KEY_FILE")).expanduser()
+        if env.get(key_name):
+            return value, f"{key_name} in the environment"
+        return value, f"{key_name} in {config.path}{loose(config.path)}"
+    if config.get(file_name):
+        path = Path(config.get(file_name)).expanduser()
         try:
-            key = read_key_file(path)
+            key = read_key_file(path, provider=provider)
         except (OSError, UnicodeDecodeError):
             return None, f"key file {path} is unreadable"
         return (key, f"key file {path}{loose(path)}") if key else (None, f"no key found in {path}")
-    if (env.get("OPENAI_API_KEY") or "").strip():
-        return env["OPENAI_API_KEY"].strip(), "OPENAI_API_KEY in the environment"
-    return None, NO_KEY
+    if (env.get(env_name) or "").strip():
+        return env[env_name].strip(), f"{env_name} in the environment"
+    if provider == "liquid":
+        base_url = (config.get("OPENCLAW_IPHONE_LIQUID_BASE_URL") or "").strip()
+        if base_url and is_loopback_url(base_url):
+            return "", f"local loopback endpoint {base_url} (no key required)"
+        return None, "no Liquid API key: use goal setup --provider liquid --key-file PATH or --key-stdin"
+    return None, NO_KEY if provider == "openai" else "no TypeSafe API key: use goal setup --provider typesafe --key-file PATH"
+
+
+def _provider_cls(provider: str) -> type[Decisions]:
+    if provider == "typesafe":
+        return TypeSafeDecisions
+    if provider == "liquid":
+        return LiquidDecisions
+    return Decisions
+
+
+def local_guard_from_config(config: IPhoneConfig) -> LiquidDecisions | None:
+    url = (config.get("OPENCLAW_IPHONE_LOCAL_GUARD_URL") or "").strip()
+    if not url:
+        return None
+    if not is_loopback_url(url):
+        raise ValueError("OPENCLAW_IPHONE_LOCAL_GUARD_URL must point to a local loopback host (127.0.0.1/localhost/::1).")
+    model = (config.get("OPENCLAW_IPHONE_LOCAL_GUARD_MODEL") or LOCAL_GUARD_MODEL).strip() or LOCAL_GUARD_MODEL
+    return LiquidDecisions("", base_url=url, model=model, timeout=10)
 
 
 def goal_navigation(config: IPhoneConfig, env: Mapping[str, str] | None = None) -> str:
     """For doctor: off, on (model and where the key comes from), or incomplete (what is missing)."""
     if not enabled(config):
         return "off"
+    provider = goal_provider(config)
     key, source = api_key(config, env)
-    return f"on ({MODEL} via OpenAI's Decisions API; key: {source})" if key else f"incomplete ({source})"
+    client_cls = _provider_cls(provider)
+    model = (config.get("OPENCLAW_IPHONE_GOAL_MODEL") or client_cls.model).strip() or client_cls.model
+    guard_url = (config.get("OPENCLAW_IPHONE_LOCAL_GUARD_URL") or "").strip()
+    guard_note = "; local guard: on" if guard_url else ""
+    if key is None:
+        return f"incomplete ({source})"
+    return f"on ({model} via {client_cls.provider}; key: {source}{guard_note})"
 
 
 def decisions_from_config(config: IPhoneConfig, env: Mapping[str, str] | None = None) -> Decisions | None:
-    key = api_key(config, env)[0] if enabled(config) else None
+    if not enabled(config):
+        return None
+    key = api_key(config, env)[0]
     if key is None:
         return None
-    return Decisions(key, base_url=config.get("OPENCLAW_IPHONE_OPENAI_BASE_URL") or OPENAI_API)
+    provider = goal_provider(config)
+    model = (config.get("OPENCLAW_IPHONE_GOAL_MODEL") or "").strip() or None
+    local_guard = local_guard_from_config(config)
+    if provider == "typesafe":
+        return TypeSafeDecisions(key, model=model, local_guard=local_guard)
+    if provider == "liquid":
+        base_url = (config.get("OPENCLAW_IPHONE_LIQUID_BASE_URL") or LIQUID_API).strip() or LIQUID_API
+        vision_box_raw = (config.get("OPENCLAW_IPHONE_GOAL_VISION_BOX") or "").strip().lower()
+        vision_box = True if vision_box_raw in {"1", "true", "yes", "on"} else False if vision_box_raw in {"0", "false", "no", "off"} else None
+        return LiquidDecisions(key, base_url=base_url, model=model, local_guard=local_guard, supports_box=vision_box)
+    base_url = (config.get("OPENCLAW_IPHONE_OPENAI_BASE_URL") or OPENAI_API).strip() or OPENAI_API
+    return Decisions(key, base_url=base_url, model=model, local_guard=local_guard)
 
 
 def jpeg(png: bytes) -> str:
-    """The validated request image as a data URL: JPEG quality 80, longest side at most 1024 px."""
+    """The validated request image as a data URL: JPEG quality 80, longest side at most 1024 px.
+
+    Uses in-memory Pillow when installed to avoid subprocess/temp-file churn, falling back to macOS `sips`.
+    """
     if len(png) < 24 or not png.startswith(b"\x89PNG\r\n\x1a\n"):
         raise ValueError("Invalid PNG.")
-    resize = ["-Z", "1024"] if max(struct.unpack_from(">II", png, 16)) > 1024 else []
+    width, height = struct.unpack_from(">II", png, 16)
+    try:
+        from PIL import Image  # type: ignore[import-not-found]
+    except ImportError:
+        Image = None
+    if Image is not None:
+        try:
+            with Image.open(io.BytesIO(png)) as img:
+                rgb = img.convert("RGB")
+                if max(rgb.size) > 1024:
+                    rgb.thumbnail((1024, 1024))
+                buf = io.BytesIO()
+                rgb.save(buf, format="JPEG", quality=80)
+                return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+        except OSError:
+            pass
+    resize = ["-Z", "1024"] if max(width, height) > 1024 else []
     with tempfile.TemporaryDirectory() as directory:
         source, target = Path(directory, "screen.png"), Path(directory, "screen.jpg")
         source.write_bytes(png)
@@ -137,21 +375,67 @@ def jpeg(png: bytes) -> str:
         return "data:image/jpeg;base64," + base64.b64encode(target.read_bytes()).decode()
 
 
+def _png_dimensions(data: bytes) -> tuple[int, int] | None:
+    if len(data) >= 24 and data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return struct.unpack_from(">II", data, 16)
+    return None
+
+
 def same(a: bytes, b: bytes) -> bool:
-    """Screenshots of an unchanged screen: identical, or PNG sizes within 0.05% (the status-bar clock, a cursor)."""
-    return a == b or abs(len(a) - len(b)) <= len(b) * 0.0005
+    """Screenshots of an unchanged screen: identical, or matching dimensions with tight PNG size & body stability."""
+    if a == b:
+        return True
+    if not a or not b:
+        return False
+    dims_a, dims_b = _png_dimensions(a), _png_dimensions(b)
+    if dims_a is not None and dims_b is not None and dims_a != dims_b:
+        return False
+    if abs(len(a) - len(b)) > len(b) * 0.0005:
+        return False
+    # Guard against distinct same-dimension screens whose compressed lengths happen to match:
+    # if both the midpoint and tail byte slices diverge, treat the screen as changed (conservative).
+    if len(a) >= 256 and len(b) >= 256:
+        mid_a, mid_b = len(a) // 2, len(b) // 2
+        tail_a, tail_b = a[-64:], b[-64:]
+        if a[mid_a:mid_a + 64] != b[mid_b:mid_b + 64] and tail_a != tail_b:
+            return False
+    return True
 
 
-def settle(shot: Callable[[], bytes]) -> bytes:
-    """The first of two screenshots 0.15 s apart that match (at most 3 s), else the latest."""
+def settle(shot: Callable[[], bytes], *, max_wait: float = 2.0, poll: float = 0.12) -> bytes:
+    """The first of two screenshots `poll` s apart that match (at most `max_wait` s), else the latest."""
     started, previous = time.monotonic(), shot()
-    while time.monotonic() - started < 3:
-        time.sleep(0.15)
+    while time.monotonic() - started < max_wait:
+        time.sleep(poll)
         current = shot()
         if same(current, previous):
             return current
         previous = current
     return previous
+
+
+def _window_size(session, obs, *, png_dims: tuple[int, int] | None = None,
+                 size_cache: dict[tuple[int, int] | None, tuple[float, float]] | None = None) -> tuple[float, float]:
+    if obs is not None and obs.elements and obs.elements[0].bounds is not None:
+        _, _, w, h = obs.elements[0].bounds
+        size = (float(w), float(h))
+        if size_cache is not None:
+            size_cache[png_dims] = size
+        return size
+    if size_cache is not None and png_dims in size_cache:
+        return size_cache[png_dims]
+    cached = getattr(session, "image_geometry", None)
+    if cached and cached[0] and (png_dims is None or cached[1] == png_dims):
+        size = (float(cached[0][0]), float(cached[0][1]))
+        if size_cache is not None:
+            size_cache[png_dims] = size
+        return size
+    with session.connection.operation():
+        raw = session._read(lambda wda: wda.window_size())
+    size = (float(raw[0]), float(raw[1]))
+    if size_cache is not None:
+        size_cache[png_dims] = size
+    return size
 
 
 def run(session, decisions: Decisions, data: dict) -> dict:
@@ -168,12 +452,19 @@ def run(session, decisions: Decisions, data: dict) -> dict:
     max_steps = data.get("max_steps", DEFAULT_STEPS)
     if type(max_steps) is not int or not 1 <= max_steps <= MAX_STEPS:
         raise ValueError(f"max_steps must be 1-{MAX_STEPS}.")
+    grounding = data.get("grounding", "auto")
+    if grounding not in {"auto", "ax", "vision"}:
+        raise ValueError("grounding must be auto, ax, or vision.")
+    supports_box = bool(getattr(decisions, "supports_box", False))
+    if grounding == "vision" and not supports_box:
+        raise ValueError("Vision grounding requires a Box-capable provider (such as Liquid AI LFM-d1).")
     app = data.get("app")
     if app is not None and (not isinstance(app, str) or not app.strip() or len(app) > 200):
         raise ValueError("app is an app name or bundle identifier.")
     steps, history, seen = [], [], Counter()
     sent, uncertain, deciding = 0, False, 0.0
     outcome, reason, extra = "step_limit", None, {}
+    bundle: str | None = None
     if app is not None:  # the navigator only taps what is on screen; opening the app is the session's job
         try:
             bundle = app if BUNDLE_ID.fullmatch(app) else session.connection.ctl.find_app(
@@ -186,35 +477,88 @@ def run(session, decisions: Decisions, data: dict) -> dict:
             return {"status": "error", "dispatch": reply.get("dispatch", "not_sent"), "acknowledged_substeps": 0,
                     "outcome": "escalate", "reason": "app_not_launched", "steps": []}
         sent = 1
+    local_guard = getattr(decisions, "local_guard", None)
+    size_cache: dict[tuple[int, int] | None, tuple[float, float]] = {}
     try:
         for index in range(max_steps):
+            obs = None
+            use_vision = grounding == "vision" or (
+                grounding == "auto" and supports_box and session.app_hint in session.shallow_apps
+            )
             try:
                 with session.connection.operation():
                     png = settle(lambda: session._read(lambda wda: wda.screenshot()))
-                    session._accessibility(limit=1)
-                obs = session.snapshot
-                if app is not None and index == 0 and obs.app != bundle:  # still launching: one more settle
+                    if not use_vision:
+                        try:
+                            session._accessibility(limit=1)
+                            obs = session.snapshot
+                        except (OpenClawIPhoneError, ValueError):
+                            if grounding == "auto" and supports_box:
+                                use_vision = True
+                            else:
+                                raise
+                if not use_vision and app is not None and index == 0 and obs is not None and obs.app != bundle:
+                    # still launching: one more settle
                     with session.connection.operation():
                         png = settle(lambda: session._read(lambda wda: wda.screenshot()))
-                        session._accessibility(limit=1)
-                    obs = session.snapshot
-                if obs.elements[0].bounds is None:
-                    raise ValueError("Screen frame unavailable.")
-                if obs.secure:
-                    outcome, reason = "escalate", "secure_field"
-                    break
-                screen = navigator.screen(obs, jpeg(png))
+                        try:
+                            session._accessibility(limit=1)
+                            obs = session.snapshot
+                        except (OpenClawIPhoneError, ValueError):
+                            if grounding == "auto" and supports_box:
+                                use_vision = True
+                                obs = None
+                            else:
+                                raise
+                if not use_vision:
+                    if obs is None or obs.elements[0].bounds is None:
+                        if grounding == "auto" and supports_box:
+                            use_vision = True
+                        else:
+                            raise ValueError("Screen frame unavailable.")
+                    elif obs.secure:
+                        outcome, reason = "escalate", "secure_field"
+                        break
+                encoded_image = jpeg(png)
+                png_dims = _png_dimensions(png)
+                win_size = _window_size(session, obs, png_dims=png_dims, size_cache=size_cache) if use_vision else None
             except (OpenClawIPhoneError, OSError, ValueError) as exc:
                 outcome, reason, extra = "escalate", "capture_failed", {"error": diagnostic(exc)}
                 break
+
+            # Optional local d1-omni privacy guard: runs on-device/loopback before any cloud upload.
+            if local_guard is not None:
+                try:
+                    guard_reply = local_guard.ask(
+                        navigator.sensitive_guard_request(encoded_image, app=(obs.app if obs else session.app_hint))
+                    )
+                    if guard_reply["sensitive"]["probability"] >= navigator.THRESHOLDS["sensitive_prob"]:
+                        outcome, reason = "escalate", "secure_field"
+                        break
+                except (navigator.Unavailable, KeyError, TypeError, ValueError) as exc:
+                    outcome, reason = "escalate", "local_guard_unavailable"
+                    extra = {"error": {"category": getattr(exc, "category", "bad_reply"), "phase": "local_guard"}}
+                    break
+
             step_goal = goal if not history else f"{goal}\nAlready done: " + "; ".join(history[-4:])
             started = time.monotonic()
             try:
-                d = navigator.decide(decisions.ask, screen, step_goal)
-                step = {"app": screen.app, "action": d["action"]}
-                if d["action"] == "dismiss_overlay":
-                    d = navigator.decide(decisions.ask, screen, navigator.DISMISS_GOAL)
-                    step["dismiss"] = d["action"]
+                if use_vision:
+                    current_app = obs.app if obs is not None else (session.app_hint or bundle or "unknown")
+                    assert win_size is not None
+                    d = navigator.decide_vision(decisions.ask, encoded_image, step_goal, win_size, app=current_app)
+                    step = {"app": current_app, "action": d["action"], "grounding": "vision"}
+                    if d["action"] == "dismiss_overlay":
+                        d = navigator.decide_vision(decisions.ask, encoded_image, navigator.DISMISS_GOAL, win_size, app=current_app)
+                        step["dismiss"] = d["action"]
+                else:
+                    assert obs is not None
+                    screen = navigator.screen(obs, encoded_image)
+                    d = navigator.decide(decisions.ask, screen, step_goal)
+                    step = {"app": screen.app, "action": d["action"]}
+                    if d["action"] == "dismiss_overlay":
+                        d = navigator.decide(decisions.ask, screen, navigator.DISMISS_GOAL)
+                        step["dismiss"] = d["action"]
             except (navigator.Unavailable, KeyError, TypeError, ValueError) as exc:
                 outcome, reason = "escalate", "navigator_unavailable"
                 extra = {"error": {"category": getattr(exc, "category", "bad_reply"), "phase": "navigator"}}
@@ -242,23 +586,34 @@ def run(session, decisions: Decisions, data: dict) -> dict:
             if d["action"] == "tap":
                 if d.get("needs_approval") and d["risk"].get("effect") not in approve:
                     outcome, reason = "needs_approval", d["risk"].get("effect", "risk_check_unavailable")
-                    extra = {"pending": {"target": target["id"], "label": step["label"], "effect": d["risk"].get("effect")}}
+                    pending = {"target": target["id"], "label": step["label"], "effect": d["risk"].get("effect")}
+                    if target.get("id") is None:
+                        pending |= {"x": target["x"], "y": target["y"]}
+                    extra = {"pending": pending}
                     break
-                # The element's center on the screen just judged: an ID tap would look the element up again, a full
-                # tree read (0.3 s in light apps, 30 s and a timeout in X's timeline). If the screen moved since
-                # (a banner, a list reloading), the point may hold another control: find the element itself.
                 if same(session._read(lambda wda: wda.screenshot()), png):
                     reply = session._request({"op": "tap", "x": target["x"], "y": target["y"]})
-                else:
+                elif target.get("id") is not None:
                     reply = session._request({"op": "tap", "target": target["id"]})
-                note = f"tapped '{step['label']}'" if step["action"] == "tap" else f"closed an overlay via '{step['label']}'"
+                else:
+                    outcome, reason = "escalate", "screen_changed"
+                    break
+                label_note = step["label"] or f"({target['x']},{target['y']})"
+                note = f"tapped '{label_note}'" if step["action"] == "tap" else f"closed an overlay via '{label_note}'"
             elif d["action"] == "type_text":
                 if text is None or history and history[-1] == TYPED:
                     outcome, reason = "escalate", "text_needed" if text is None else "repeated_type"
                     break
                 reply, note = session._request({"op": "set", "value": text}), TYPED
+            elif d["action"] == "go_back":
+                reply = session._request({"op": "press", "button": "back"})
+                note = "went back"
             else:  # scroll_down
-                x, y, w, h = obs.elements[0].bounds
+                if obs is not None and obs.elements and obs.elements[0].bounds is not None:
+                    x, y, w, h = obs.elements[0].bounds
+                else:
+                    w, h = win_size if win_size is not None else _window_size(session, obs, png_dims=png_dims, size_cache=size_cache)
+                    x, y = 0.0, 0.0
                 reply = session._request({"op": "swipe", "from_x": round(x + w / 2), "from_y": round(y + h * 0.725),
                                           "to_x": round(x + w / 2), "to_y": round(y + h * 0.335), "duration": 0.3})
                 note = "scrolled down"
@@ -272,7 +627,7 @@ def run(session, decisions: Decisions, data: dict) -> dict:
             if session.closed:
                 outcome, reason = "escalate", "interrupted"
                 break
-            time.sleep(0.4)  # let the transition start before the next settle check
+            time.sleep(0.2)  # let the transition start before the next settle check
     except KeyboardInterrupt:  # between writes: a write in flight reports through its own step
         session.connection.invalidate()
         session.closed = True

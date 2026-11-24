@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 import tempfile
 from typing import Any
 
+from . import cache
 from .errors import AppNotFound, DeviceSelectionError
 from .evidence import artifact_path
 from .runner import Runner
@@ -148,8 +150,34 @@ class DeviceCtl:
         apps = [_app_from_json(item) for item in entries]
         return apps, output
 
-    def find_app(self, device_id: str, query: str) -> App:
+    def find_app(self, device_id: str, query: str, *, use_cache: bool = True) -> App:
+        if use_cache and os.environ.get("OPENCLAW_IPHONE_DISABLE_CACHE") != "1":
+            cached = cache.get_cached_apps(device_id)
+            if cached is not None:
+                cached_apps = [
+                    App(
+                        name=item.get("name", ""),
+                        bundle_identifier=item.get("bundle_identifier", ""),
+                        version=item.get("version", ""),
+                        bundle_version=item.get("bundle_version", ""),
+                    )
+                    for item in cached
+                ]
+                try:
+                    return resolve_app(cached_apps, query, device_id)
+                except AppNotFound:
+                    pass  # Cache may be stale after a new install; refresh live.
         apps, _ = self.list_apps(device_id, include_all=True)
+        if use_cache and os.environ.get("OPENCLAW_IPHONE_DISABLE_CACHE") != "1":
+            cache.set_cached_apps(device_id, [
+                {
+                    "name": app.name,
+                    "bundle_identifier": app.bundle_identifier,
+                    "version": app.version,
+                    "bundle_version": app.bundle_version,
+                }
+                for app in apps
+            ])
         return resolve_app(apps, query, device_id)
 
 def resolve_app(apps: list[App], query: str, device_id: str) -> App:

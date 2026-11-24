@@ -1,12 +1,88 @@
 # Goal navigation (optional)
 
 Off by default. When enabled, the session's `goal` operation hands navigation to
-OpenAI's Decisions API (`gpt-6-luna`): each step captures the screen, the model
+OpenAI's Decisions API (`gpt-6-luna`, the default), Liquid AI's LFM-d1 (`d1.2` / `d1.2-ultra` / local `d1-omni-*`),
+or TypeSafe (`jev-1.14.0`): each step captures the screen, the model
 picks the next tap, text entry or scroll, and the session performs it, until the
 goal looks done or something needs the agent. The agent still owns the task: it supplies the goal,
 any text to type and which risky effects are pre-approved, and it checks the result.
 
 ## Enable
+
+### Liquid AI LFM-d1 (hosted `d1.2` / `d1.2-ultra` or local `d1-omni-*`)
+
+Liquid AI's `d1` decision models evaluate screenshots in a single forward pass with
+zero output tokens and support native **`box` visual grounding**. When configured,
+`ready.capabilities` includes both `goal` and `goal_vision_box`:
+
+- **Automatic AX-free fallback:** In heavy or shallow apps (such as App Store, X,
+  Instagram, or WebViews) where accessibility `/source` reads are slow or capped,
+  `goal` automatically switches to single-pass screenshot + `box` grounding
+  (combining action, completion, overlay, sensitive-screen guard, target coordinates,
+  and tap risk in one pass). You can also force `"grounding": "vision"` per request.
+- **Local Apple Silicon MLX `d1-omni-600M` (zero core dependencies):** Install
+  `mlx-vlm` into an isolated host venv (`~/.openclaw/iphone/mlx-venv`) and serve
+  `LiquidAI/d1-omni-600M-MLX-8bit` (~600 MB RAM) over loopback `127.0.0.1:8781`.
+  Run it either as a zero-API-cost local navigator (`--configure-navigator`) or as
+  a fast local privacy guard ahead of a cloud provider (`--configure-guard`,
+  screening password/OTP/payment/CAPTCHA screens before any cloud call). Note:
+  `d1-omni-600M` evaluates `noul`/`choice`/`score` natively (so `goal_vision_box`
+  defaults to off for `d1-omni*` models and on for `d1.2*`; override with
+  `OPENCLAW_IPHONE_GOAL_VISION_BOX=1|0`).
+
+```sh
+# 1) Local Apple Silicon MLX d1-omni-600M (isolated venv, no core runtime deps)
+openclaw-iphone d1 install --prefetch --configure-navigator   # or --configure-guard
+openclaw-iphone d1 serve                                      # or install snippets/launchd/install-d1-serve-launchagent.sh
+openclaw-iphone d1 status
+openclaw-iphone goal check
+
+# 2) Hosted Liquid AI d1.2 (or --model d1.2-ultra) with Box visual grounding
+openclaw-iphone goal setup --provider liquid --key-file ~/.secrets/liquid.env --model d1.2
+openclaw-iphone goal check
+
+# 3) Hosted cloud navigator + local MLX d1-omni-600M privacy guard
+openclaw-iphone d1 install --prefetch --configure-guard
+openclaw-iphone goal setup --provider liquid --key-file ~/.secrets/liquid.env --model d1.2
+```
+
+Equivalent host settings:
+
+```sh
+OPENCLAW_IPHONE_GOAL_ENABLED="1"
+OPENCLAW_IPHONE_GOAL_PROVIDER="liquid"
+OPENCLAW_IPHONE_GOAL_MODEL="d1.2"
+OPENCLAW_IPHONE_LIQUID_API_KEY_FILE="~/.secrets/liquid.env"
+# OPENCLAW_IPHONE_LIQUID_BASE_URL="https://api.liquid.ai/decisions/v1"
+```
+
+### Reuse a TypeSafe/Jev key
+
+```sh
+openclaw-iphone goal setup --provider typesafe --key-file ~/.openclaw/secrets/unblock-memory-typesafe.env
+openclaw-iphone goal check
+```
+
+The referenced file can contain `TYPESAFE_API_KEY=...` or a bare key. The key stays
+in that file and is read on each new session; it is not copied to the iPhone config.
+Alternatively, use `--key-stdin` or an existing `TYPESAFE_API_KEY` environment variable.
+TypeSafe credentials never fall back to an OpenAI key (or vice versa).
+
+**Experimental vision:** TypeSafe labels image support experimental. This adapter
+sends the `TypeSafe-Danger-Zone-Images: true` header for screenshot requests only.
+It preserves the navigator's consent/risky-tap checks, but the OpenAI benchmark
+results below do not establish Jev's accuracy. Validate the actual app workflow
+before unattended use. See [TypeSafe images](https://docs.typesafe.ai/images).
+
+Equivalent host settings:
+
+```sh
+OPENCLAW_IPHONE_GOAL_ENABLED="1"
+OPENCLAW_IPHONE_GOAL_PROVIDER="typesafe"
+OPENCLAW_IPHONE_TYPESAFE_API_KEY_FILE="~/.openclaw/secrets/unblock-memory-typesafe.env"
+```
+
+### OpenAI (default)
 
 Goal navigation needs an OpenAI API key with Decisions API access. Either store
 the key, or point to where it already is:
@@ -42,9 +118,9 @@ or `incomplete (<what is missing>)`, never the key. When it is on, the session's
 `ready.capabilities` includes `goal`.
 
 **Privacy:** every step sends a screenshot and the screen's text (labels, names)
-to OpenAI. Text supplied with `text` is typed on the phone, not sent. A screen with
+to the selected provider. Text supplied with `text` is typed on the phone, not sent. A screen with
 a password field is never sent; the goal stops instead. Enable this only where
-sending screen contents to OpenAI is acceptable (OpenAI offers Zero Data Retention
+sending screen contents to that provider is acceptable (OpenAI offers Zero Data Retention
 to eligible API organizations).
 
 ## Request
@@ -60,12 +136,16 @@ to eligible API organizations).
 - `app`: optional app name (`"X"`, `"Instagram"`) or bundle identifier to open first.
   The navigator only taps what is on screen: it can't open an app that isn't on the
   current home-screen page, and starting from the home screen sends that screen
-  (widgets included) to OpenAI. A name costs one installed-app lookup (~0.3 s);
+  (widgets included) to the configured provider. A name costs one installed-app lookup (~0.3 s, cached for 10 min);
   a bundle identifier skips it.
 - `text`: typed with `set` (whole-field replacement) when a focused field needs it.
 - `approve`: risky effects the agent pre-approves: `communication`,
   `social_action`, `purchase_install`, `permission_grant`. Default none.
 - `max_steps`: 1-30, default 14.
+- `grounding`: optional `"auto"` (default), `"ax"`, or `"vision"`. With a
+  `Box`-capable provider (`liquid` / LFM-d1), `"auto"` automatically falls back
+  to AX-free screenshot + `box` grounding when `/source` fails or the app is in
+  `shallow-apps.json`; `"vision"` skips `/source` altogether.
 
 The reply has no observation; observe separately when you need the screen.
 
@@ -89,7 +169,8 @@ The reply has no observation; observe separately when you need the screen.
   `app_not_launched` (for `app`), `permission_or_consent_prompt`
   (never auto-answered), `low_confidence`, `nothing_on_screen_helps`,
   `secure_field`, `text_needed`, `repeated_type`, `no_progress`,
-  `cannot_dismiss_overlay_safely`, `navigator_unavailable` (with a safe
+  `cannot_dismiss_overlay_safely`, `local_guard_unavailable`, `screen_changed`,
+  `navigator_unavailable` (with a safe
   `error.category`, e.g. `http_401`; rate limits and server errors are retried twice first), `capture_failed`, `action_not_sent`,
   `inspect_before_retry` (a write may have happened), `interrupted`.
 - `step_limit`: `max_steps` ran out.
@@ -120,7 +201,7 @@ full depth; a coordinate tap took 0.75 s everywhere. Screens of apps measured sl
 
 ## How a step works
 
-1. Wait until two screenshots 0.15 s apart match (at most 3 s), then read the AX source.
+1. Wait until two screenshots 0.12 s apart match (at most 2.0 s), then read the AX source.
 2. Build candidates: on-screen controls and text, without scroll bars, keyboard keys,
    empty containers, controls under the tab bar, keyboard or status bar, or text that
    repeats its control's label. Each candidate is a choice described by its own line.

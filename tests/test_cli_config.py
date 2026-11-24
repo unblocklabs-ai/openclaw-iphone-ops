@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import io
+import os
 import plistlib
 from pathlib import Path
 import tempfile
@@ -501,6 +502,154 @@ class CLIConfigTests(unittest.TestCase):
         self.assertIn("wda-ready: false", output)
         self.assertIn("result: attention-required", output)
         self.assertIn("blocker: connection refused", output)
+
+    def test_watchdog_once_kickstarts_wda_after_consecutive_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict("os.environ", {"HOME": tmp}):
+            fake_device = FakeDeviceCtl()
+            args = argparse.Namespace(
+                device=None,
+                url=None,
+                developer_dir=None,
+                evidence_dir=None,
+                timeout=30,
+                no_verify=False,
+                restart_after=2,
+            )
+            kickstarts: list[list[str]] = []
+
+            def fake_subproc(cmd, **kwargs):
+                kickstarts.append(cmd)
+                return mock.Mock(returncode=0, stdout="", stderr="")
+
+            with mock.patch("openclaw_iphone.cli.client_from_args", return_value=fake_device), \
+                 mock.patch("openclaw_iphone.cli.wda_client_from_args", return_value=LockFailingWDA()), \
+                 mock.patch("openclaw_iphone.cli.subprocess.run", side_effect=fake_subproc):
+                out1 = io.StringIO()
+                with contextlib.redirect_stdout(out1):
+                    rc1 = cli.handle_watchdog_once(args)
+                self.assertEqual(rc1, 1)
+                self.assertEqual(kickstarts, [])
+
+                out2 = io.StringIO()
+                with contextlib.redirect_stdout(out2):
+                    rc2 = cli.handle_watchdog_once(args)
+                self.assertEqual(rc2, 1)
+                self.assertEqual(len(kickstarts), 1)
+                self.assertIn("kickstart", kickstarts[0])
+                self.assertIn("recovery: kickstarted com.openclaw.iphone-wda-run", out2.getvalue())
+
+            # Recovery resets consecutive failure count.
+            with mock.patch("openclaw_iphone.cli.client_from_args", return_value=fake_device), \
+                 mock.patch("openclaw_iphone.cli.wda_client_from_args", return_value=FakeWDA(ready=True, locked_values=[False])):
+                out3 = io.StringIO()
+                with contextlib.redirect_stdout(out3):
+                    rc3 = cli.handle_watchdog_once(args)
+                self.assertEqual(rc3, 0)
+                self.assertIn("result: ok", out3.getvalue())
+
+            # launchctl timeout is caught cleanly instead of raising an unhandled traceback.
+            import subprocess
+            with mock.patch("openclaw_iphone.cli.client_from_args", return_value=fake_device), \
+                 mock.patch("openclaw_iphone.cli.wda_client_from_args", return_value=LockFailingWDA()), \
+                 mock.patch("openclaw_iphone.cli.subprocess.run", side_effect=subprocess.TimeoutExpired(["launchctl"], 15)):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(cli.handle_watchdog_once(args), 1)
+                out_timeout = io.StringIO()
+                with contextlib.redirect_stdout(out_timeout):
+                    self.assertEqual(cli.handle_watchdog_once(args), 1)
+                self.assertIn("recovery: kickstart-failed", out_timeout.getvalue())
+
+            # WDA answering cleanly while phone needs human passcode resets WDA failure counter.
+            passcode_device = FakeDeviceCtl(lock_state_payload={"result": {"passcodeRequired": True}})
+            with mock.patch("openclaw_iphone.cli.client_from_args", return_value=passcode_device), \
+                 mock.patch("openclaw_iphone.cli.wda_client_from_args", return_value=FakeWDA(ready=True, locked_values=[True, True])):
+                out_human = io.StringIO()
+                with contextlib.redirect_stdout(out_human):
+                    self.assertEqual(cli.handle_watchdog_once(args), 1)
+                self.assertIn("result: human-unlock-required", out_human.getvalue())
+            # Next single failure should be 1/2 (not immediate kickstart).
+            with mock.patch("openclaw_iphone.cli.client_from_args", return_value=fake_device), \
+                 mock.patch("openclaw_iphone.cli.wda_client_from_args", return_value=LockFailingWDA()):
+                out_after = io.StringIO()
+                with contextlib.redirect_stdout(out_after):
+                    self.assertEqual(cli.handle_watchdog_once(args), 1)
+                self.assertIn("consecutive-failures: 1/2", out_after.getvalue())
+
+    def test_wda_run_xctestrun_and_without_building_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            derived = Path(tmp) / "DerivedData"
+            products = derived / "Build" / "Products"
+            products.mkdir(parents=True)
+            fresh_xctestrun = products / "WebDriverAgentRunner_iphoneos18.2-arm64.xctestrun"
+            fresh_xctestrun.write_text("<plist/>", encoding="utf-8")
+            cfg = Path(tmp) / "config.env"
+            # Point OPENCLAW_IPHONE_WDA_XCTESTRUN at a stale deleted file and omit OPENCLAW_IPHONE_WDA_PATH.
+            cfg.write_text(
+                f'OPENCLAW_IPHONE_WDA_XCTESTRUN="{products / "deleted.xctestrun"}"\n'
+                f'OPENCLAW_IPHONE_WDA_DERIVED_DATA="{derived}"\n',
+                encoding="utf-8",
+            )
+            env = {**os.environ, "HOME": tmp, "OPENCLAW_IPHONE_CONFIG": str(cfg)}
+            recorded = []
+
+            def fake_run_wda(run_cfg):
+                recorded.append(run_cfg)
+                return 0
+
+            with mock.patch.dict("os.environ", env, clear=True), \
+                 mock.patch("openclaw_iphone.cli.client_from_args", return_value=FakeDeviceCtl()), \
+                 mock.patch("openclaw_iphone.cli.run_wda", side_effect=fake_run_wda):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    rc = cli.main(["wda", "run", "--without-building"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(recorded), 1)
+            self.assertEqual(recorded[0].xctestrun, fresh_xctestrun)
+            self.assertIn("starting: xcodebuild test-without-building", out.getvalue())
+
+    def test_wda_pasteboard_cli_uses_configured_runner_bundle_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "config.env"
+            cfg.write_text('OPENCLAW_IPHONE_RUNNER_BUNDLE_ID="com.example.WDA"\n', encoding="utf-8")
+            env = {**os.environ, "HOME": tmp, "OPENCLAW_IPHONE_CONFIG": str(cfg)}
+            seen: dict[str, object] = {}
+
+            class FakePasteWDA:
+                def read_pasteboard(self, **kwargs):
+                    seen.update(kwargs)
+                    return {"text": "https://www.instagram.com/reel/xyz/", "swapped_app": True, "restored_app": "com.burbn.instagram", "restore_warning": False}
+
+            with mock.patch.dict("os.environ", env, clear=True), \
+                 mock.patch("openclaw_iphone.cli.control_lock"), \
+                 mock.patch("openclaw_iphone.cli.wda_client_from_args", return_value=FakePasteWDA()):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    rc = cli.main(["wda", "pasteboard"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(out.getvalue().strip(), "https://www.instagram.com/reel/xyz/")
+            self.assertEqual(seen["runner_bundle_id"], "com.example.WDA")
+            self.assertTrue(seen["foreground_runner"])
+
+    def test_wda_build_saves_xctestrun_to_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "config.env"
+            cfg.write_text("", encoding="utf-8")
+            wda_dir = Path(tmp) / "WebDriverAgent"
+            wda_dir.mkdir()
+            xctestrun = Path(tmp) / "derived" / "Build" / "Products" / "WebDriverAgentRunner_iphoneos.xctestrun"
+            xctestrun.parent.mkdir(parents=True)
+            xctestrun.write_text("<plist/>", encoding="utf-8")
+            env = {**os.environ, "HOME": tmp, "OPENCLAW_IPHONE_CONFIG": str(cfg), "OPENCLAW_IPHONE_WDA_PATH": str(wda_dir)}
+            with mock.patch.dict("os.environ", env, clear=True), \
+                 mock.patch("openclaw_iphone.cli.client_from_args", return_value=FakeDeviceCtl()), \
+                 mock.patch("openclaw_iphone.cli.build_wda", return_value=xctestrun):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    rc = cli.main(["wda", "build", "--save-config"])
+            self.assertEqual(rc, 0)
+            self.assertIn(f"xctestrun: {xctestrun}", out.getvalue())
+            loaded = load_config(env=env)
+            self.assertEqual(loaded.get("OPENCLAW_IPHONE_WDA_XCTESTRUN"), str(xctestrun))
 
 
 if __name__ == "__main__":

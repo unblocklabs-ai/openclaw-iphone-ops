@@ -56,11 +56,15 @@ subsequent action. Optional observation failure does not erase acknowledgment.
 ## Optional goal navigation
 
 Hosts can enable a `goal` operation that hands multi-step navigation to
-OpenAI's Decisions API (`gpt-6-luna`): the agent names a goal, the session taps,
+OpenAI's Decisions API (`gpt-6-luna`, default), Liquid AI's LFM-d1 (`d1.2`,
+`d1.2-ultra`, or local Apple Silicon MLX `d1-omni-600M` via `openclaw-iphone d1 install`
+and `d1 serve`, plus single-pass `Box` visual grounding on `d1.2*` for AX-free fallback),
+or TypeSafe/Jev (`jev-1.14.0`, experimental images): the agent names a goal, the session taps,
 types and scrolls until it looks done, stopping for consent prompts, low
 confidence and risky taps the agent hasn't pre-approved. It is off unless
-`OPENCLAW_IPHONE_GOAL_ENABLED` and an OpenAI API key are set, and it sends
-screenshots and screen text to OpenAI. `openclaw-iphone goal setup` stores the
+`OPENCLAW_IPHONE_GOAL_ENABLED` and the selected provider's API key (or a local
+loopback MLX `d1-omni-600M` server, which needs no key) are configured, and it sends
+screenshots and screen text to that provider. `openclaw-iphone goal setup` stores the
 key or points to where it is; `openclaw-iphone goal check` tests it. See
 [goal navigation](docs/goal.md).
 
@@ -86,8 +90,8 @@ Close the session before separate mutating commands.
 
 ## Distribution
 
-This is a CLI/skills bundle, not a native OpenClaw plugin. Install v0.9.3 with
-`npm install -g @unblocklabs/openclaw-iphone-ops@0.9.3`.
+This is a CLI/skills bundle, not a native OpenClaw plugin. Install v0.10.0 with
+`npm install -g @unblocklabs/openclaw-iphone-ops@0.10.0`.
 The package ships the CLI, skills, docs and snippets; register its `skills/` directory with
 the agent explicitly. The launcher supports `OPENCLAW_IPHONE_PYTHON` to select
 an absolute Python interpreter. Configuration/evidence belong outside the package.

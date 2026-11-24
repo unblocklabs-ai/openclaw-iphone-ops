@@ -193,6 +193,72 @@ class LaunchdInstallerTests(unittest.TestCase):
                 [f"{configured_repo}/snippets/launchd/openclaw-iphone-wda-run.sh"],
             )
 
+    def test_d1_serve_installer_and_wrapper(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            home.mkdir()
+            config = Path(tmp) / "config.env"
+            config.write_text(f'OPENCLAW_IPHONE_REPO_DIR="{REPO}"\n', encoding="utf-8")
+
+            result = self.run_installer(
+                "snippets/launchd/install-d1-serve-launchagent.sh",
+                home=home,
+                config=config,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            plist_path = home / "Library/LaunchAgents/com.openclaw.iphone-d1-serve.plist"
+            with plist_path.open("rb") as fh:
+                data = plistlib.load(fh)
+            self.assertEqual(
+                data["ProgramArguments"],
+                [f"{REPO}/snippets/launchd/openclaw-iphone-d1-serve.sh"],
+            )
+            self.assertEqual(data["Umask"], 0o077)
+            self.assertEqual(data["EnvironmentVariables"]["OPENCLAW_IPHONE_CONFIG"], str(config.resolve()))
+            for key in ("StandardOutPath", "StandardErrorPath"):
+                self.assertEqual(Path(data[key]).stat().st_mode & 0o777, 0o600)
+
+            # Verify wrapper script executes `d1 serve` with resolved PYTHONPATH and repo cwd.
+            root = Path(tmp).resolve()
+            interpreter = root / "python-stub"
+            calls = root / "d1-calls.jsonl"
+            interpreter.write_text(
+                f"#!{sys.executable}\n"
+                "import json, os, sys\n"
+                "from pathlib import Path\n"
+                "with Path(os.environ['IPHONE_AUDIT_CALLS']).open('a') as stream:\n"
+                "    stream.write(json.dumps({'argv': sys.argv[1:], 'cwd': os.getcwd(), 'pythonpath': os.environ.get('PYTHONPATH')}) + '\\n')\n"
+                "if sys.argv[1:] == ['-']:\n"
+                "    sys.stdin.read()\n"
+                "    print(os.environ['IPHONE_AUDIT_REPO'])\n"
+                "    sys.exit(0)\n"
+                "sys.exit(41)\n",
+                encoding="utf-8",
+            )
+            interpreter.chmod(0o700)
+            env = dict(
+                os.environ,
+                HOME=str(home),
+                OPENCLAW_IPHONE_PYTHON=str(interpreter),
+                IPHONE_AUDIT_CALLS=str(calls),
+                IPHONE_AUDIT_REPO=str(REPO),
+                PYTHONPATH="existing-path",
+            )
+            run = subprocess.run(
+                ["sh", str(REPO / "snippets/launchd/openclaw-iphone-d1-serve.sh")],
+                cwd=root,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(run.returncode, 41, run.stderr)
+            probe, execution = [json.loads(line) for line in calls.read_text().splitlines()]
+            self.assertEqual(probe["argv"], ["-"])
+            self.assertEqual(execution["argv"], ["-m", "openclaw_iphone", "d1", "serve", "--warmup"])
+            self.assertEqual(execution["cwd"], str(REPO))
+            self.assertEqual(execution["pythonpath"], f"{REPO}/src:existing-path")
+
 
 if __name__ == "__main__":
     unittest.main()

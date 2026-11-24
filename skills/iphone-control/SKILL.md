@@ -33,6 +33,10 @@ model unless the operator enabled goal navigation.
   `value_ref`/`text_ref` files, never CLI arguments or logs.
 - Use `press`, `launch`, and `open_url` for ordinary transitions. Optional
   `observe` attaches the next view without changing acknowledged dispatch.
+- Use `{"op":"pasteboard"}` (or `openclaw-iphone wda pasteboard` outside a
+  session) to read the iPhone clipboard (for example, a copied share link). On
+  iOS 16+, it automatically foregrounds the WDA runner briefly when needed and
+  restores the active app.
 - Set a wheel-style Gregorian date in one request: `set`, picker target,
   `kind: date`, and `value: YYYY-MM-DD`. The controller identifies supported
   components and handles dependencies. `verify: true` optionally reads the final
@@ -51,7 +55,7 @@ model unless the operator enabled goal navigation.
   toward a goal you name and returns `done`, `escalate` or `needs_approval`.
   Name the app with `app` ("X", "Instagram" or a bundle ID) so it opens first:
   the navigator only taps what is on screen. Pre-approve only the effects the
-  user asked for (`approve`) and check `done` yourself. It sends screenshots and screen text to OpenAI. Without the
+  user asked for (`approve`) and check `done` yourself. It sends screenshots and screen text to the configured provider. Without the
   capability, you choose every action.
   - `escalate`: the navigator stopped instead of guessing; the session stays
     open. Observe, then act yourself or send a narrower goal ("Tap Back to the
@@ -65,7 +69,18 @@ model unless the operator enabled goal navigation.
   full (X): deeper controls are missing from `elements`, so use the screenshot
   and tap by coordinates.
 - Enable goal navigation only when the operator asks, since it sends screens to
-  OpenAI. If they give you an OpenAI API key, store it with
+  the configured provider. For local Apple Silicon MLX `d1-omni-600M` (zero core
+  dependencies, isolated venv, zero cloud cost), run
+  `openclaw-iphone d1 install --prefetch --configure-navigator` (or `--configure-guard`)
+  followed by `openclaw-iphone d1 serve` (or install `snippets/launchd/install-d1-serve-launchagent.sh`).
+  For hosted Liquid AI LFM-d1 (supports single-pass `Box` visual grounding and
+  AX-free fallback in heavy apps), use
+  `openclaw-iphone goal setup --provider liquid --key-file PATH [--model d1.2|d1.2-ultra]`
+  and run `goal check`.
+  For TypeSafe/Jev, use `openclaw-iphone goal setup --provider typesafe --key-file PATH`
+  to reuse a bare-key file or `TYPESAFE_API_KEY` dotenv file, then run `goal check`.
+  TypeSafe image support is experimental; the OpenAI navigation benchmark is not evidence of Jev accuracy.
+  If they give you an OpenAI API key, store it with
   `printf '%s' "$KEY" | openclaw-iphone goal setup --key-stdin` (never as an
   argument, in logs or in replies); if they say where it is, use
   `openclaw-iphone goal setup --key-file PATH`; if `OPENAI_API_KEY` is already

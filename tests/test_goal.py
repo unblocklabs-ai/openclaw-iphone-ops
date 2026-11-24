@@ -13,8 +13,9 @@ import unittest
 from unittest import mock
 
 from openclaw_iphone import cli, navigator
-from openclaw_iphone.config import IPhoneConfig
-from openclaw_iphone.goal import Decisions, api_key, decisions_from_config, goal_navigation, jpeg
+from openclaw_iphone.config import IPhoneConfig, load_config
+from openclaw_iphone.goal import (Decisions, LiquidDecisions, TypeSafeDecisions, api_key, decisions_from_config,
+                                  goal_navigation, jpeg, local_guard_from_config, read_key_file, same)
 from openclaw_iphone.observations import parse_observation
 from test_image_evidence import png
 
@@ -229,6 +230,7 @@ class DecisionsHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         self.server.requests.append((self.path, self.headers.get("Authorization"), body))
+        self.server.image_opt_in = self.headers.get("TypeSafe-Danger-Zone-Images")
         status, reply = self.server.replies.pop(0) if self.server.replies else (200, check(0.1))
         raw = reply if isinstance(reply, bytes) else json.dumps(reply).encode()
         self.send_response(status)
@@ -238,6 +240,66 @@ class DecisionsHandler(BaseHTTPRequestHandler):
 
 
 class DecisionsTests(unittest.TestCase):
+    def test_typesafe_translates_screen_questions_images_and_answers_over_http(self):
+        # Native TypeSafe response contract, independent of the adapter's output.
+        with DecisionsServer() as server:
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
+            thread.start()
+            try:
+                client = TypeSafeDecisions("secret-key", base_url=f"http://127.0.0.1:{server.server_port}/v1")
+                s = navigator.screen(observe(), "data:image/jpeg;base64,AA==")
+                request = navigator.request(s, "Open the profile")
+                options = request["questions"][0]["choices"]
+                next_probabilities = {c["value"]: 1.0 if c["value"] == "done" else 0.0 for c in options}
+                blocked_probabilities = {k: 1.0 if k == "none" else 0.0 for k in navigator.BLOCKED_OPTIONS}
+                answer = {"answers": {
+                    "next": {"type": "choice", "choice": "done", "probabilities": next_probabilities},
+                    "done": {"type": "noul", "noul": 0.99},
+                    "blocked": {"type": "choice", "choice": "none", "probabilities": blocked_probabilities},
+                    "done2": {"type": "noul", "noul": 0.98},
+                    "progress": {"type": "score", "score": 2.9},
+                }}
+                server.replies = [(200, answer)]
+                self.assertEqual(navigator.decide(client.ask, s, "Open the profile")["action"], "done")
+                path, auth, body = server.requests[-1]
+                self.assertEqual((path, auth, body["model"]), ("/v1/systemone", "Bearer secret-key", "jev-1.14.0"))
+                ref, asset = next(iter(body["assets"].items()))
+                self.assertEqual(asset, {"type": "image", "format": "jpg", "data_base64": "AA=="})
+                self.assertIn({"screenshot": ref}, body["state"])
+                self.assertEqual(server.image_opt_in, "true")
+                self.assertEqual(body["questions"]["done"]["type"], "noul")
+                self.assertEqual(body["questions"]["next"]["criteria"]["done"], navigator.NON_ELEMENT_OPTIONS["done"])
+                self.assertEqual(body["questions"]["progress"]["criteria"], navigator.PROGRESS_LEVELS)
+                # A missing safety judgment or non-finite probability must not become an action.
+                for bad in ({"answers": {}}, {"answers": {"risky": {"type": "noul", "noul": float("nan")}}}):
+                    server.replies = [(200, bad)]
+                    with self.assertRaises(navigator.Unavailable):
+                        client.ask({"input": "screen", "questions": [navigator.predicate("risky", "Is this risky?")]})
+                self.assertIsNone(server.image_opt_in)  # text-only calls do not opt into images
+            finally:
+                server.shutdown()
+                thread.join(timeout=5)
+
+    def test_typesafe_setup_reuses_existing_secret_file_without_copying_or_cross_provider_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config, secret = Path(tmp, "config.env"), Path(tmp, "memory.env")
+            config.write_text('OPENCLAW_IPHONE_DEVICE="phone"\n')
+            secret.write_text("TYPESAFE_API_KEY=secret-typesafe\n")
+            secret.chmod(0o600)
+            env = {"HOME": tmp, "OPENCLAW_IPHONE_CONFIG": str(config), "OPENAI_API_KEY": "wrong-provider"}
+            with mock.patch.dict(os.environ, env, clear=True), contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(cli.main(["goal", "setup", "--provider", "typesafe", "--key-file", str(secret)]), 0)
+                settings = load_config()
+                client = decisions_from_config(settings)
+                self.assertIsInstance(client, TypeSafeDecisions)
+                self.assertEqual(client.api_key, "secret-typesafe")
+                self.assertEqual(config.stat().st_mode & 0o777, 0o600)
+                self.assertNotIn("secret-typesafe", config.read_text() + out.getvalue())
+                self.assertEqual(secret.read_text(), "TYPESAFE_API_KEY=secret-typesafe\n")
+                self.assertIsNone(read_key_file(secret))  # not an OpenAI credential
+                secret.write_text("OPENAI_API_KEY=wrong-provider\n")
+                self.assertIsNone(api_key(settings)[0])
+
     def test_client_posts_the_body_and_reports_failures_without_details(self):
         with DecisionsServer() as server:
             thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
@@ -354,6 +416,109 @@ class DecisionsTests(unittest.TestCase):
         self.assertEqual(size(jpeg(png(8, 16))), (8, 16))
         with self.assertRaises(ValueError):
             jpeg(b"not a png")
+
+    def test_liquid_d1_single_pass_box_grounding_and_text_extraction(self):
+        with DecisionsServer() as server:
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
+            thread.start()
+            try:
+                client = LiquidDecisions("liq-secret", base_url=f"http://127.0.0.1:{server.server_port}/decisions/v1", model="d1.2")
+                self.assertTrue(client.supports_box)
+                action_probs = {k: (0.9 if k == "tap" else 0.02) for k in navigator.VISION_ACTIONS}
+                blocked_probs = {k: (0.96 if k == "none" else 0.01) for k in navigator.BLOCKED_OPTIONS}
+                effect_probs = {k: (0.93 if k == "navigate" else 0.01) for k in navigator.EFFECTS}
+                server.replies = [(200, {"answers": {
+                    "action": {"type": "choice", "choice": "tap", "probabilities": action_probs},
+                    "done": {"type": "noul", "noul": 0.05},
+                    "blocked": {"type": "choice", "choice": "none", "probabilities": blocked_probs},
+                    "done2": {"type": "noul", "noul": 0.05},
+                    "progress": {"type": "score", "score": 2.0},
+                    "sensitive": {"type": "noul", "noul": 0.01},
+                    "target_box": {"type": "box", "box": {"left": 0.2, "top": 0.4, "right": 0.6, "bottom": 0.6}, "confidence": 0.92},
+                    "risky": {"type": "noul", "noul": 0.04},
+                    "effect": {"type": "choice", "choice": "navigate", "probabilities": effect_probs},
+                }})]
+                d = navigator.decide_vision(client.ask, "data:image/jpeg;base64,AA==", "Open Search", (400.0, 800.0), app="com.apple.AppStore")
+                self.assertEqual((d["action"], d["grounding"], d["needs_approval"]), ("tap", "vision", False))
+                self.assertEqual((d["target"]["x"], d["target"]["y"]), (160, 400))
+                self.assertEqual(d["confidence"], 0.9)
+                path, auth, body = server.requests[-1]
+                self.assertEqual((path, auth, body["model"]), ("/decisions/v1/systemone", "Bearer liq-secret", "d1.2"))
+                self.assertIsNone(server.image_opt_in)  # Liquid d1 accepts images natively without TypeSafe danger header
+                self.assertEqual(body["questions"]["target_box"]["type"], "box")
+                # Sensitive screen guard stops immediately without tapping.
+                server.replies = [(200, {"answers": {
+                    "action": {"type": "choice", "choice": "tap", "probabilities": action_probs},
+                    "done": {"type": "noul", "noul": 0.0},
+                    "blocked": {"type": "choice", "choice": "none", "probabilities": blocked_probs},
+                    "done2": {"type": "noul", "noul": 0.0},
+                    "progress": {"type": "score", "score": 1.0},
+                    "sensitive": {"type": "noul", "noul": 0.91},
+                    "target_box": {"type": "box", "box": {"left": 0.2, "top": 0.4, "right": 0.6, "bottom": 0.6}, "confidence": 0.92},
+                    "risky": {"type": "noul", "noul": 0.04},
+                    "effect": {"type": "choice", "choice": "navigate", "probabilities": effect_probs},
+                }})]
+                d_sec = navigator.decide_vision(client.ask, "data:image/jpeg;base64,AA==", "Log in", (400.0, 800.0))
+                self.assertEqual((d_sec["action"], d_sec["reason"]), ("escalate", "secure_field"))
+                # Hallucination-free text extraction treats "not found" as None.
+                server.replies = [
+                    (200, {"answers": {"extracted": {"type": "text", "text": "@pear_lmiller"}}}),
+                    (200, {"answers": {"extracted": {"type": "text", "text": "not found"}}}),
+                ]
+                self.assertEqual(navigator.extract_text(client.ask, "data:image/jpeg;base64,AA==", "Read handle"), "@pear_lmiller")
+                self.assertIsNone(navigator.extract_text(client.ask, "data:image/jpeg;base64,AA==", "Read missing"))
+                # Degenerate or out-of-range boxes are rejected cleanly.
+                server.replies = [(200, {"answers": {"b": {"type": "box", "box": {"left": 0.8, "right": 0.2, "top": 0.1, "bottom": 0.5}}}})]
+                with self.assertRaises(navigator.Unavailable):
+                    client.ask({"input": "s", "questions": [navigator.box("b", "Find it")]})
+            finally:
+                server.shutdown()
+                thread.join(timeout=5)
+
+    def test_liquid_setup_hosted_local_loopback_and_local_guard(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config, secret = Path(tmp, "config.env"), Path(tmp, "liquid.env")
+            config.write_text('OPENCLAW_IPHONE_DEVICE="phone"\n')
+            secret.write_text("LIQUID_API_KEY=liq-key-123\n")
+            secret.chmod(0o600)
+            env = {"HOME": tmp, "OPENCLAW_IPHONE_CONFIG": str(config), "OPENAI_API_KEY": "wrong-provider"}
+            with mock.patch.dict(os.environ, env, clear=True), contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(cli.main([
+                    "goal", "setup", "--provider", "liquid", "--key-file", str(secret),
+                    "--model", "d1.2-ultra", "--local-guard-url", "http://127.0.0.1:8080/v1",
+                ]), 0)
+                settings = load_config()
+                client = decisions_from_config(settings)
+                self.assertIsInstance(client, LiquidDecisions)
+                self.assertEqual((client.api_key, client.model), ("liq-key-123", "d1.2-ultra"))
+                self.assertIsInstance(client.local_guard, LiquidDecisions)
+                self.assertEqual(client.local_guard.url, "http://127.0.0.1:8080/v1/systemone")
+                self.assertIn("d1.2-ultra via Liquid AI (LFM-d1)", out.getvalue())
+                self.assertIn("local guard: on", out.getvalue())
+                self.assertNotIn("liq-key-123", config.read_text() + out.getvalue())
+            # Local loopback Liquid d1-omni endpoint works with no API key.
+            local_cfg = IPhoneConfig({
+                "OPENCLAW_IPHONE_GOAL_ENABLED": "1",
+                "OPENCLAW_IPHONE_GOAL_PROVIDER": "d1",
+                "OPENCLAW_IPHONE_GOAL_MODEL": "d1-omni-2B",
+                "OPENCLAW_IPHONE_LIQUID_BASE_URL": "http://127.0.0.1:8090/v1",
+            })
+            local_client = decisions_from_config(local_cfg, env={})
+            self.assertIsInstance(local_client, LiquidDecisions)
+            self.assertEqual((local_client.url, local_client.model, local_client.api_key),
+                             ("http://127.0.0.1:8090/v1/systemone", "d1-omni-2B", ""))
+            # Non-loopback local guard URL is rejected to prevent accidental remote leakage.
+            with self.assertRaises(ValueError):
+                local_guard_from_config(IPhoneConfig({"OPENCLAW_IPHONE_LOCAL_GUARD_URL": "https://evil.example/v1"}))
+
+    def test_same_distinguishes_different_screens_with_identical_byte_length(self):
+        a = png(16, 16)
+        self.assertTrue(same(a, a))
+        self.assertFalse(same(png(16, 16), png(32, 32)))
+        # Same length synthetic PNG-sized buffers that diverge across middle and tail must not collide.
+        buf_a = b"\x89PNG\r\n\x1a\n" + struct.pack(">II", 0, 16) + struct.pack(">II", 100, 200) + (b"A" * 512)
+        buf_b = b"\x89PNG\r\n\x1a\n" + struct.pack(">II", 0, 16) + struct.pack(">II", 100, 200) + (b"B" * 512)
+        self.assertFalse(same(buf_a, buf_b))
 
 
 if __name__ == "__main__":

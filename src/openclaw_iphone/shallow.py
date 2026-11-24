@@ -15,6 +15,7 @@ import time
 DEPTH = 22            # tree levels read in a slow app
 DEFAULT_DEPTH = 50    # WDA's own default, restored for every other app
 SLOW_SECONDS = 3.0    # a full read slower than this marks the app slow
+FULL_READ_TIMEOUT = 6.0  # cap an uncached full read so shallow fallback still has budget left
 KEEP_SECONDS = 14 * 24 * 3600  # re-measure after two weeks (an app update may fix it)
 # Measured slow on a dedicated iPhone, so no host pays the first full read: X (21-38 s, and it closed twice).
 KNOWN = frozenset({"com.atebits.Tweetie2"})

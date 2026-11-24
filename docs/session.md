@@ -40,12 +40,20 @@ Hold onto the process across the workflow. Don't recreate it after each step.
 {"op":"launch","bundle_id":"com.apple.mobilesafari","observe":"image"}
 {"op":"launch","bundle_id":"com.apple.mobilesafari","wait_seconds":2,"observe":"image"}
 {"op":"open_url","url":"https://example.com","observe":"accessibility"}
+{"op":"pasteboard"}
 {"op":"goal","goal":"Open Settings and show Wi-Fi","approve":[]}
 {"op":"close"}
 ```
 
 `goal` exists only when `ready.capabilities` includes it: optional goal
 navigation, enabled in host config. See [goal navigation](goal.md).
+`pasteboard` reads the iPhone clipboard via WDA (`getPasteboard`). On iOS 16+,
+when reading from the background returns empty and `OPENCLAW_IPHONE_RUNNER_BUNDLE_ID`
+is configured (or `runner_bundle_id` is supplied), it briefly foregrounds
+`<runner_bundle_id>.xctrunner`, reads the pasteboard, and restores the previous
+foreground app (`swapped_app: true`, `restored_app: "..."`). Pass
+`"foreground_runner": false` to skip the app swap. Session secrets are redacted
+and text is bounded to 32 KiB (`truncated`).
 
 - `observe` returns a screen: AX plus a screenshot when `--allow-images` is set,
   otherwise AX only. Explicit `mode` still selects either independently.

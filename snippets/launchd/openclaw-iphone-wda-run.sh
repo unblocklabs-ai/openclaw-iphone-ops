@@ -35,6 +35,19 @@ set -- \
 
 export PYTHONPATH="$REPO_DIR/src${PYTHONPATH:+:$PYTHONPATH}"
 
+# Prevent crash-looping logs from growing unbounded (rotate at 20 MiB, keeping 1 backup).
+LOG_DIR="$HOME/Library/Logs/openclaw"
+for log_file in "$LOG_DIR/iphone-wda-run.log" "$LOG_DIR/iphone-wda-run.err.log"; do
+  if [ ! -L "$log_file" ] && [ -f "$log_file" ] && [ ! -L "${log_file}.1" ]; then
+    log_size="$(wc -c < "$log_file" 2>/dev/null | tr -d ' ' || echo 0)"
+    if [ "${log_size:-0}" -gt 20971520 ]; then
+      rm -f "${log_file}.1" 2>/dev/null || true
+      cp -f "$log_file" "${log_file}.1" 2>/dev/null || true
+      : > "$log_file" 2>/dev/null || true
+    fi
+  fi
+done
+
 cd "$REPO_DIR"
 
 exec "$@"

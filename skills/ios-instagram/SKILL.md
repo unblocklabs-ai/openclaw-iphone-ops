@@ -20,3 +20,9 @@ Feeds, recommendations, login/consent sheets, and WebViews are dynamic. The
 caller decides when more evidence is needed and whether a task is complete.
 Do not automatically clear consent, follow, like, message, post, or change
 accounts. Research and content evaluation belong to the caller's workflow.
+
+To inspect a Reel or video post in an external video tool (such as
+`video-understand`), follow [ios-social-video](../ios-social-video/SKILL.md):
+tap Share/Send -> Copy link on the post, call `{"op":"pasteboard"}`, and run
+`openclaw-iphone media fetch "<URL>" --json` to download the `.mp4`. iOS
+accessibility `/source` does not expose underlying `.mp4` stream URLs.

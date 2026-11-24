@@ -224,6 +224,13 @@ class PhoneHandler(BaseHTTPRequestHandler):
             elif path.endswith("/wda/apps/activate"):
                 self.server.transition_to = payload["bundleId"]
                 self.server.transition_at = time.monotonic() + 0.2
+            elif path.endswith("/wda/getPasteboard"):
+                import base64
+                active = self.server.transition_to or self.server.foreground
+                if getattr(self.server, "pasteboard_requires_runner", False) and not str(active).endswith(".xctrunner"):
+                    value = ""
+                else:
+                    value = base64.b64encode(getattr(self.server, "pasteboard_text", "").encode()).decode()
             elif path.endswith("/clear"):
                 self.server.text = ""
             elif path.endswith("/wda/keys") or path.endswith("/value"):
@@ -1023,6 +1030,92 @@ class SessionTests(unittest.TestCase):
             self.assertNotIn("goal", self.ready["capabilities"])
             reply = self.request(proc, {"op": "goal", "goal": "Open Settings"})
             self.assertEqual((reply["reason"], reply["dispatch"]), ("goal_navigation_disabled", "not_sent"))
+            self.finish(proc, base)
+
+    def test_liquid_d1_vision_fallback_taps_box_when_ax_fails_and_local_guard_blocks_sensitive(self):
+        from openclaw_iphone import navigator as nav
+        action_tap = {k: (0.92 if k == "tap" else 0.01) for k in nav.VISION_ACTIONS}
+        action_done = {k: (0.95 if k == "done" else 0.01) for k in nav.VISION_ACTIONS}
+        blocked_none = {k: (0.96 if k == "none" else 0.01) for k in nav.BLOCKED_OPTIONS}
+        effect_nav = {k: (0.93 if k == "navigate" else 0.01) for k in nav.EFFECTS}
+        vision_tap_reply = {"answers": {
+            "action": {"type": "choice", "choice": "tap", "probabilities": action_tap},
+            "done": {"type": "noul", "noul": 0.05},
+            "blocked": {"type": "choice", "choice": "none", "probabilities": blocked_none},
+            "done2": {"type": "noul", "noul": 0.05},
+            "progress": {"type": "score", "score": 2.0},
+            "sensitive": {"type": "noul", "noul": 0.02},
+            "target_box": {"type": "box", "box": {"left": 0.25, "top": 0.5, "right": 0.75, "bottom": 0.6}, "confidence": 0.9},
+            "risky": {"type": "noul", "noul": 0.03},
+            "effect": {"type": "choice", "choice": "navigate", "probabilities": effect_nav},
+        }}
+        vision_done_reply = {"answers": {
+            "action": {"type": "choice", "choice": "done", "probabilities": action_done},
+            "done": {"type": "noul", "noul": 0.96},
+            "blocked": {"type": "choice", "choice": "none", "probabilities": blocked_none},
+            "done2": {"type": "noul", "noul": 0.95},
+            "progress": {"type": "score", "score": 2.95},
+            "sensitive": {"type": "noul", "noul": 0.01},
+            "target_box": {"type": "box", "box": None, "confidence": 0.0},
+            "risky": {"type": "noul", "noul": 0.01},
+            "effect": {"type": "choice", "choice": "navigate", "probabilities": effect_nav},
+        }}
+        with self.decisions() as (api, _), self.decisions() as (guard, _):
+            config = (
+                "OPENCLAW_IPHONE_GOAL_ENABLED=1\n"
+                "OPENCLAW_IPHONE_GOAL_PROVIDER=liquid\n"
+                "OPENCLAW_IPHONE_GOAL_MODEL=d1.2\n"
+                f"OPENCLAW_IPHONE_LIQUID_BASE_URL=http://127.0.0.1:{api.server_port}/v1\n"
+                f"OPENCLAW_IPHONE_LOCAL_GUARD_URL=http://127.0.0.1:{guard.server_port}/v1\n"
+            )
+            with self.running(config=config) as (proc, server, base):
+                self.assertIn("goal", self.ready["capabilities"])
+                self.assertIn("goal_vision_box", self.ready["capabilities"])
+                # Break AX /source so goal must fall back to LFM-d1 Box grounding.
+                server.size = {"width": 414, "height": 896}
+                server.xml = "<not valid xml"
+                guard.replies = [
+                    (200, {"answers": {"sensitive": {"type": "noul", "noul": 0.02}}}),
+                    (200, {"answers": {"sensitive": {"type": "noul", "noul": 0.01}}}),
+                ]
+                api.replies = [(200, vision_tap_reply), (200, vision_done_reply)]
+                reply = self.request(proc, {"op": "goal", "goal": "Tap Get"}, timeout=20)
+                self.assertEqual((reply["outcome"], reply["acknowledged_substeps"]), ("done", 1))
+                self.assertEqual(reply["steps"][0]["grounding"], "vision")
+                # Window size is 414x896; box center (0.5, 0.55) -> (207, 493).
+                taps = [p["actions"][0]["actions"] for _, path, p in server.requests if path.endswith("/actions")]
+                self.assertEqual([(a["x"], a["y"]) for a in taps[0] if a["type"] == "pointerMove"], [(207, 493)])
+                # Local guard blocks a sensitive screen before any call reaches the main provider.
+                called_before = len(api.requests)
+                guard.replies = [(200, {"answers": {"sensitive": {"type": "noul", "noul": 0.92}}})]
+                blocked = self.request(proc, {"op": "goal", "goal": "Sign in", "grounding": "vision"}, timeout=20)
+                self.assertEqual((blocked["outcome"], blocked["reason"]), ("escalate", "secure_field"))
+                self.assertEqual(len(api.requests), called_before)
+                self.finish(proc, base)
+
+    def test_pasteboard_op_swaps_runner_restores_app_and_redacts_secrets(self):
+        config = "OPENCLAW_IPHONE_RUNNER_BUNDLE_ID=com.example.WebDriverAgentRunner\n"
+        with self.running(config=config) as (proc, server, base):
+            self.assertIn("pasteboard", self.ready["capabilities"])
+            server.foreground = "com.burbn.instagram"
+            server.pasteboard_requires_runner = True
+            server.pasteboard_text = "https://www.instagram.com/reel/DgA1FrdKylY/"
+
+            # With foreground_runner=False, iOS 16+ background restriction returns empty without swapping.
+            no_swap = self.request(proc, {"op": "pasteboard", "foreground_runner": False})
+            self.assertEqual(no_swap["status"], "checked")
+            self.assertEqual(no_swap["text"], "")
+            self.assertFalse(no_swap["swapped_app"])
+
+            # Default foreground_runner=True swaps to .xctrunner, reads URL, and restores Instagram.
+            swapped = self.request(proc, {"op": "pasteboard"})
+            self.assertEqual(swapped["status"], "checked")
+            self.assertEqual(swapped["text"], "https://www.instagram.com/reel/DgA1FrdKylY/")
+            self.assertTrue(swapped["swapped_app"])
+            self.assertEqual(swapped["restored_app"], "com.burbn.instagram")
+            self.assertFalse(swapped["truncated"])
+            activations = [p["bundleId"] for _, path, p in server.requests if path.endswith("/wda/apps/activate")]
+            self.assertEqual(activations, ["com.example.WebDriverAgentRunner.xctrunner", "com.burbn.instagram"])
             self.finish(proc, base)
 
 

@@ -2,13 +2,15 @@
 from __future__ import annotations
 
 from contextlib import ExitStack, contextmanager
+import os
 from pathlib import Path
 import threading
 from typing import Iterator
 
+from . import cache
 from .control_lock import control_lock
 from .devicectl import Device, DeviceCtl
-from .errors import DeviceSelectionError, WDAUnavailable
+from .errors import DeviceSelectionError, WDASetupError, WDAUnavailable
 from .execution import Budget, Metrics
 from .wda import WDAClient
 
@@ -67,6 +69,40 @@ class Connection:
                 self.wda.budget = None
 
     def _connect(self, selector: str | None) -> None:
+        use_cache = (
+            self.device is None
+            and type(self.ctl) is DeviceCtl
+            and os.environ.get("OPENCLAW_IPHONE_DISABLE_CACHE") != "1"
+        )
+        if use_cache:
+            cached = cache.get_cached_wda_endpoint(selector)
+            if cached is not None:
+                try:
+                    probe = WDAClient(url=cached["url"], timeout=min(2, self.ctl.runner.timeout), read_timeout=1.5)
+                    probe.budget = self.ctl.runner.budget
+                    status = probe.status()
+                except (WDAUnavailable, WDASetupError, ValueError):
+                    status = None
+                if status is not None and status.ready is True:
+                    try:
+                        wda = WDAClient(url=cached["url"], timeout=self.ctl.runner.timeout, read_timeout=self.read_timeout)
+                        wda.budget, wda.metrics = self.ctl.runner.budget, self.metrics
+                        self._sessions.enter_context(wda.session())
+                    except (WDAUnavailable, WDASetupError, ValueError):
+                        pass
+                    else:
+                        self.device = Device(
+                            name=cached.get("name", ""),
+                            identifier=cached["identifier"],
+                            state="connected",
+                            model=cached.get("model", ""),
+                            udid=cached["udid"],
+                        )
+                        self.wda = wda
+                        self.valid = True
+                        return
+                cache.clear_cached_wda_endpoint(cached.get("udid"))
+
         device = self.ctl.select_device(selector)
         if not device.udid or self.device is not None and device.udid != self.device.udid:
             raise DeviceSelectionError("Physical device identity unavailable or changed.")
@@ -77,6 +113,14 @@ class Connection:
         self.wda = wda
         self._sessions.enter_context(wda.session())
         self.valid = True
+        if type(self.ctl) is DeviceCtl and os.environ.get("OPENCLAW_IPHONE_DISABLE_CACHE") != "1":
+            cache.set_cached_wda_endpoint(
+                udid=device.udid,
+                identifier=device.identifier,
+                name=device.name,
+                model=device.model,
+                url=url,
+            )
 
     def require_active(self) -> WDAClient:
         with self._reconnect:

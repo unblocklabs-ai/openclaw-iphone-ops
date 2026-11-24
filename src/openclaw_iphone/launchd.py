@@ -1,4 +1,4 @@
-"""Shared plist rendering for the two explicit launchd installers."""
+"""Shared plist rendering for the explicit launchd installers."""
 import os
 from pathlib import Path
 import plistlib

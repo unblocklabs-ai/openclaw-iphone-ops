@@ -28,9 +28,38 @@ THRESHOLDS = {
     "overlay": 0.5,           # blocked is a menu/sheet or popup with this much probability ...
     "part": 0.5,              # ... and the target is not part of it -> dismiss_overlay
     "back_over_none": 0.25,   # go_back (with the back button's own share) beats none at this much; a back tap's floor
+    "sensitive_prob": 0.5,    # vision/local guard: password/OTP/payment/CAPTCHA -> escalate secure_field
+    "box_confidence": 0.35,   # vision Box grounding confidence floor
 }
 RISKY_EFFECTS = frozenset({"social_action", "communication", "purchase_install", "permission_grant"})
 OVERLAYS = ("menu_or_sheet", "feature_popup")
+
+VISION_ACTIONS = {
+    "tap": "Tap a specific visible on-screen UI control to make progress on `goal`.",
+    "done": "The goal is already complete on this screen; nothing needs to be tapped.",
+    "scroll_down": ("Scroll down (swipe up): reveals more of the page when the needed control is not visible, and moves to "
+                    "the next item in a full-screen feed such as Reels, Stories or a video player."),
+    "go_back": ("Go back to the previous screen: what the goal needs is not on this screen and no control "
+                "here leads to it, but an earlier screen in this app does."),
+    "dismiss_overlay": "A popup, menu or sheet covers the needed control and must be closed first.",
+    "none": "Nothing on this screen helps with the goal.",
+    "type_text": "A text field is already focused (keyboard open) and the goal needs text typed into it now.",
+}
+VISION_ACTION_Q = ("What action should happen next to make progress on `goal`? Pick `tap` if a visible control on "
+                   "the screenshot should be tapped, or pick one of the other actions.")
+VISION_TARGET_BOX = ("Locate the single visible on-screen UI control that should be tapped next to make progress on "
+                     "`goal` (or the close/dismiss button if closing an overlay).")
+SENSITIVE_SCREEN = ("Does the screenshot show a password field, PIN or passcode keypad, one-time verification/2FA code "
+                    "entry, payment/credit-card sheet, Apple ID password prompt, or interactive CAPTCHA?",
+                    "A sensitive credential, payment, verification code, or CAPTCHA prompt is visible.",
+                    "Ordinary non-sensitive app content is shown.")
+VISION_RISKY = ("Would tapping the control needed next for `goal` immediately cause a consequential or hard-to-undo "
+                "effect: sending or posting something, following/unfollowing/muting someone, liking or saving content, "
+                "buying or installing an app, starting a call, deleting something, granting a permission, or changing "
+                "network connectivity?",
+                "The tap itself performs such an action.",
+                "The tap only opens, navigates, focuses, reveals options, or changes a harmless display setting.")
+VISION_EFFECT = "What happens immediately when the control needed next for `goal` is tapped?"
 
 NEXT = ("What should happen next to make progress on `goal`? Pick the on-screen element to tap, or one of the "
         "non-element options. The screenshot shows the current screen.")
@@ -242,6 +271,18 @@ def choice(name: str, question: str, options: dict) -> dict:
             "choices": [{"value": k, "description": v} for k, v in options.items()]}
 
 
+def box(name: str, question: str) -> dict:
+    return {"type": "box", "name": name, "instructions": question}
+
+
+def boxes(name: str, question: str) -> dict:
+    return {"type": "boxes", "name": name, "instructions": question}
+
+
+def text_extract(name: str, question: str) -> dict:
+    return {"type": "text", "name": name, "instructions": question}
+
+
 def message(state: dict, image: str) -> list:
     return [{"role": "user", "content": [{"type": "input_text", "text": json.dumps(state, ensure_ascii=False, separators=(",", ":"))},
                                          {"type": "input_image", "image_url": image}]}]
@@ -264,6 +305,45 @@ def request(s: Screen, goal: str) -> dict:
     }
 
 
+def sensitive_guard_request(image: str, *, app: str | None = None) -> dict:
+    """Lightweight vision-only privacy check (ideal for local d1-omni before any cloud call)."""
+    return {
+        "input": message({"app": app or "unknown"}, image),
+        "questions": [predicate("sensitive", SENSITIVE_SCREEN)],
+    }
+
+
+def vision_request(image: str, goal: str, *, app: str | None = None, notes: tuple[str, ...] = ()) -> dict:
+    """Single-pass AX-free visual navigation request using LFM-d1 primitives (choice + noul + score + box).
+
+    Evaluates action, completion, overlays, sensitive-screen guard, target bounding box, and tap risk
+    in one zero-output-token forward pass without reading the iOS accessibility tree.
+    """
+    return {
+        "input": message({"goal": goal, "app": app or "unknown", "notes": list(notes)}, image),
+        "questions": [
+            choice("action", VISION_ACTION_Q, VISION_ACTIONS),
+            predicate("done", DONE),
+            choice("blocked", BLOCKED, BLOCKED_OPTIONS),
+            predicate("done2", DONE2),
+            {"type": "score", "name": "progress", "instructions": PROGRESS,
+             "levels": [{"label": str(i), "description": d} for i, d in enumerate(PROGRESS_LEVELS)]},
+            predicate("sensitive", SENSITIVE_SCREEN),
+            box("target_box", VISION_TARGET_BOX),
+            predicate("risky", VISION_RISKY),
+            choice("effect", VISION_EFFECT, EFFECTS),
+        ],
+    }
+
+
+def extract_text_request(image: str, instruction: str, *, app: str | None = None) -> dict:
+    """Hallucination-free visual text extraction using LFM-d1's `text` primitive."""
+    return {
+        "input": message({"app": app or "unknown"}, image),
+        "questions": [text_extract("extracted", instruction)],
+    }
+
+
 def tap_check_request(s: Screen, goal: str, e: Element) -> dict:
     """One call per tap: is it risky, what does it do, and is an overlay in the way?"""
     return {
@@ -273,9 +353,19 @@ def tap_check_request(s: Screen, goal: str, e: Element) -> dict:
     }
 
 
+def _parse_box(raw: object) -> dict[str, float]:
+    if not isinstance(raw, dict):
+        raise ValueError("Box must be an object.")
+    coords = {k: float(raw[k]) for k in ("top", "bottom", "left", "right")}
+    if not (0.0 <= coords["left"] < coords["right"] <= 1.0 and 0.0 <= coords["top"] < coords["bottom"] <= 1.0):
+        raise ValueError("Box coordinates out of normalized range.")
+    return coords
+
+
 def answers(reply: dict) -> dict:
     """Decisions reply -> {name: answer}: predicate {"probability"}, choice {"choice", "probabilities": {value: p}},
-    score {"score"}. A refusal or an unexpected shape raises Unavailable."""
+    score {"score"}, box {"box": {top,bottom,left,right}, "confidence"}, boxes {"boxes": [...]}, text {"text"}.
+    A refusal or an unexpected shape raises Unavailable."""
     out = {}
     try:
         for a in reply["answers"]:
@@ -288,6 +378,21 @@ def answers(reply: dict) -> dict:
                 out[name] = {"choice": a["choice"], "probabilities": {p["value"]: float(p["probability"]) for p in a["probabilities"]}}
             elif kind == "score":
                 out[name] = {"score": float(a["score"])}
+            elif kind == "box":
+                parsed = _parse_box(a["box"]) if a.get("box") is not None else None
+                conf = float(a.get("confidence", 1.0 if parsed is not None else 0.0))
+                out[name] = {"box": parsed, "confidence": conf}
+            elif kind == "boxes":
+                items = []
+                for item in a.get("boxes") or ():
+                    coords = _parse_box(item.get("box", item) if isinstance(item, dict) else item)
+                    conf = float(item.get("confidence", 1.0)) if isinstance(item, dict) else 1.0
+                    items.append({"box": coords, "confidence": conf})
+                out[name] = {"boxes": items}
+            elif kind == "text":
+                raw = a.get("text")
+                text = None if raw is None or str(raw).strip().lower() == "not found" else str(raw)
+                out[name] = {"text": text}
             else:
                 raise KeyError(kind)
     except (KeyError, TypeError, ValueError):
@@ -355,3 +460,68 @@ def decide(ask: Callable[[dict], dict], s: Screen, goal: str, *, check_tap: bool
         return {k: v for k, v in decision.items() if k != "target"} | {"action": "dismiss_overlay"}
     return decision | {"needs_approval": risky >= t["risky_noul"] or effect in RISKY_EFFECTS,
                        "risk": {"risky": round(risky, 2), "effect": effect}}
+
+
+def decide_vision(ask: Callable[[dict], dict], image: str, goal: str, window_size: tuple[float, float], *,
+                  app: str | None = None, notes: tuple[str, ...] = (), check_tap: bool = True) -> dict:
+    """Single-pass AX-free step using LFM-d1 primitives (choice + noul + score + box).
+
+    Returns the same decision shape as `decide()`, except tap targets carry normalized `box` and
+    device-point `x`/`y` (no AX `id`).
+    """
+    t = THRESHOLDS
+    a = ask(vision_request(image, goal, app=app, notes=notes))
+    act, b, progress = a["action"], a["blocked"], a["progress"]["score"]
+    probabilities = act["probabilities"]
+    sensitive = a["sensitive"]["probability"]
+    top = sorted(probabilities.items(), key=lambda kv: -kv[1])[:3]
+    out = {"grounding": "vision",
+           "signals": {"blocked": b["choice"], "progress": round(progress, 2),
+                       "done": round(a["done"]["probability"], 2),
+                       "done2": round(a["done2"]["probability"], 2),
+                       "sensitive": round(sensitive, 2),
+                       "top": [[k, round(p, 3)] for k, p in top]}}
+    if sensitive >= t["sensitive_prob"]:
+        return out | {"action": "escalate", "reason": "secure_field"}
+    if b["choice"] == "permission_or_consent" and b["probabilities"][b["choice"]] >= t["consent_prob"]:
+        return out | {"action": "escalate", "reason": "permission_or_consent_prompt"}
+    votes = act["choice"] == "done" and min(probabilities["done"], a["done"]["probability"]) >= t["done_votes"]
+    agree = progress >= t["done_score"] and a["done2"]["probability"] >= t["done2_min"]
+    tap_prob = probabilities.get("tap", 0.0)
+    if (agree or votes) and tap_prob < t["done_veto"]:
+        return out | {"action": "done", "confidence": round(progress / 3, 2)}
+    choice_name = act["choice"] if act["choice"] != "done" else max((k for k in probabilities if k != "done"), key=probabilities.get)
+    if choice_name == "none":
+        return out | {"action": "escalate", "reason": "nothing_on_screen_helps"}
+    if choice_name in ("scroll_down", "type_text", "dismiss_overlay", "go_back"):
+        return out | {"action": choice_name, "confidence": round(probabilities[choice_name], 2)}
+    box_answer = a.get("target_box") or {}
+    coords = box_answer.get("box")
+    box_conf = float(box_answer.get("confidence", 0.0))
+    if coords is None:
+        return out | {"action": "escalate", "reason": "low_confidence"}
+    width, height = window_size
+    x = round(((coords["left"] + coords["right"]) / 2.0) * width)
+    y = round(((coords["top"] + coords["bottom"]) / 2.0) * height)
+    confidence = min(probabilities.get("tap", 0.0), box_conf)
+    box_key = f"box:{round(coords['left'], 3)},{round(coords['top'], 3)},{round(coords['right'], 3)},{round(coords['bottom'], 3)}"
+    decision = out | {"action": "tap", "confidence": round(confidence, 2),
+                      "target": {"id": None, "key": box_key, "role": "VisualControl",
+                                 "label": "", "x": x, "y": y, "box": coords}}
+    status_bar = min(STATUS_BAR, height * 0.06)
+    if confidence < t["box_confidence"] or (y < status_bar and app != "com.apple.springboard"):
+        return decision | {"action": "escalate", "reason": "low_confidence"}
+    if not check_tap:
+        return decision
+    risky_answer, effect_answer = a.get("risky"), a.get("effect")
+    if not risky_answer or not effect_answer:
+        return decision | {"needs_approval": True, "risk": {"error": "risk_check_unavailable"}}
+    risky, effect = risky_answer["probability"], effect_answer["choice"]
+    return decision | {"needs_approval": risky >= t["risky_noul"] or effect in RISKY_EFFECTS,
+                       "risk": {"risky": round(risky, 2), "effect": effect}}
+
+
+def extract_text(ask: Callable[[dict], dict], image: str, instruction: str, *, app: str | None = None) -> str | None:
+    """Extract visible text from a screenshot without generative hallucination (returns None if not found)."""
+    result = ask(extract_text_request(image, instruction, app=app))
+    return result["extracted"]["text"]

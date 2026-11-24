@@ -211,6 +211,67 @@ class WDAClient:
         with self.session() as session_id:
             return self._json_post(f"/session/{session_id}/wda/apps/activate", {"bundleId": bundle_id})
 
+    def pasteboard(self, *, content_type: str = "plaintext") -> str:
+        """Read the device pasteboard as UTF-8 text (base64-decoded from WDA getPasteboard)."""
+        if content_type not in {"plaintext", "url"}:
+            raise ValueError("Unsupported pasteboard content_type.")
+        with self.session() as session_id:
+            value = self._json_post(
+                f"/session/{session_id}/wda/getPasteboard",
+                {"contentType": content_type},
+            ).get("value")
+        if value is None or value == "":
+            return ""
+        if not isinstance(value, str):
+            raise WDAUnavailable("WDA pasteboard response did not contain a base64 string.")
+        try:
+            return base64.b64decode(value, validate=True).decode("utf-8", errors="replace")
+        except (binascii.Error, ValueError) as exc:
+            raise WDAUnavailable("WDA pasteboard response contained invalid base64.") from exc
+
+    def read_pasteboard(self, *, content_type: str = "plaintext", runner_bundle_id: str | None = None,
+                        return_app: str | None = None, fallback_app: str | None = None,
+                        foreground_runner: bool = True, settle_seconds: float = 0.35,
+                        skip_initial_read: bool = False) -> dict[str, Any]:
+        """Read pasteboard text, briefly foregrounding the WDA runner on iOS 16+ when needed."""
+        text = "" if skip_initial_read else self.pasteboard(content_type=content_type)
+        if text or not foreground_runner or not runner_bundle_id:
+            return {"text": text, "swapped_app": False, "restored_app": None, "restore_warning": False}
+
+        runner_xct = runner_bundle_id if runner_bundle_id.endswith(".xctrunner") else f"{runner_bundle_id}.xctrunner"
+        prev_app = return_app
+        if prev_app is None:
+            try:
+                prev_app = self.active_app().get("bundleId")
+            except WDAUnavailable:
+                prev_app = fallback_app
+        if not prev_app:
+            prev_app = fallback_app
+
+        restored_app: str | None = None
+        restore_warning = False
+        self.activate_app(runner_xct)
+        try:
+            delay = settle_seconds
+            if self.budget is not None:
+                delay = min(delay, max(0.0, self.budget.remaining() - 0.5))
+            if delay > 0:
+                time.sleep(delay)
+            text = self.pasteboard(content_type=content_type)
+        finally:
+            if prev_app and prev_app != runner_xct:
+                try:
+                    self.activate_app(prev_app)
+                    restored_app = prev_app
+                except WDAUnavailable:
+                    restore_warning = True
+        return {
+            "text": text,
+            "swapped_app": True,
+            "restored_app": restored_app,
+            "restore_warning": restore_warning,
+        }
+
     def find_elements(self, query: str, *, using: str = "xpath", element_id: str | None = None) -> list[NativeElement]:
         """Read-only query (WDA uses POST); no implicit retries."""
         if using not in {"xpath", "predicate string", "class chain", "accessibility id"}:
@@ -460,7 +521,7 @@ class WDAClient:
 
 
 def read_only_request(method: str, path: str) -> bool:
-    return method == "GET" or method == "POST" and path.endswith("/elements")
+    return method == "GET" or method == "POST" and (path.endswith("/elements") or path.endswith("/wda/getPasteboard"))
 
 
 def element_identifier(value: object) -> str:
@@ -497,6 +558,33 @@ class WDARunConfig:
     development_team: str | None = None
     runner_bundle_id: str | None = None
     allow_provisioning_updates: bool = False
+    allow_provisioning_device_registration: bool = False
+    xctestrun: Path | None = None
+    derived_data_path: Path | None = None
+    build_only: bool = False
+
+
+def default_derived_data_path() -> Path:
+    return Path.home() / ".openclaw/iphone/DerivedData"
+
+
+def find_xctestrun(derived_data_path: Path, *, scheme: str = DEFAULT_WDA_SCHEME) -> Path | None:
+    """Return the newest matching .xctestrun produced by `xcodebuild build-for-testing`."""
+    products = derived_data_path.expanduser() / "Build" / "Products"
+    if not products.is_dir():
+        return None
+    candidates = sorted(
+        (p for p in products.glob("*.xctestrun") if p.is_file() and scheme in p.name),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if not candidates:
+        candidates = sorted(
+            (p for p in products.glob("*.xctestrun") if p.is_file()),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+    return candidates[0] if candidates else None
 
 
 def resolve_wda_path(explicit: str | None = None) -> Path:
@@ -541,10 +629,25 @@ def find_xcode_container(wda_path: Path) -> tuple[str, Path]:
 def build_xcodebuild_command(config: WDARunConfig) -> list[str]:
     if config.destination_timeout <= 0:
         raise WDASetupError("Xcode destination timeout must be positive.")
+    if config.xctestrun is not None and not config.build_only:
+        xctestrun = config.xctestrun.expanduser()
+        if not xctestrun.is_file():
+            raise WDASetupError(f"xctestrun file does not exist: {xctestrun}")
+        return [
+            "xcodebuild",
+            "test-without-building",
+            "-xctestrun",
+            str(xctestrun),
+            "-destination",
+            f"id={config.device_id}",
+            "-destination-timeout",
+            str(config.destination_timeout),
+        ]
     container_flag, container_path = find_xcode_container(config.wda_path)
+    action = "build-for-testing" if config.build_only else "test"
     command = [
         "xcodebuild",
-        "test",
+        action,
         container_flag,
         str(container_path),
         "-scheme",
@@ -556,13 +659,50 @@ def build_xcodebuild_command(config: WDARunConfig) -> list[str]:
         "-destination-timeout",
         str(config.destination_timeout),
     ]
+    if config.derived_data_path is not None:
+        command.extend(["-derivedDataPath", str(config.derived_data_path.expanduser())])
     if config.allow_provisioning_updates:
         command.append("-allowProvisioningUpdates")
+    if config.allow_provisioning_device_registration:
+        command.append("-allowProvisioningDeviceRegistration")
     if config.development_team:
         command.append(f"DEVELOPMENT_TEAM={config.development_team}")
     if config.runner_bundle_id:
         command.append(f"PRODUCT_BUNDLE_IDENTIFIER={config.runner_bundle_id}")
     return command
+
+
+def build_wda(config: WDARunConfig) -> Path | None:
+    """Run `xcodebuild build-for-testing` and return the produced .xctestrun path."""
+    import subprocess
+    derived = config.derived_data_path or default_derived_data_path()
+    build_config = WDARunConfig(
+        device_id=config.device_id,
+        wda_path=config.wda_path,
+        scheme=config.scheme,
+        configuration=config.configuration,
+        developer_dir=config.developer_dir,
+        destination_timeout=config.destination_timeout,
+        development_team=config.development_team,
+        runner_bundle_id=config.runner_bundle_id,
+        allow_provisioning_updates=config.allow_provisioning_updates,
+        allow_provisioning_device_registration=config.allow_provisioning_device_registration,
+        derived_data_path=derived,
+        build_only=True,
+    )
+    developer_dir = resolve_developer_dir(build_config.developer_dir)
+    env = os.environ.copy()
+    if developer_dir:
+        env["DEVELOPER_DIR"] = developer_dir
+    command = build_xcodebuild_command(build_config)
+    result = subprocess.run(command, env=env, check=False)
+    if result.returncode != 0:
+        raise WDASetupError(
+            f"xcodebuild build-for-testing failed with exit code {result.returncode}. "
+            "If codesign failed with errSecInternalComponent over SSH, run `wda build` "
+            "from the logged-in macOS GUI session or unlock the login keychain first."
+        )
+    return find_xctestrun(derived, scheme=config.scheme)
 
 
 def run_wda(config: WDARunConfig) -> int:

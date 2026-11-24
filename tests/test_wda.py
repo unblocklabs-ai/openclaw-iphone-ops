@@ -384,6 +384,126 @@ class WDATests(unittest.TestCase):
             with self.assertRaises(WDASetupError):
                 find_xcode_container(Path(tmp))
 
+    def test_build_xcodebuild_command_build_for_testing_and_test_without_building(self) -> None:
+        from openclaw_iphone.wda import find_xctestrun
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "WebDriverAgent.xcodeproj"
+            project.mkdir()
+            derived = root / "derived"
+            products = derived / "Build" / "Products"
+            products.mkdir(parents=True)
+            xctestrun = products / "WebDriverAgentRunner_iphoneos18.0-arm64.xctestrun"
+            xctestrun.write_text("<plist/>", encoding="utf-8")
+
+            self.assertEqual(find_xctestrun(derived), xctestrun)
+
+            build_cmd = build_xcodebuild_command(
+                WDARunConfig(
+                    device_id="device-id",
+                    wda_path=root,
+                    destination_timeout=15,
+                    development_team="TEAM123",
+                    runner_bundle_id="com.example.WDA",
+                    allow_provisioning_updates=True,
+                    allow_provisioning_device_registration=True,
+                    derived_data_path=derived,
+                    build_only=True,
+                )
+            )
+            self.assertEqual(build_cmd[:2], ["xcodebuild", "build-for-testing"])
+            self.assertIn("-derivedDataPath", build_cmd)
+            self.assertIn(str(derived), build_cmd)
+            self.assertIn("-allowProvisioningDeviceRegistration", build_cmd)
+
+            run_cmd = build_xcodebuild_command(
+                WDARunConfig(
+                    device_id="device-id",
+                    wda_path=root,
+                    destination_timeout=15,
+                    xctestrun=xctestrun,
+                )
+            )
+            self.assertEqual(
+                run_cmd,
+                [
+                    "xcodebuild",
+                    "test-without-building",
+                    "-xctestrun",
+                    str(xctestrun),
+                    "-destination",
+                    "id=device-id",
+                    "-destination-timeout",
+                    "15",
+                ],
+            )
+
+    def test_build_wda_failure_includes_keychain_hint(self) -> None:
+        from openclaw_iphone.wda import build_wda
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "WebDriverAgent.xcodeproj").mkdir()
+            fake = type("R", (), {"returncode": 65})()
+            with patch("subprocess.run", return_value=fake):
+                with self.assertRaises(WDASetupError) as err:
+                    build_wda(WDARunConfig(device_id="device-id", wda_path=root, derived_data_path=root / "derived"))
+            self.assertIn("errSecInternalComponent", str(err.exception))
+
+    def test_pasteboard_decodes_base64_and_foreground_swaps_runner(self) -> None:
+        from openclaw_iphone.wda import read_only_request
+
+        self.assertTrue(read_only_request("POST", "/session/s1/wda/getPasteboard"))
+
+        class PasteboardWDA(WDAClient):
+            def __init__(self) -> None:
+                super().__init__(url="http://wda.test", timeout=5)
+                self.foreground = "com.burbn.instagram"
+                self.activations: list[str] = []
+                self.clip = "https://www.instagram.com/reel/abc123/"
+
+            def _send(self, path: str, *, method: str, payload: dict | None, timeout: float) -> bytes:
+                if path == "/session" and method == "POST":
+                    return b'{"sessionId":"s1","value":{}}'
+                if path == "/session/s1" and method == "DELETE":
+                    return b'{"value":null}'
+                if path == "/wda/activeAppInfo":
+                    return json.dumps({"value": {"bundleId": self.foreground}}).encode()
+                if path == "/session/s1/wda/apps/activate":
+                    self.foreground = payload["bundleId"]
+                    self.activations.append(self.foreground)
+                    return b'{"value":null}'
+                if path == "/session/s1/wda/getPasteboard":
+                    if self.foreground.endswith(".xctrunner"):
+                        return json.dumps({"value": base64.b64encode(self.clip.encode()).decode()}).encode()
+                    return b'{"value":""}'
+                return b'{"value":null}'
+
+        client = PasteboardWDA()
+        result = client.read_pasteboard(
+            runner_bundle_id="com.example.WebDriverAgentRunner",
+            settle_seconds=0.0,
+        )
+        self.assertEqual(result["text"], "https://www.instagram.com/reel/abc123/")
+        self.assertTrue(result["swapped_app"])
+        self.assertEqual(result["restored_app"], "com.burbn.instagram")
+        self.assertFalse(result["restore_warning"])
+        self.assertEqual(
+            client.activations,
+            ["com.example.WebDriverAgentRunner.xctrunner", "com.burbn.instagram"],
+        )
+
+        # Invalid base64 raises WDAUnavailable.
+        bad = FakeWDAClient({
+            "/session": b'{"sessionId":"s1","value":{}}',
+            "/session/s1/appium/settings": b'{"value":null}',
+            "/session/s1/wda/getPasteboard": b'{"value":"!!!bad!!!"}',
+            "/session/s1": b'{"value":null}',
+        })
+        with self.assertRaises(WDAUnavailable):
+            bad.pasteboard()
+
 
 if __name__ == "__main__":
     unittest.main()
