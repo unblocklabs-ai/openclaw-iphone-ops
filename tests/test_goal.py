@@ -614,6 +614,37 @@ class DecisionsTests(unittest.TestCase):
         d = navigator.decide_vision(ask, "data:image/jpeg;base64,AA==", "Submit search", (390.0, 844.0))
         self.assertEqual((d["action"], d["confidence"]), ("submit", 0.92))
 
+    def test_decisions_reuses_http_keep_alive_connection(self):
+        connections = []
+        class KeepAliveDecisionsHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+            def log_message(self, *args):
+                pass
+            def setup(self):
+                super().setup()
+                connections.append(self.client_address)
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                raw = json.dumps(check(0.1)).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+        with ThreadingHTTPServer(("127.0.0.1", 0), KeepAliveDecisionsHandler) as server:
+            server.daemon_threads = True
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
+            thread.start()
+            client = Decisions("secret-key", base_url=f"http://127.0.0.1:{server.server_port}/v1")
+            try:
+                for _ in range(3):
+                    self.assertIn("risky", client.ask({"input": "s", "questions": []}))
+                self.assertEqual(len(connections), 1)
+            finally:
+                client.close()
+                server.shutdown()
+                thread.join(timeout=5)
+
 
 if __name__ == "__main__":
     unittest.main()

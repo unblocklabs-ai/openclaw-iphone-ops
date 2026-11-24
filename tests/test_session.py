@@ -976,10 +976,101 @@ class SessionTests(unittest.TestCase):
             self.assertEqual((loop_reply["outcome"], loop_reply["reason"]), ("escalate", "repeated_submit"))
             self.finish(proc, base)
 
+    def test_goal_observe_reuses_captured_screen_and_pretap_failure_preserves_receipt(self):
+        with self.decisions() as (api, config), self.running(config=config, images=True) as (proc, server, base):
+            self.assertIn("goal_observe", self.ready["capabilities"])
+            server.xml = GOAL_XML
+            api.replies = [(200, step("done", {"done": 0.95, "e1": 0.05}, progress=2.9, done=0.95))]
+            reply = self.request(proc, {"op": "goal", "goal": "Verify screen", "observe": "both"}, timeout=20)
+            self.assertEqual(reply["outcome"], "done")
+            self.assertIn("accessibility", reply["observation"])
+            self.assertIn("image", reply["observation"])
+            # Reused the captured AX snapshot with zero extra /source calls after the single step capture.
+            self.assertEqual(sum(path == "/source" for _, path, _ in server.requests), 1)
+            # Pre-tap screenshot failure escalates cleanly instead of crashing the session.
+            server.failures["/screenshot"] = 0
+            api.replies = [(200, step("e1")), (200, check(0.05))]
+            server.image_sequence = [server.image, server.image]
+            # Fail the 3rd screenshot (pre-tap check) by raising a bad response on the next capture after settle.
+            server.failures["/screenshot"] = 1
+            # First test: capture_failed on step 0 does not kill session; session stays alive for close.
+            failed = self.request(proc, {"op": "goal", "goal": "Tap Next"}, timeout=20)
+            self.assertEqual((failed["outcome"], failed["reason"]), ("escalate", "capture_failed"))
+            self.finish(proc, base)
+
+    def test_set_submit_skips_clear_when_empty_and_sequence_fails_fast(self):
+        with self.running(config='OPENCLAW_IPHONE_RUNNER_BUNDLE_ID="com.example.WebDriverAgentRunner"\n') as (proc, server, base):
+            self.assertIn("set_submit", self.ready["capabilities"])
+            self.assertIn("sequence", self.ready["capabilities"])
+            server.xml = XML
+            # Targeted set on an empty field with submit=True skips /clear and presses Enter (\ue007).
+            server.text = ""
+            res = self.request(proc, {
+                "op": "set",
+                "target": {"role": "XCUIElementTypeTextField", "label": "Input"},
+                "value": "pregnancy announcement",
+                "submit": True,
+                "observe": "accessibility",
+            })
+            self.assertEqual((res["status"], res["dispatch"], res["acknowledged_substeps"]), ("action", "acknowledged", 2))
+            self.assertEqual(sum(p.endswith("/clear") for _, p, _ in server.requests), 0)
+            self.assertEqual(server.submit_count, 1)
+            self.assertIn("accessibility", res["observation"])
+            # Sequence runs tap -> pasteboard in one turn and attaches final observe.
+            server.pasteboard_requires_runner = True
+            server.pasteboard_text = "https://www.instagram.com/p/DflF3RuIAL6/"
+            seq = self.request(proc, {
+                "op": "sequence",
+                "steps": [
+                    {"op": "tap", "x": 100, "y": 200},
+                    {"op": "pasteboard"},
+                ],
+                "observe": "accessibility",
+            })
+            self.assertEqual((seq["status"], seq["completed_steps"], seq["total_steps"]), ("action", 2, 2))
+            self.assertEqual(seq["steps"][1]["text"], "https://www.instagram.com/p/DflF3RuIAL6/")
+            self.assertTrue(seq["steps"][1]["swapped_app"])
+            self.assertIn("accessibility", seq["observation"])
+            # Second pasteboard in same session remembers swap and skips the doomed background read.
+            pb_before = sum(p.endswith("/wda/getPasteboard") for _, p, _ in server.requests)
+            pb2 = self.request(proc, {"op": "pasteboard"})
+            pb_after = sum(p.endswith("/wda/getPasteboard") for _, p, _ in server.requests)
+            self.assertEqual(pb2["text"], "https://www.instagram.com/p/DflF3RuIAL6/")
+            self.assertTrue(pb2["swapped_app"])
+            self.assertEqual(pb_after - pb_before, 1)
+            # Emoji-heavy clipboard truncates by ASCII-escaped JSON byte length (<= 32 KiB) so it stays inside 64 KiB frame.
+            server.pasteboard_text = "🎉" * 12000
+            emoji_pb = self.request(proc, {"op": "pasteboard"})
+            self.assertTrue(emoji_pb["truncated"])
+            self.assertLessEqual(len(json.dumps(emoji_pb["text"], ensure_ascii=True).encode("ascii")), 32_768)
+            self.assertNotIn("output_warning", emoji_pb)
+            # Sequence fails fast on error without executing remaining steps.
+            server.elements = []
+            fail_seq = self.request(proc, {
+                "op": "sequence",
+                "steps": [
+                    {"op": "tap", "x": 10, "y": 20},
+                    {"op": "tap", "target": {"role": "XCUIElementTypeButton", "label": "Missing"}},
+                    {"op": "press", "button": "home"},
+                ],
+            })
+            self.assertEqual((fail_seq["status"], fail_seq["dispatch"], fail_seq["completed_steps"], fail_seq["total_steps"]),
+                             ("error", "partial", 1, 3))
+            self.assertEqual(len(fail_seq["steps"]), 2)
+            # Validation rejects nested sequence / goal / per-step observe.
+            for bad_steps in ([], [{"op": "sequence", "steps": [{"op": "tap", "x": 1, "y": 1}]}],
+                              [{"op": "tap", "x": 1, "y": 1, "observe": "accessibility"}]):
+                self.assertEqual(self.request(proc, {"op": "sequence", "steps": bad_steps})["reason"], "invalid_request")
+            # strict_json rejects exponent overflow (1e999 -> inf).
+            from openclaw_iphone.protocol import strict_json
+            with self.assertRaises(ValueError):
+                strict_json("1e999")
+            self.finish(proc, base)
+
     def test_goal_stops_before_unapproved_risky_taps_and_never_sends_secure_screens(self):
         with self.decisions() as (api, config), self.running(config=config) as (proc, server, base):
             server.xml = GOAL_XML
-            for bad in ({"approve": ["delete"]}, {"max_steps": 0}, {"observe": "accessibility"}, {"goal": ""}):
+            for bad in ({"approve": ["delete"]}, {"max_steps": 0}, {"offset": 10}, {"goal": ""}):
                 self.assertEqual(self.request(proc, {"op": "goal", "goal": "Send it", **bad})["reason"], "invalid_request")
             api.replies = [(200, r) for r in (step("e1"), check(0.9, "communication"))]
             reply = self.request(proc, {"op": "goal", "goal": "Send it", "approve": ["social_action"]}, timeout=20)

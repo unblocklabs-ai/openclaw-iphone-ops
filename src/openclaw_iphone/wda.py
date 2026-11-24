@@ -17,7 +17,8 @@ import urllib.parse
 
 from .errors import WDAOutcomeUnknown, WDASetupError, WDAStaleElement, WDAUnavailable, WDAUnsupportedCommand, WDAReadUnavailable, WDATransportUnavailable
 from .execution import Budget, Metrics, TaskStopped
-from .transport import exchange, TransportFailure
+from .transport import ConnectionPool, exchange, TransportFailure
+_TRANSPORT_EXCHANGE = exchange
 from .xcode import resolve_developer_dir
 
 
@@ -66,6 +67,10 @@ class WDAClient:
         self.budget: Budget | None = None
         self.metrics = Metrics()
         self._session = SessionState()
+        self._pool = ConnectionPool()
+
+    def close(self) -> None:
+        self._pool.close()
 
     def status(self) -> WDAStatus:
         payload = self._json_request("/status")
@@ -232,45 +237,52 @@ class WDAClient:
     def read_pasteboard(self, *, content_type: str = "plaintext", runner_bundle_id: str | None = None,
                         return_app: str | None = None, fallback_app: str | None = None,
                         foreground_runner: bool = True, settle_seconds: float = 0.35,
-                        skip_initial_read: bool = False) -> dict[str, Any]:
-        """Read pasteboard text, briefly foregrounding the WDA runner on iOS 16+ when needed."""
-        text = "" if skip_initial_read else self.pasteboard(content_type=content_type)
-        if text or not foreground_runner or not runner_bundle_id:
-            return {"text": text, "swapped_app": False, "restored_app": None, "restore_warning": False}
+                        skip_initial_read: bool = False,
+                        send: Any = None) -> dict[str, Any]:
+        """Read pasteboard text, briefly foregrounding the WDA runner on iOS 16+ when needed.
 
-        runner_xct = runner_bundle_id if runner_bundle_id.endswith(".xctrunner") else f"{runner_bundle_id}.xctrunner"
-        prev_app = return_app
-        if prev_app is None:
-            try:
-                prev_app = self.active_app().get("bundleId")
-            except WDAUnavailable:
-                prev_app = fallback_app
-        if not prev_app:
-            prev_app = fallback_app
+        Runs inside a single WDA session (reusing an active session when present) so standalone
+        calls avoid creating/deleting four separate sessions during a foreground swap.
+        """
+        with self.session():
+            text = "" if skip_initial_read else self.pasteboard(content_type=content_type)
+            if text or not foreground_runner or not runner_bundle_id:
+                return {"text": text, "swapped_app": False, "restored_app": None, "restore_warning": False}
 
-        restored_app: str | None = None
-        restore_warning = False
-        self.activate_app(runner_xct)
-        try:
-            delay = settle_seconds
-            if self.budget is not None:
-                delay = min(delay, max(0.0, self.budget.remaining() - 0.5))
-            if delay > 0:
-                time.sleep(delay)
-            text = self.pasteboard(content_type=content_type)
-        finally:
-            if prev_app and prev_app != runner_xct:
+            runner_xct = runner_bundle_id if runner_bundle_id.endswith(".xctrunner") else f"{runner_bundle_id}.xctrunner"
+            prev_app = return_app
+            if prev_app is None:
                 try:
-                    self.activate_app(prev_app)
-                    restored_app = prev_app
+                    prev_app = self.active_app().get("bundleId")
                 except WDAUnavailable:
-                    restore_warning = True
-        return {
-            "text": text,
-            "swapped_app": True,
-            "restored_app": restored_app,
-            "restore_warning": restore_warning,
-        }
+                    prev_app = fallback_app
+            if not prev_app:
+                prev_app = fallback_app
+
+            restored_app: str | None = None
+            restore_warning = False
+            activate = (lambda bundle: send(lambda: self.activate_app(bundle))) if send is not None else self.activate_app
+            activate(runner_xct)
+            try:
+                delay = settle_seconds
+                if self.budget is not None:
+                    delay = min(delay, max(0.0, self.budget.remaining() - 0.5))
+                if delay > 0:
+                    time.sleep(delay)
+                text = self.pasteboard(content_type=content_type)
+            finally:
+                if prev_app and prev_app != runner_xct:
+                    try:
+                        activate(prev_app)
+                        restored_app = prev_app
+                    except (WDAUnavailable, WDAOutcomeUnknown):
+                        restore_warning = True
+            return {
+                "text": text,
+                "swapped_app": True,
+                "restored_app": restored_app,
+                "restore_warning": restore_warning,
+            }
 
     def find_elements(self, query: str, *, using: str = "xpath", element_id: str | None = None) -> list[NativeElement]:
         """Read-only query (WDA uses POST); no implicit retries."""
@@ -287,9 +299,16 @@ class WDAClient:
                               item.get("attribute/value") if isinstance(item.get("attribute/value"), str) else None)
                 for item in value]
 
-    def active_element(self) -> str:
+    def active_element_info(self) -> tuple[str, str | None, str | None]:
         with self.session() as session_id:
-            return element_identifier(self._json_request(f"/session/{session_id}/element/active").get("value"))
+            value = self._json_request(f"/session/{session_id}/element/active").get("value")
+        ref = element_identifier(value)
+        role = value.get("type") if isinstance(value, dict) and isinstance(value.get("type"), str) else None
+        current = value.get("attribute/value") if isinstance(value, dict) and isinstance(value.get("attribute/value"), str) else None
+        return ref, role, current
+
+    def active_element(self) -> str:
+        return self.active_element_info()[0]
 
     def window_size(self) -> tuple[float, float]:
         # Sessionless, so a concurrent observation lane never touches the WDA session.
@@ -503,8 +522,12 @@ class WDAClient:
         data = json.dumps(payload).encode("utf-8") if payload is not None else None
         read = read_only_request(method, path)
         try:
-            status, body = exchange(self.url, path, method, data, timeout,
-                max_bytes=40_000_000 if path == "/screenshot" else 2_100_000)
+            max_bytes = 40_000_000 if path == "/screenshot" else 2_100_000
+            if exchange is _TRANSPORT_EXCHANGE:
+                status, body = exchange(self.url, path, method, data, timeout,
+                    max_bytes=max_bytes, pool=self._pool, allow_stale_retry=read)
+            else:
+                status, body = exchange(self.url, path, method, data, timeout, max_bytes=max_bytes)
         except TransportFailure as exc:
             # A source deadline is lane-specific. A refused/reset socket is not.
             failure = (WDAReadUnavailable if path.startswith("/source") and exc.category != "transport"

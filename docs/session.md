@@ -23,6 +23,7 @@ Hold onto the process across the workflow. Don't recreate it after each step.
 {"op":"tap","target":"RETURNED_ELEMENT_ID"}
 {"op":"swipe","from_x":200,"from_y":700,"to_x":200,"to_y":250,"duration":0.2}
 {"op":"set","target":"NAME_FIELD_ID","value":"Bek"}
+{"op":"set","target":{"role":"XCUIElementTypeSearchField","label":"Search"},"value":"pregnancy announcement","submit":true,"observe":"accessibility"}
 {"op":"set","target":"NAME_FIELD_ID","value":""}
 {"op":"set","target":"TEXT_VIEW_ID","value":"First line\nSecond line"}
 {"op":"set","target":"PASSWORD_FIELD_ID","value_ref":"/absolute/private/input.txt"}
@@ -41,19 +42,29 @@ Hold onto the process across the workflow. Don't recreate it after each step.
 {"op":"launch","bundle_id":"com.apple.mobilesafari","wait_seconds":2,"observe":"image"}
 {"op":"open_url","url":"https://example.com","observe":"accessibility"}
 {"op":"pasteboard"}
-{"op":"goal","goal":"Open Settings and show Wi-Fi","approve":[]}
+{"op":"sequence","steps":[{"op":"tap","target":{"role":"XCUIElementTypeButton","label":"Dismiss"}},{"op":"tap","target":{"role":"XCUIElementTypeButton","label":"Back"}}],"observe":"accessibility"}
+{"op":"goal","goal":"Open Settings and show Wi-Fi","approve":[],"observe":"accessibility"}
 {"op":"close"}
 ```
 
 `goal` exists only when `ready.capabilities` includes it: optional goal
-navigation, enabled in host config. See [goal navigation](goal.md).
+navigation, enabled in host config. See [goal navigation](goal.md). When
+`ready.capabilities` includes `goal_observe`, you can attach `"observe"`
+(`"accessibility"`, `"image"`, or `"both"`) to `goal` to return the final screen
+without an extra round-trip (reusing the already-captured frame when possible).
+`sequence` (`ready.capabilities` includes `sequence`) executes 1–10 ordinary
+steps serially, stops immediately on the first error or uncertain dispatch with
+per-step receipts (`completed_steps`, `total_steps`, `steps`), and attaches an
+optional final `observe`.
 `pasteboard` reads the iPhone clipboard via WDA (`getPasteboard`). On iOS 16+,
 when reading from the background returns empty and `OPENCLAW_IPHONE_RUNNER_BUNDLE_ID`
 is configured (or `runner_bundle_id` is supplied), it briefly foregrounds
 `<runner_bundle_id>.xctrunner`, reads the pasteboard, and restores the previous
-foreground app (`swapped_app: true`, `restored_app: "..."`). Pass
-`"foreground_runner": false` to skip the app swap. Session secrets are redacted
-and text is bounded to 32 KiB (`truncated`).
+foreground app (`swapped_app: true`, `restored_app: "..."`), remembering that
+swap requirement for subsequent reads in the same session. Pass
+`"foreground_runner": false` to skip the app swap or `"foreground_first": true`
+to swap immediately. Session secrets are redacted and text is bounded to 32 KiB
+of JSON-encoded bytes (`truncated`).
 
 - `observe` returns a screen: AX plus a screenshot when `--allow-images` is set,
   otherwise AX only. Explicit `mode` still selects either independently.

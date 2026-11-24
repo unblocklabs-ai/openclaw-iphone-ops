@@ -26,17 +26,26 @@ model unless the operator enabled goal navigation.
   use `space: image`. Conversion fetches dimensions once per image; recapture
   after rotation or layout changes.
 - Use `set` with a complete `value` for text, picker options and Boolean states.
-  Text replaces; an empty string clears. Native input handles keyboard focus;
+  Text replaces; an empty string clears. Add `"submit": true` on text/search
+  fields (when `ready.capabilities` includes `set_submit`) to type and press
+  Return/Search in one turn. Native input handles keyboard focus;
   no letter-by-letter agent calls are needed. Literal newlines require TextView.
   `type` is for intentional insertion. Native input is preferred; sequential
   is explicit field compatibility. Credentials use private owner-only
   `value_ref`/`text_ref` files, never CLI arguments or logs.
 - Use `press`, `launch`, and `open_url` for ordinary transitions. Optional
-  `observe` attaches the next view without changing acknowledged dispatch.
+  `observe` attaches the next view without changing acknowledged dispatch —
+  prefer attaching `observe` to an action over sending a second turn.
+- Use `{"op":"sequence","steps":[...],"observe":"accessibility"}` (when
+  `ready.capabilities` includes `sequence`) to run 1–10 deterministic steps in
+  one turn (for example, `tap "Dismiss"` -> `tap "Back"`, or `tap "Copy link"`
+  -> `pasteboard`). It stops immediately on the first error or uncertain
+  dispatch and returns per-step receipts.
 - Use `{"op":"pasteboard"}` (or `openclaw-iphone wda pasteboard` outside a
   session) to read the iPhone clipboard (for example, a copied share link). On
-  iOS 16+, it automatically foregrounds the WDA runner briefly when needed and
-  restores the active app.
+  iOS 16+, it automatically foregrounds the WDA runner briefly when needed,
+  restores the active app, and remembers that swap for later reads in the same
+  session.
 - Set a wheel-style Gregorian date in one request: `set`, picker target,
   `kind: date`, and `value: YYYY-MM-DD`. The controller identifies supported
   components and handles dependencies. `verify: true` optionally reads the final
@@ -54,7 +63,9 @@ model unless the operator enabled goal navigation.
   navigation ([goal navigation](../../docs/goal.md)): `goal` runs several steps
   toward a goal you name and returns `done`, `escalate` or `needs_approval`.
   Name the app with `app` ("X", "Instagram" or a bundle ID) so it opens first:
-  the navigator only taps what is on screen. Pre-approve only the effects the
+  the navigator only taps what is on screen. Attach `"observe": "accessibility"`
+  (or `"image"`) to `goal` when `ready.capabilities` includes `goal_observe` to
+  receive the final screen in the same reply. Pre-approve only the effects the
   user asked for (`approve`) and check `done` yourself. It sends screenshots and screen text to the configured provider. Without the
   capability, you choose every action.
   - `escalate`: the navigator stopped instead of guessing; the session stays

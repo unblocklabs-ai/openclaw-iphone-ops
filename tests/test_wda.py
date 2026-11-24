@@ -461,10 +461,12 @@ class WDATests(unittest.TestCase):
                 super().__init__(url="http://wda.test", timeout=5)
                 self.foreground = "com.burbn.instagram"
                 self.activations: list[str] = []
+                self.sessions_created = 0
                 self.clip = "https://www.instagram.com/reel/abc123/"
 
             def _send(self, path: str, *, method: str, payload: dict | None, timeout: float) -> bytes:
                 if path == "/session" and method == "POST":
+                    self.sessions_created += 1
                     return b'{"sessionId":"s1","value":{}}'
                 if path == "/session/s1" and method == "DELETE":
                     return b'{"value":null}'
@@ -493,6 +495,8 @@ class WDATests(unittest.TestCase):
             client.activations,
             ["com.example.WebDriverAgentRunner.xctrunner", "com.burbn.instagram"],
         )
+        # Standalone read_pasteboard uses a single WDA session across probe, swap, read, and restore.
+        self.assertEqual(client.sessions_created, 1)
 
         # Invalid base64 raises WDAUnavailable.
         bad = FakeWDAClient({

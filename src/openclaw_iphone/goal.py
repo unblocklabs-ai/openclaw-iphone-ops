@@ -8,15 +8,19 @@ from __future__ import annotations
 import base64
 from collections import Counter
 import hashlib
+import http.client
 import io
 import json
 import math
 import os
 from pathlib import Path
 import re
+import select
+import ssl
 import struct
 import subprocess
 import tempfile
+import threading
 import time
 from typing import Callable, Mapping
 import urllib.error
@@ -69,9 +73,80 @@ class Decisions:
         if model:
             self.model = model
         self.local_guard = local_guard
+        self._conn_lock = threading.Lock()
+        self._conn: http.client.HTTPConnection | None = None
+        self._conn_key: tuple[str, str, int] | None = None
+
+    def close(self) -> None:
+        with self._conn_lock:
+            self._close_conn_locked()
+        if self.local_guard is not None:
+            self.local_guard.close()
+
+    def _close_conn_locked(self) -> None:
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except OSError:
+                pass
+            self._conn = None
+            self._conn_key = None
 
     def ask(self, body: dict) -> dict:
         return navigator.answers(self._post(dict(body, model=self.model)))
+
+    def _uses_proxy(self, parsed: urllib.parse.SplitResult) -> bool:
+        host = parsed.hostname or ""
+        if host.lower() in LOOPBACK_HOSTS:
+            return False
+        proxies = urllib.request.getproxies()
+        if parsed.scheme not in proxies:
+            return False
+        return not urllib.request.proxy_bypass(host)
+
+    def _post_direct(self, parsed: urllib.parse.SplitResult, data: bytes, req_headers: dict[str, str]) -> tuple[int, bytes]:
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        key = (parsed.scheme, parsed.hostname or "", port)
+        path = parsed.path or "/"
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+        headers = dict(req_headers, Connection="keep-alive")
+        with self._conn_lock:
+            for stale_attempt in range(2):
+                reused = False
+                if self._conn is not None and self._conn_key != key:
+                    self._close_conn_locked()
+                if self._conn is not None and self._conn.sock is not None:
+                    try:
+                        readable, _, errored = select.select([self._conn.sock], [], [self._conn.sock], 0.0)
+                        if readable or errored:
+                            self._close_conn_locked()
+                        else:
+                            reused = True
+                    except (OSError, ValueError):
+                        self._close_conn_locked()
+                if self._conn is None:
+                    if parsed.scheme == "https":
+                        self._conn = http.client.HTTPSConnection(
+                            parsed.hostname, port, timeout=self.timeout, context=ssl.create_default_context()
+                        )
+                    else:
+                        self._conn = http.client.HTTPConnection(parsed.hostname, port, timeout=self.timeout)
+                    self._conn_key = key
+                try:
+                    self._conn.request("POST", path, body=data, headers=headers)
+                    resp = self._conn.getresponse()
+                    raw = resp.read()
+                    status = resp.status
+                    if resp.will_close:
+                        self._close_conn_locked()
+                    return status, raw
+                except (http.client.HTTPException, OSError):
+                    self._close_conn_locked()
+                    if reused and stale_attempt == 0:
+                        continue
+                    raise
+        raise OSError("Decisions connection closed.")
 
     def _post(self, body: dict, *, headers: dict[str, str] | None = None) -> dict:
         data = json.dumps(body).encode()
@@ -82,20 +157,30 @@ class Decisions:
         }
         if self.api_key:
             req_headers["Authorization"] = f"Bearer {self.api_key}"
+        parsed = urllib.parse.urlsplit(self.url)
+        use_proxy = self._uses_proxy(parsed)
         for attempt in range(RETRIES + 1):  # asking has no side effects: rate limits and server errors are retried
-            request = urllib.request.Request(self.url, data=data, method="POST", headers=req_headers)
             try:
-                with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                    return json.load(response)
+                if use_proxy:
+                    request = urllib.request.Request(self.url, data=data, method="POST", headers=req_headers)
+                    with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                        return json.load(response)
+                status, raw = self._post_direct(parsed, data, req_headers)
+                if 200 <= status < 300:
+                    return json.loads(raw.decode("utf-8"))
+                if (status == 429 or status >= 500) and attempt < RETRIES:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                raise navigator.Unavailable("The Decisions API refused the request.", category=f"http_{status}") from None
             except urllib.error.HTTPError as exc:
                 exc.close()
                 if (exc.code == 429 or exc.code >= 500) and attempt < RETRIES:
                     time.sleep(0.5 * (attempt + 1))
                     continue
                 raise navigator.Unavailable("The Decisions API refused the request.", category=f"http_{exc.code}") from None
-            except OSError as exc:
+            except (http.client.HTTPException, OSError) as exc:
                 raise navigator.Unavailable("The Decisions API is unreachable.", category="unreachable") from exc
-            except ValueError as exc:
+            except (ValueError, UnicodeDecodeError) as exc:
                 raise navigator.Unavailable("The Decisions API reply is not JSON.") from exc
 
 
@@ -489,10 +574,11 @@ def _window_size(session, obs, *, png_dims: tuple[int, int] | None = None,
     return size
 
 
-def run(session, decisions: Decisions, data: dict) -> dict:
+def run(session, decisions: Decisions, data: dict, *,
+        observe_mode: str | None = None, masks: list | None = None, limit: int = 80) -> dict:
     """Capture, decide, act until done, an escalation, a risky tap needing approval, or the step limit."""
-    if any(key in data for key in ("observe", "masks", "limit", "offset")):
-        raise ValueError("Goal replies carry no observation; observe separately.")
+    if "offset" in data:
+        raise ValueError("Goal replies cannot page an older snapshot.")
     goal = validate_text(data.get("goal"))
     text = data.get("text")
     if text is not None:
@@ -530,9 +616,14 @@ def run(session, decisions: Decisions, data: dict) -> dict:
         sent = 1
     local_guard = getattr(decisions, "local_guard", None)
     size_cache: dict[tuple[int, int] | None, tuple[float, float]] = {}
+    last_png: bytes | None = None
+    last_obs = None
+    last_depth: int | None = None
+    last_capture_after_write = False
     try:
         for index in range(max_steps):
             obs = None
+            depth = None
             use_vision = grounding == "vision" or (
                 grounding == "auto" and supports_box and session.app_hint in session.shallow_apps
             )
@@ -541,8 +632,7 @@ def run(session, decisions: Decisions, data: dict) -> dict:
                     png = settle(lambda: session._read(lambda wda: wda.screenshot()))
                     if not use_vision:
                         try:
-                            session._accessibility(limit=1)
-                            obs = session.snapshot
+                            obs, depth = session._capture_accessibility()
                         except (OpenClawIPhoneError, ValueError):
                             if grounding == "auto" and supports_box:
                                 use_vision = True
@@ -553,12 +643,12 @@ def run(session, decisions: Decisions, data: dict) -> dict:
                     with session.connection.operation():
                         png = settle(lambda: session._read(lambda wda: wda.screenshot()))
                         try:
-                            session._accessibility(limit=1)
-                            obs = session.snapshot
+                            obs, depth = session._capture_accessibility()
                         except (OpenClawIPhoneError, ValueError):
                             if grounding == "auto" and supports_box:
                                 use_vision = True
                                 obs = None
+                                depth = None
                             else:
                                 raise
                 if not use_vision:
@@ -570,6 +660,8 @@ def run(session, decisions: Decisions, data: dict) -> dict:
                     elif obs.secure:
                         outcome, reason = "escalate", "secure_field"
                         break
+                last_png, last_obs, last_depth = png, obs, depth
+                last_capture_after_write = True
                 encoded_image = jpeg(png)
                 png_dims = _png_dimensions(png)
                 win_size = _window_size(session, obs, png_dims=png_dims, size_cache=size_cache) if use_vision else None
@@ -642,7 +734,13 @@ def run(session, decisions: Decisions, data: dict) -> dict:
                         pending |= {"x": target["x"], "y": target["y"]}
                     extra = {"pending": pending}
                     break
-                if same(session._read(lambda wda: wda.screenshot()), png):
+                try:
+                    with session.connection.operation():
+                        current_png = session._read(lambda wda: wda.screenshot())
+                except (OpenClawIPhoneError, OSError) as exc:
+                    outcome, reason, extra = "escalate", "capture_failed", {"error": diagnostic(exc)}
+                    break
+                if same(current_png, png):
                     reply = session._request({"op": "tap", "x": target["x"], "y": target["y"]})
                 elif target.get("id") is not None:
                     reply = session._request({"op": "tap", "target": target["id"]})
@@ -673,6 +771,7 @@ def run(session, decisions: Decisions, data: dict) -> dict:
                 reply = session._request({"op": "swipe", "from_x": round(x + w / 2), "from_y": round(y + h * 0.725),
                                           "to_x": round(x + w / 2), "to_y": round(y + h * 0.335), "duration": 0.3})
                 note = "scrolled down"
+            last_capture_after_write = False
             step["dispatch"] = reply.get("dispatch")
             if step["dispatch"] != "acknowledged":
                 uncertain = step["dispatch"] in ("unknown", "partial")
@@ -683,7 +782,8 @@ def run(session, decisions: Decisions, data: dict) -> dict:
             if session.closed:
                 outcome, reason = "escalate", "interrupted"
                 break
-            time.sleep(0.2)  # let the transition start before the next settle check
+            if index + 1 < max_steps:
+                time.sleep(0.2)  # let the transition start before the next settle check
     except KeyboardInterrupt:  # between writes: a write in flight reports through its own step
         session.connection.invalidate()
         session.closed = True
@@ -695,4 +795,23 @@ def run(session, decisions: Decisions, data: dict) -> dict:
               "navigator_seconds": round(deciding, 3)}
     if reason:
         result["reason"] = reason
+    if observe_mode and not session.closed and reason != "secure_field":
+        req_masks = masks or []
+        observation: dict[str, object] = {}
+        try:
+            if last_capture_after_write and not req_masks:
+                if observe_mode in ("accessibility", "both") and last_obs is not None:
+                    observation["accessibility"] = session._render_accessibility(last_obs, last_depth, limit=limit, offset=0)
+                if observe_mode in ("image", "both") and last_png is not None:
+                    observation["image"] = session._save_image_bytes(last_png, masks=[])
+            needed_ax = observe_mode in ("accessibility", "both") and "accessibility" not in observation
+            needed_img = observe_mode in ("image", "both") and "image" not in observation
+            if needed_ax or needed_img:
+                fetch_mode = "both" if needed_ax and needed_img else ("accessibility" if needed_ax else "image")
+                with session.connection.operation():
+                    observation.update(session._observe(fetch_mode, req_masks, limit=limit, offset=0))
+        except (OpenClawIPhoneError, OSError, ValueError) as exc:
+            observation["observation_error"] = diagnostic(exc)
+        if observation:
+            result["observation"] = observation
     return result | extra

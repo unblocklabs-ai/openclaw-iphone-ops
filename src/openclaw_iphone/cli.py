@@ -656,12 +656,17 @@ def handle_wda_lock(args: argparse.Namespace) -> int:
 def handle_wda_pasteboard(args: argparse.Namespace) -> int:
     config = load_config()
     runner_id = args.runner_bundle_id or config.get("OPENCLAW_IPHONE_RUNNER_BUNDLE_ID")
-    result = wda_client_from_args(args).read_pasteboard(
-        content_type=args.content_type,
-        runner_bundle_id=runner_id,
-        return_app=args.return_app,
-        foreground_runner=not args.no_foreground_runner,
-    )
+    wda = wda_client_from_args(args)
+    try:
+        result = wda.read_pasteboard(
+            content_type=args.content_type,
+            runner_bundle_id=runner_id,
+            return_app=args.return_app,
+            foreground_runner=not args.no_foreground_runner,
+        )
+    finally:
+        if hasattr(wda, "close"):
+            wda.close()
     print(result["text"])
     return 0
 
@@ -673,11 +678,16 @@ def handle_media_fetch(args: argparse.Namespace) -> int:
         if raw_url:
             raise ValueError("Pass either a URL or --from-pasteboard, not both.")
         runner_id = args.runner_bundle_id or config.get("OPENCLAW_IPHONE_RUNNER_BUNDLE_ID")
-        pb = wda_client_from_args(args).read_pasteboard(
-            runner_bundle_id=runner_id,
-            return_app=args.return_app,
-            foreground_runner=not args.no_foreground_runner,
-        )
+        wda = wda_client_from_args(args)
+        try:
+            pb = wda.read_pasteboard(
+                runner_bundle_id=runner_id,
+                return_app=args.return_app,
+                foreground_runner=not args.no_foreground_runner,
+            )
+        finally:
+            if hasattr(wda, "close"):
+                wda.close()
         raw_url = pb["text"]
     if not raw_url:
         raise ValueError("Provide a social video URL or pass --from-pasteboard.")
@@ -1045,11 +1055,12 @@ def handle_session(args: argparse.Namespace) -> int:
                               decisions=decisions_from_config(config),
                               runner_bundle_id=config.get("OPENCLAW_IPHONE_RUNNER_BUNDLE_ID"))
             capabilities = [
-                "set_input", "gregorian_wheel_date", "native_picker", "private_replace_verification",
-                "foreground_readiness", "request_timing", "candidate_paging", "pasteboard",
+                "set_input", "set_submit", "gregorian_wheel_date", "native_picker",
+                "private_replace_verification", "foreground_readiness", "request_timing",
+                "candidate_paging", "pasteboard", "sequence",
             ]
             if session.decisions:
-                capabilities.append("goal")
+                capabilities.extend(["goal", "goal_observe"])
                 if getattr(session.decisions, "supports_box", False):
                     capabilities.append("goal_vision_box")
             emit({"status": "ready", "protocol": 2, "device_udid": connection.device.udid,

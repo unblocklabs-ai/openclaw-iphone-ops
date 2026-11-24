@@ -15,15 +15,13 @@ Instagram/TikTok share links directly.
 
 1. **Navigate to the Reel or TikTok video** using [iphone-control](../iphone-control/SKILL.md)
    (and [ios-instagram](../ios-instagram/SKILL.md) for Instagram).
-2. **Copy the share link on the phone:**
-   - **Instagram:** tap the Share/Send paper-airplane button -> tap **Copy link**.
-   - **TikTok:** tap the Share arrow button -> tap **Copy link**.
-3. **Read the iPhone clipboard without closing the session:**
+2. **Copy the share link and read the iPhone clipboard in one turn** (after tapping Share/Send so `Copy link` is visible):
    ```json
-   {"op":"pasteboard"}
+   {"op":"sequence","steps":[{"op":"tap","target":{"role":"XCUIElementTypeButton","label":"Copy link"}},{"op":"pasteboard"}]}
    ```
-   On iOS 16+, `openclaw-iphone` briefly foregrounds the WDA runner to read
-   `UIPasteboard` and automatically restores the active app.
+   *(Or run `tap` then `{"op":"pasteboard"}` separately.)* On iOS 16+,
+   `openclaw-iphone` briefly foregrounds the WDA runner to read `UIPasteboard`
+   and automatically restores the active app.
 4. **Download the `.mp4` locally** (strips tracking parameters, merges H.264/AAC
    into `.mp4`, writes owner-only `0600` inside a private `0700` temp directory):
    ```sh

@@ -78,3 +78,46 @@ class DeadlineTests(unittest.TestCase):
                 client.status()
             self.assertEqual(caught.exception.category, "response_too_large")
             self.assertEqual(writes, [("GET", "/status")])
+
+    def test_keep_alive_reuses_socket_and_retries_only_stale_reads(self):
+        connections = []
+        requests = []
+
+        class KeepAliveHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *args):
+                pass
+
+            def setup(self):
+                super().setup()
+                connections.append(self.client_address)
+
+            def respond(self):
+                length = int(self.headers.get("Content-Length", 0))
+                if length:
+                    self.rfile.read(length)
+                requests.append((self.command, self.path))
+                body = b'{"value":{"ready":true}}'
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            do_GET = respond
+            do_POST = respond
+
+        with ThreadingHTTPServer(("127.0.0.1", 0), KeepAliveHandler) as server:
+            server.daemon_threads = True
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
+            thread.start()
+            client = WDAClient(url=f"http://127.0.0.1:{server.server_port}", timeout=2.0)
+            try:
+                for _ in range(4):
+                    self.assertTrue(client.status().ready)
+                self.assertEqual(len(requests), 4)
+                self.assertEqual(len(connections), 1)
+            finally:
+                client.close()
+                server.shutdown()
+                thread.join()

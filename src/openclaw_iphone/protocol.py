@@ -4,6 +4,7 @@ from __future__ import annotations
 import io
 from datetime import datetime, timezone
 import json
+import math
 import os
 import select
 import time
@@ -29,7 +30,13 @@ def strict_json(raw: bytes | str) -> object:
     def constant(value):
         raise ValueError("Non-finite JSON number.")
 
-    return json.loads(raw, object_pairs_hook=pairs, parse_constant=constant)
+    def finite_float(raw_float: str) -> float:
+        value = float(raw_float)
+        if not math.isfinite(value):
+            raise ValueError("Non-finite JSON number.")
+        return value
+
+    return json.loads(raw, object_pairs_hook=pairs, parse_constant=constant, parse_float=finite_float)
 
 
 def read_requests(fd: int, *, frame_timeout: float = 5) -> Iterator[bytes]:
@@ -72,8 +79,10 @@ class JsonLineEmitter:
         raw = (json.dumps(value, ensure_ascii=True, separators=(",", ":")) + "\n").encode()
         oversized = len(raw) > self.max_bytes
         if oversized:
-            summary = {key: value[key] for key in ("status", "dispatch", "reason", "acknowledged_substeps",
-                       "acknowledged_characters", "cleanup", "request_sequence") if key in value}
+            summary = {key: value[key] for key in ("status", "dispatch", "reason", "outcome", "pending",
+                       "acknowledged_substeps", "acknowledged_characters", "completed_steps", "total_steps",
+                       "swapped_app", "restored_app", "restore_warning", "truncated", "cleanup",
+                       "request_sequence") if key in value}
             summary["output_warning"] = "response_too_large_reduce_observation_limit"
             observation = value.get("observation")
             if isinstance(observation, dict) and "image" in observation:

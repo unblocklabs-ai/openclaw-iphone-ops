@@ -80,7 +80,10 @@ class Connection:
                 try:
                     probe = WDAClient(url=cached["url"], timeout=min(2, self.ctl.runner.timeout), read_timeout=1.5)
                     probe.budget = self.ctl.runner.budget
-                    status = probe.status()
+                    try:
+                        status = probe.status()
+                    finally:
+                        probe.close()
                 except (WDAUnavailable, WDASetupError, ValueError):
                     status = None
                 if status is not None and status.ready is True:
@@ -157,6 +160,7 @@ class Connection:
         try:
             self._sessions.close()
         finally:
+            wda.close()
             wda.budget = previous
             self.cleanup_failed |= wda._session.cleanup_failed
 

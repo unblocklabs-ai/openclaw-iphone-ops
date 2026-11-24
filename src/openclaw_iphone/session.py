@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from contextlib import contextmanager, nullcontext
 from itertools import islice
+import json
 import math
 import os
 from pathlib import Path
@@ -45,6 +46,47 @@ def read_input(path: str) -> str:
     return raw.decode("utf-8").removesuffix("\n")
 
 
+def _truncate_json_text(text: str, *, max_bytes: int = 32_768) -> tuple[str, bool]:
+    """Truncate text so its ASCII-escaped JSON encoding stays within `max_bytes`."""
+    if len(json.dumps(text, ensure_ascii=True).encode("ascii")) <= max_bytes:
+        return text, False
+    lo, hi = 0, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if len(json.dumps(text[:mid], ensure_ascii=True).encode("ascii")) <= max_bytes:
+            lo = mid
+        else:
+            hi = mid - 1
+    return text[:lo], True
+
+
+OP_FIELDS: dict[str, set[str]] = {
+    "observe": {"mode", "masks", "candidates"},
+    "tap": {"target", "x", "y", "space"},
+    "swipe": {"from_x", "from_y", "to_x", "to_y", "duration", "space"},
+    "type": {"text", "text_ref", "target", "mode", "strategy", "frequency", "verify"},
+    "pick": {"target", "value", "order", "max_steps", "offset", "seconds"},
+    "set": {"target", "value", "value_ref", "kind", "components", "month_values", "strategy", "verify", "submit"},
+    "press": {"button", "duration"},
+    "launch": {"bundle_id", "wait_seconds"},
+    "open_url": {"url"},
+    "pasteboard": {"content_type", "foreground_runner", "foreground_first", "runner_bundle_id", "return_app"},
+    "goal": {"goal", "app", "text", "approve", "max_steps", "grounding"},
+    "sequence": {"steps"},
+    "close": set(),
+}
+OP_REQUIRED: dict[str, set[str]] = {
+    "swipe": {"from_x", "from_y", "to_x", "to_y"},
+    "press": {"button"},
+    "launch": {"bundle_id"},
+    "open_url": {"url"},
+    "pick": {"target", "value"},
+    "sequence": {"steps"},
+}
+SEQUENCE_MAX_STEPS = 10
+SEQUENCE_DISALLOWED_OPS = frozenset({"sequence", "goal", "close"})
+
+
 class TargetUnavailable(OpenClawIPhoneError):
     def __init__(self, candidates: dict[str, object] | list[dict[str, object]]) -> None:
         super().__init__("Target missing or ambiguous.")
@@ -65,6 +107,7 @@ class Session:
         self.candidate_ids: set[str] | None = None
         self.shallow_apps = shallow.load()  # apps too slow to read in full (shallow.py)
         self.app_hint: str | None = None  # the app the next read expects: last observed or launched
+        self._pasteboard_needs_swap = False
 
     def _read(self, read: Callable[[WDAClient], T]) -> T:
         """One safe retry per read; no lifetime recovery allowance."""
@@ -78,14 +121,7 @@ class Session:
                     raise
         raise AssertionError("Unreachable read retry state.")
 
-    def _accessibility(self, *, limit: int = 80, offset: int = 0, candidates: bool = False) -> dict[str, object]:
-        if offset or candidates:
-            if self.snapshot is None:
-                raise ValueError("Observe a screen before paging it.")
-            if candidates and self.candidate_ids is None:
-                raise ValueError("No current ambiguity candidates.")
-            return self.snapshot.compact(include_labels=True, limit=limit, offset=offset, redact=self._redact,
-                                         ids=self.candidate_ids if candidates else None)
+    def _capture_accessibility(self) -> tuple[Observation, int]:
         def capture(depth: int, *, timeout: float | None = None) -> Observation:
             def read(wda: WDAClient) -> Observation:
                 wda.snapshot_depth(depth)
@@ -125,39 +161,60 @@ class Session:
         elif depth == shallow.DEPTH and observation.app not in self.shallow_apps:
             observation = capture(depth := shallow.DEFAULT_DEPTH)  # another app is in front now: read it in full
         self.snapshot, self.app_hint = observation, observation.app
+        return observation, depth
+
+    def _render_accessibility(self, observation: Observation, depth: int | None, *,
+                              limit: int = 80, offset: int = 0) -> dict[str, object]:
         view = observation.compact(include_labels=True, limit=limit, offset=offset, redact=self._redact)
         if depth == shallow.DEPTH:
             view["tree_depth_limit"] = depth  # deeper controls are missing from `elements`; the screenshot shows all
         return view
+
+    def _accessibility(self, *, limit: int = 80, offset: int = 0, candidates: bool = False) -> dict[str, object]:
+        if offset or candidates:
+            if self.snapshot is None:
+                raise ValueError("Observe a screen before paging it.")
+            if candidates and self.candidate_ids is None:
+                raise ValueError("No current ambiguity candidates.")
+            return self.snapshot.compact(include_labels=True, limit=limit, offset=offset, redact=self._redact,
+                                         ids=self.candidate_ids if candidates else None)
+        observation, depth = self._capture_accessibility()
+        return self._render_accessibility(observation, depth, limit=limit, offset=offset)
 
     def _remember_shallow(self, app: str | None) -> None:
         if app and app not in self.shallow_apps:
             self.shallow_apps.add(app)
             shallow.remember(app)
 
-    def _image(self, masks: list) -> dict[str, object]:
-        started = time.monotonic()
-        def capture(wda: WDAClient):
-            size = wda.window_size() if masks else None
-            raw = wda.screenshot()
-            stamp, captured = datetime.now(timezone.utc).isoformat(), time.monotonic()
-            if masks:
-                raw, pixels = redact_png(raw, size, masks)
-            else:
-                if len(raw) < 24 or not raw.startswith(b"\x89PNG\r\n\x1a\n"):
-                    raise WDAUnavailable("Invalid PNG.")
-                pixels = struct.unpack_from(">II", raw, 16)
-                if not 0 < pixels[0] * pixels[1] <= 12_000_000:
-                    raise WDAUnavailable("Invalid image geometry.")
-            return size, pixels, raw, stamp, captured
-        size, pixels, raw, stamp, captured = self._read(capture)
+    def _save_image_bytes(self, raw: bytes, *, masks: list, size: tuple[float, float] | None = None,
+                          stamp: str | None = None, capture_seconds: float = 0.0) -> dict[str, object]:
+        captured = time.monotonic()
+        stamp = stamp or datetime.now(timezone.utc).isoformat()
+        if masks:
+            assert size is not None
+            raw, pixels = redact_png(raw, size, masks)
+        else:
+            if len(raw) < 24 or not raw.startswith(b"\x89PNG\r\n\x1a\n"):
+                raise WDAUnavailable("Invalid PNG.")
+            pixels = struct.unpack_from(">II", raw, 16)
+            if not 0 < pixels[0] * pixels[1] <= 12_000_000:
+                raise WDAUnavailable("Invalid image geometry.")
         path = artifact_path("screen", ".png", base=self.evidence_base)
         write_private(path, raw)
         self.image_geometry = size, pixels
         return {"path": str(path), "pixels": list(pixels), "device_size": list(size) if size else None,
                 "masked_regions": len(masks), "privacy": "potentially_private",
-                "captured_at": stamp, "capture_seconds": captured - started,
+                "captured_at": stamp, "capture_seconds": capture_seconds,
                 "processing_seconds": time.monotonic() - captured}
+
+    def _image(self, masks: list) -> dict[str, object]:
+        started = time.monotonic()
+        def capture(wda: WDAClient):
+            size = wda.window_size() if masks else None
+            raw = wda.screenshot()
+            return size, raw, datetime.now(timezone.utc).isoformat(), time.monotonic() - started
+        size, raw, stamp, capture_seconds = self._read(capture)
+        return self._save_image_bytes(raw, masks=masks, size=size, stamp=stamp, capture_seconds=capture_seconds)
 
     def _observe(self, mode: str, masks: list, *, limit: int, offset: int, candidates: bool = False) -> dict[str, object]:
         lanes = {name: capture for name, capture in (("image", lambda: self._image(masks)), ("accessibility", lambda: self._accessibility(limit=limit, offset=offset, candidates=candidates)))
@@ -292,20 +349,9 @@ class Session:
         if self.closed or not isinstance(data, dict):
             raise ValueError("Expected an open session and request object.")
         op = data.get("op")
-        fields = {"observe": {"mode", "masks", "candidates"}, "tap": {"target", "x", "y", "space"},
-                  "swipe": {"from_x", "from_y", "to_x", "to_y", "duration", "space"},
-                  "type": {"text", "text_ref", "target", "mode", "strategy", "frequency", "verify"},
-                  "pick": {"target", "value", "order", "max_steps", "offset", "seconds"},
-                  "set": {"target", "value", "value_ref", "kind", "components", "month_values", "strategy", "verify"},
-                  "press": {"button", "duration"}, "launch": {"bundle_id", "wait_seconds"},
-                  "open_url": {"url"},
-                  "pasteboard": {"content_type", "foreground_runner", "runner_bundle_id", "return_app"},
-                  "goal": {"goal", "app", "text", "approve", "max_steps", "grounding"}, "close": set()}
-        if not isinstance(op, str) or op not in fields or set(data) - (fields[op] | {"op", "observe", "masks", "limit", "offset"}):
+        if not isinstance(op, str) or op not in OP_FIELDS or set(data) - (OP_FIELDS[op] | {"op", "observe", "masks", "limit", "offset"}):
             raise ValueError("Unknown operation or field.")
-        required = {"swipe": {"from_x", "from_y", "to_x", "to_y"}, "press": {"button"},
-                    "launch": {"bundle_id"}, "open_url": {"url"}, "pick": {"target", "value"}}
-        if required.get(op, set()) - set(data) or op == "tap" and data.get("target") is None and not {"x", "y"} <= set(data):
+        if OP_REQUIRED.get(op, set()) - set(data) or op == "tap" and data.get("target") is None and not {"x", "y"} <= set(data):
             raise ValueError("Missing operation argument.")
         candidates = data.get("candidates", False)
         if type(candidates) is not bool:
@@ -327,12 +373,16 @@ class Session:
             raise ValueError("Image disclosure requires --allow-images.")
         if op == "close":
             self.closed = True
+            if self.decisions is not None:
+                self.decisions.close()
             return {"status": "closed"}
         if op == "goal":
             # Many operations, each with its own deadline; the navigator's calls run between them.
             if self.decisions is None:
                 return {"status": "error", "dispatch": "not_sent", "reason": "goal_navigation_disabled"}
-            return goal.run(self, self.decisions, data)
+            return goal.run(self, self.decisions, data, observe_mode=mode, masks=masks, limit=limit)
+        if op == "sequence":
+            return self._sequence(data["steps"], mode=mode, masks=masks, limit=limit)
         acknowledged = 0
         action_started = False
         completed = False
@@ -366,19 +416,27 @@ class Session:
                 if op == "pasteboard":
                     content_type = data.get("content_type", "plaintext")
                     foreground_runner = data.get("foreground_runner", True)
+                    foreground_first = data.get("foreground_first")
                     runner_override = data.get("runner_bundle_id")
                     return_app = data.get("return_app")
-                    if content_type not in {"plaintext", "url"} or type(foreground_runner) is not bool:
+                    if (content_type not in {"plaintext", "url"} or type(foreground_runner) is not bool
+                            or foreground_first is not None and type(foreground_first) is not bool):
                         raise ValueError("Invalid pasteboard options.")
                     for opt in (runner_override, return_app):
                         if opt is not None and (not isinstance(opt, str) or not opt or any(ord(c) < 32 for c in opt)):
                             raise ValueError("Invalid bundle identifier.")
+                    runner_id = runner_override or self.runner_bundle_id
+                    skip_bg = bool(
+                        foreground_runner and runner_id and (
+                            foreground_first is True
+                            or (foreground_first is None and self._pasteboard_needs_swap)
+                        )
+                    )
                     # Safe initial read reconnects if the WDA session was lost.
-                    text = self._read(lambda wda: wda.pasteboard(content_type=content_type))
+                    text = "" if skip_bg else self._read(lambda wda: wda.pasteboard(content_type=content_type))
                     swapped = False
                     restored_app = None
                     restore_warning = False
-                    runner_id = runner_override or self.runner_bundle_id
                     if not text and foreground_runner and runner_id:
                         wda = self.connection.require_active()
                         read = wda.read_pasteboard(
@@ -388,18 +446,22 @@ class Session:
                             fallback_app=self.app_hint,
                             foreground_runner=True,
                             skip_initial_read=True,
+                            send=send,
                         )
                         text = read["text"]
                         swapped = bool(read["swapped_app"])
                         restored_app = read["restored_app"]
                         restore_warning = bool(read["restore_warning"])
+                        if swapped and text:
+                            self._pasteboard_needs_swap = True
                         if restored_app:
                             self.app_hint = restored_app
                     redacted = self._redact(text)
-                    truncated = len(redacted) > 32_768
+                    clipped, truncated = _truncate_json_text(redacted, max_bytes=32_768)
+                    completed = True
                     result: dict[str, object] = {
                         "status": "checked",
-                        "text": redacted[:32_768],
+                        "text": clipped,
                         "truncated": truncated,
                         "swapped_app": swapped,
                     }
@@ -457,8 +519,8 @@ class Session:
                             or any(not isinstance(v, str) or not v or any(ord(c) < 32 for c in v) for v in month_values)
                             or len({v.casefold() for v in month_values}) != 12):
                         raise ValueError("Provide twelve distinct native month values.")
-                    strategy, verify = data.get("strategy", "native"), data.get("verify", False)
-                    if strategy not in ("native", "sequential") or type(verify) is not bool:
+                    strategy, verify, submit = data.get("strategy", "native"), data.get("verify", False), data.get("submit", False)
+                    if strategy not in ("native", "sequential") or type(verify) is not bool or type(submit) is not bool:
                         raise ValueError("Invalid input options.")
                 if op == "pick":
                     value = data["value"]
@@ -485,14 +547,20 @@ class Session:
                 wda = self.connection.require_active()
                 if op == "set":
                     role = None
+                    active_value: str | None = None
                     if kind == "date" or components is not None:
                         kind = "date"
                     else:
-                        ref = ref or wda.active_element()
-                        role = element.role if element else wda.element_type(ref)
+                        if ref is None:
+                            ref, active_role, active_value = wda.active_element_info()
+                            role = active_role or wda.element_type(ref)
+                        else:
+                            role = element.role if element and element.role else wda.element_type(ref)
                         kind = input_kind(role, value, kind)
                     if kind != "date" and (components is not None or month_values is not None):
                         raise ValueError("Date options require a date picker.")
+                    if submit and kind != "text":
+                        raise ValueError("Submit requires a text field.")
                     def perform_set() -> str:
                         if kind == "date":
                             if ref is None and components is None:
@@ -503,13 +571,17 @@ class Session:
                         if kind == "text":
                             if "\n" in value and role != "XCUIElementTypeTextView":
                                 raise InputUnavailable("multiline_requires_text_view")
-                            write_text(wda, ref, value, send, replace=True, strategy=strategy)
+                            current_text = element.value if element is not None else active_value
+                            write_text(wda, ref, value, send, replace=True, strategy=strategy,
+                                       current_value=current_text, role=role)
+                            if submit:
+                                send(lambda: wda.type_text("\ue007"))
                             return self._compare(wda, ref, value, role=role) if verify else "unknown"
                         if kind == "picker" and (not value or "\n" in value):
                             raise ValueError("Picker options must be non-empty single-line strings.")
-                        current = element.value if element else None
+                        current = element.value if element else active_value
                         if kind == "checked":
-                            if element is None:
+                            if current is None:
                                 current = wda.element_value(ref, allow_null_empty=False)
                             return set_checked(wda, ref, value, send, current=current, verify=verify)
                         return pick_value(wda, ref, value, send, current=current, verify=verify)
@@ -578,3 +650,69 @@ class Session:
                     "reason": "invalid_request" if isinstance(exc, (ValueError, TypeError, OverflowError)) else "operation_unavailable",
                     "error": diagnostic(exc), "acknowledged_substeps": acknowledged,
                     **({"effect": "unknown"} if op in ("pick", "set") else {})}
+
+    def _sequence(self, steps: object, *, mode: str | None, masks: list, limit: int) -> dict[str, object]:
+        """Run 1..10 ordinary ops in order, stopping immediately on the first error or uncertain dispatch."""
+        if not isinstance(steps, list) or not 1 <= len(steps) <= SEQUENCE_MAX_STEPS:
+            raise ValueError(f"Sequence requires 1-{SEQUENCE_MAX_STEPS} steps.")
+        for step in steps:
+            if not isinstance(step, dict):
+                raise ValueError("Each sequence step must be a request object.")
+            step_op = step.get("op")
+            if not isinstance(step_op, str) or step_op not in OP_FIELDS or step_op in SEQUENCE_DISALLOWED_OPS:
+                raise ValueError("Unsupported operation in sequence.")
+            if "observe" in step or "offset" in step:
+                raise ValueError("Attach observe to the sequence itself, not individual steps.")
+            if set(step) - (OP_FIELDS[step_op] | {"op", "masks", "limit"}):
+                raise ValueError("Unknown field in sequence step.")
+            if OP_REQUIRED.get(step_op, set()) - set(step) or (
+                step_op == "tap" and step.get("target") is None and not {"x", "y"} <= set(step)
+            ):
+                raise ValueError("Missing argument in sequence step.")
+        results: list[dict[str, object]] = []
+        acknowledged = 0
+        any_action = False
+        failed: dict[str, object] | None = None
+        for step in steps:
+            try:
+                reply = self._request(step)
+            except (ValueError, TypeError, UnicodeError, RecursionError, OverflowError) as exc:
+                reply = {"status": "error", "dispatch": "not_sent", "reason": "invalid_request", "error": diagnostic(exc)}
+            results.append(reply)
+            acknowledged += int(reply.get("acknowledged_substeps") or 0)
+            if reply.get("status") == "action" or reply.get("swapped_app"):
+                any_action = True
+            step_dispatch = reply.get("dispatch")
+            if reply.get("status") == "error" or step_dispatch in ("unknown", "partial") or self.closed:
+                failed = reply
+                break
+        if failed is not None:
+            fail_dispatch = failed.get("dispatch")
+            dispatch = "unknown" if fail_dispatch == "unknown" else ("partial" if acknowledged else "not_sent")
+            out: dict[str, object] = {
+                "status": "error",
+                "dispatch": dispatch,
+                "reason": failed.get("reason", "sequence_step_failed"),
+                "acknowledged_substeps": acknowledged,
+                "completed_steps": len(results) - 1,
+                "total_steps": len(steps),
+                "steps": results,
+            }
+            if "error" in failed:
+                out["error"] = failed["error"]
+            return out
+        out = {
+            "status": "action" if any_action else "checked",
+            "dispatch": "acknowledged" if acknowledged else "not_sent",
+            "acknowledged_substeps": acknowledged,
+            "completed_steps": len(results),
+            "total_steps": len(steps),
+            "steps": results,
+        }
+        if mode:
+            try:
+                with self.connection.operation():
+                    out["observation"] = self._observe(mode, masks, limit=limit, offset=0)
+            except (OpenClawIPhoneError, OSError, ValueError) as exc:
+                out["error"] = diagnostic(exc)
+        return out

@@ -49,10 +49,17 @@ def iso_date(value: object) -> date:
     return date.fromisoformat(value)
 
 
+CLEAR_SKIP_ROLES = frozenset({"XCUIElementTypeTextField", "XCUIElementTypeSearchField", "XCUIElementTypeTextView"})
+
+
 def write_text(wda: WDAClient, ref: str | None, text: str, send: Send, *,
-               replace: bool, strategy: str, frequency: int | None = None) -> None:
+               replace: bool, strategy: str, frequency: int | None = None,
+               current_value: str | None = None, role: str | None = None) -> None:
     if replace:
-        send(lambda: wda.element_action(ref, "clear") if ref else wda.clear_text())
+        # Skip the slow WDA /clear round-trip when a non-secure native field is already proven empty.
+        already_empty = bool(text) and current_value == "" and role in CLEAR_SKIP_ROLES
+        if not already_empty:
+            send(lambda: wda.element_action(ref, "clear") if ref else wda.clear_text())
     if not text:
         return
     if strategy == "sequential":
