@@ -951,6 +951,31 @@ class SessionTests(unittest.TestCase):
             self.assertNotIn("see you", json.dumps(api.requests))
             self.finish(proc, base)
 
+    def test_goal_submits_typed_search_with_enter_and_guards_repeated_submit(self):
+        with self.decisions() as (api, config), self.running(config=config) as (proc, server, base):
+            server.xml = GOAL_XML
+            api.replies = [(200, r) for r in (
+                step("type_text"),
+                step("submit"),
+                step("done", {"done": 0.95, "e1": 0.05}, progress=2.9, done=0.95),
+            )]
+            reply = self.request(proc, {"op": "goal", "goal": "Search for news", "text": "news"}, timeout=20)
+            self.assertEqual((reply["outcome"], reply["acknowledged_substeps"]), ("done", 2))
+            self.assertEqual([(s["action"], s.get("dispatch")) for s in reply["steps"]],
+                             [("type_text", "acknowledged"), ("submit", "acknowledged"), ("done", None)])
+            # Enter key (\ue007) was sent via WDA key actions after typing.
+            key_actions = [a for _, path, p in server.requests if path.endswith("/actions")
+                           for src in p.get("actions", []) if src.get("type") == "key"
+                           for a in src.get("actions", []) if a.get("value") == "\ue007"]
+            self.assertTrue(key_actions)
+            last_goal = json.loads(api.requests[-1][2]["input"][0]["content"][0]["text"])["goal"]
+            self.assertIn("pressed Return/Search to submit", last_goal)
+            # A second consecutive submit escalates instead of looping.
+            api.replies = [(200, step("submit")), (200, step("submit"))]
+            loop_reply = self.request(proc, {"op": "goal", "goal": "Search for news", "text": "news"}, timeout=20)
+            self.assertEqual((loop_reply["outcome"], loop_reply["reason"]), ("escalate", "repeated_submit"))
+            self.finish(proc, base)
+
     def test_goal_stops_before_unapproved_risky_taps_and_never_sends_secure_screens(self):
         with self.decisions() as (api, config), self.running(config=config) as (proc, server, base):
             server.xml = GOAL_XML

@@ -44,6 +44,8 @@ VISION_ACTIONS = {
     "dismiss_overlay": "A popup, menu or sheet covers the needed control and must be closed first.",
     "none": "Nothing on this screen helps with the goal.",
     "type_text": "A text field is already focused (keyboard open) and the goal needs text typed into it now.",
+    "submit": ("Press the keyboard's Search/Go/Return key to submit a search query, URL or form already typed "
+               "into the focused field (not for sending messages or posting content)."),
 }
 VISION_ACTION_Q = ("What action should happen next to make progress on `goal`? Pick `tap` if a visible control on "
                    "the screenshot should be tapped, or pick one of the other actions.")
@@ -72,6 +74,8 @@ NON_ELEMENT_OPTIONS = {
     "dismiss_overlay": "A popup, menu or sheet covers the needed control and must be closed first.",
     "none": "Nothing on this screen helps with the goal.",
     "type_text": "A text field is already focused (keyboard open) and the goal needs text typed into it now.",
+    "submit": ("Press the keyboard's Search/Go/Return key to submit a search query, URL or form already typed "
+               "into the focused field (not for sending messages or posting content)."),
 }
 DONE = "Does the screenshot show that `goal` is already complete?"
 DONE2 = ("Is `goal` already satisfied by what this screen shows, so that no further tap or typing is needed?",
@@ -493,7 +497,7 @@ def decide_vision(ask: Callable[[dict], dict], image: str, goal: str, window_siz
     choice_name = act["choice"] if act["choice"] != "done" else max((k for k in probabilities if k != "done"), key=probabilities.get)
     if choice_name == "none":
         return out | {"action": "escalate", "reason": "nothing_on_screen_helps"}
-    if choice_name in ("scroll_down", "type_text", "dismiss_overlay", "go_back"):
+    if choice_name in ("scroll_down", "type_text", "submit", "dismiss_overlay", "go_back"):
         return out | {"action": choice_name, "confidence": round(probabilities[choice_name], 2)}
     box_answer = a.get("target_box") or {}
     coords = box_answer.get("box")

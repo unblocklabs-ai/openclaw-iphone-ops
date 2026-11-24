@@ -16,13 +16,19 @@ intended result tab, and scroll using ordinary gestures. Use images when labels
 are missing or ambiguous. Avoid inferring identity from a nearby search result
 or attributing content to a profile you have not actually inspected.
 
-Feeds, recommendations, login/consent sheets, and WebViews are dynamic. The
-caller decides when more evidence is needed and whether a task is complete.
-Do not automatically clear consent, follow, like, message, post, or change
-accounts. Research and content evaluation belong to the caller's workflow.
+Feeds, recommendations, login/consent sheets, and WebViews are dynamic. In-app
+search tabs (such as `For you`) are not sorted chronologically; check visible
+post dates before treating results as recent. The caller decides when more
+evidence is needed and whether a task is complete. Do not automatically clear
+consent, follow, like, message, post, or change accounts. Research and content
+evaluation belong to the caller's workflow.
 
 To inspect a Reel or video post in an external video tool (such as
-`video-understand`), follow [ios-social-video](../ios-social-video/SKILL.md):
-tap Share/Send -> Copy link on the post, call `{"op":"pasteboard"}`, and run
-`openclaw-iphone media fetch "<URL>" --json` to download the `.mp4`. iOS
-accessibility `/source` does not expose underlying `.mp4` stream URLs.
+`video-understand`) or capture a post URL, follow
+[ios-social-video](../ios-social-video/SKILL.md): tap Share/Send -> `Copy link`
+on the post (if `Copy link` is scrolled off-screen in the bottom horizontal
+share row, swipe that row horizontally until `Copy link` has on-screen bounds
+before tapping), call `{"op":"pasteboard"}` and verify a non-empty URL was
+returned, then run `openclaw-iphone media fetch "<URL>" --json` when you need
+the `.mp4`. iOS accessibility `/source` does not expose underlying `.mp4` stream
+URLs.

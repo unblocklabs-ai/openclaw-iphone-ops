@@ -44,6 +44,7 @@ CHECK = {"input": "The sky is blue.",  # `goal check`: proves key and access wit
          "questions": [{"type": "predicate", "name": "check", "instructions": "Is this sentence about the sky?"}]}
 DEFAULT_STEPS, MAX_STEPS = 14, 30
 TYPED = "typed the supplied text"
+SUBMITTED = "pressed Return/Search to submit"
 PROVIDER_ALIASES = {"openai": "openai", "typesafe": "typesafe", "liquid": "liquid", "d1": "liquid", "lfm-d1": "liquid"}
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
@@ -451,12 +452,13 @@ def same(a: bytes, b: bytes) -> bool:
     return True
 
 
-def settle(shot: Callable[[], bytes], *, max_wait: float = 2.0, poll: float = 0.12) -> bytes:
-    """The first of two screenshots `poll` s apart that match (at most `max_wait` s), else the latest."""
-    started, previous = time.monotonic(), shot()
-    while time.monotonic() - started < max_wait:
+def settle(shot: Callable[[], bytes], *, max_wait: float = 1.0, poll: float = 0.18, max_shots: int = 3) -> bytes:
+    """The first of two screenshots `poll` s apart that match (at most `max_wait` s / `max_shots` captures), else the latest."""
+    started, previous, count = time.monotonic(), shot(), 1
+    while count < max_shots and time.monotonic() - started < max_wait:
         time.sleep(poll)
         current = shot()
+        count += 1
         if same(current, previous):
             return current
         previous = current
@@ -654,6 +656,11 @@ def run(session, decisions: Decisions, data: dict) -> dict:
                     outcome, reason = "escalate", "text_needed" if text is None else "repeated_type"
                     break
                 reply, note = session._request({"op": "set", "value": text}), TYPED
+            elif d["action"] == "submit":
+                if history and history[-1] == SUBMITTED:
+                    outcome, reason = "escalate", "repeated_submit"
+                    break
+                reply, note = session._request({"op": "press", "button": "enter"}), SUBMITTED
             elif d["action"] == "go_back":
                 reply = session._request({"op": "press", "button": "back"})
                 note = "went back"

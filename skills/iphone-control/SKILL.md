@@ -91,11 +91,17 @@ model unless the operator enabled goal navigation.
   writes; uncertainty does not block subsequent deliberate requests.
 - `close`/EOF releases ownership; exit 0 says nothing about task achievement.
 
-Read one complete reply promptly per request; avoid empty polling. Reuse its
-attached view and display image results directly when your tool supports it,
-instead of an extra inspection step. AX and image are independent, timestamped
-captures; select the useful modality. Route timing and safe phases explain
-failures without exposing text. Don't add a planner wrapper.
+Read one complete newline-delimited JSON reply (matching `request_sequence`)
+per request before sending the next command. Because `session` stays open and
+does not exit after replying, do not pass huge fixed PTY `yield_time_ms` waits
+(such as 60–100s) that stall even after output is printed — read in short slices
+(1–2s for ordinary taps/observes, 5–10s while waiting on `goal`) until the
+complete JSON line arrives, and never pipeline the next command before slower
+ops (`set`, `pasteboard`, `goal`) finish. Reuse its attached view and display
+image results directly when your tool supports it, instead of an extra
+inspection step. AX and image are independent, timestamped captures; select the
+useful modality. Route timing and safe phases explain failures without exposing
+text. Don't add a planner wrapper.
 
 Do not add status/doctor/screenshot/source chains before every action. Use
 `doctor --check-ui` after connection failures. Read recovery stays pinned to the

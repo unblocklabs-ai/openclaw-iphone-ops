@@ -15,7 +15,7 @@ from unittest import mock
 from openclaw_iphone import cli, navigator
 from openclaw_iphone.config import IPhoneConfig, load_config
 from openclaw_iphone.goal import (CHECK, Decisions, LiquidDecisions, TypeSafeDecisions, api_key, decisions_from_config,
-                                  goal_navigation, jpeg, local_guard_from_config, read_key_file, same)
+                                  goal_navigation, jpeg, local_guard_from_config, read_key_file, same, settle)
 from openclaw_iphone.observations import parse_observation
 from test_image_evidence import png
 
@@ -107,7 +107,7 @@ class NavigatorTests(unittest.TestCase):
         choices = body["questions"][0]["choices"]
         self.assertEqual([c["value"] for c in choices],
                          ["e3", "e4", "e6", "e8", "e13", "done", "scroll_down", "go_back", "dismiss_overlay", "none",
-                          "type_text"])
+                          "type_text", "submit"])
         self.assertEqual(choices[1]["description"], 'Button "Message" @(70,122) 100x44 in "Profile"')
         self.assertIn("\nTrue: ", body["questions"][3]["instructions"])
         self.assertEqual([lv["label"] for lv in body["questions"][4]["levels"]], ["0", "1", "2", "3"])
@@ -130,6 +130,7 @@ class NavigatorTests(unittest.TestCase):
             (step("done", {"done": 0.6, "scroll_down": 0.3, "e4": 0.1}, progress=2.45, done=0.9), "scroll_down", None),
             (step("none"), "escalate", "nothing_on_screen_helps"),
             (step("type_text"), "type_text", None),
+            (step("submit"), "submit", None),
             (step("e4", {"e4": 0.3, "e6": 0.3, "none": 0.4}), "escalate", "low_confidence"),
         ]
         for reply, action, reason in cases:
@@ -577,6 +578,41 @@ class DecisionsTests(unittest.TestCase):
         buf_a = b"\x89PNG\r\n\x1a\n" + struct.pack(">II", 0, 16) + struct.pack(">II", 100, 200) + (b"A" * 512)
         buf_b = b"\x89PNG\r\n\x1a\n" + struct.pack(">II", 0, 16) + struct.pack(">II", 100, 200) + (b"B" * 512)
         self.assertFalse(same(buf_a, buf_b))
+
+    def test_settle_caps_captures_on_animated_screens_and_stops_early_when_stable(self):
+        # Stable screen settles in 2 captures.
+        stable_shot = png(16, 16)
+        calls = 0
+        def stable():
+            nonlocal calls
+            calls += 1
+            return stable_shot
+        self.assertEqual(settle(stable, max_wait=1.0, poll=0.0, max_shots=3), stable_shot)
+        self.assertEqual(calls, 2)
+        # Continuously changing frames (video/blinking cursor) stop at max_shots rather than spinning.
+        frames = [png(16 + i, 16) for i in range(6)]
+        idx = 0
+        def animated():
+            nonlocal idx
+            frame = frames[idx]
+            idx += 1
+            return frame
+        self.assertEqual(settle(animated, max_wait=5.0, poll=0.0, max_shots=3), frames[2])
+        self.assertEqual(idx, 3)
+
+    def test_decide_vision_supports_submit_action(self):
+        action_probs = {k: (0.92 if k == "submit" else 0.01) for k in navigator.VISION_ACTIONS}
+        blocked_probs = {k: (0.96 if k == "none" else 0.01) for k in navigator.BLOCKED_OPTIONS}
+        ask = lambda _req: {
+            "action": {"choice": "submit", "probabilities": action_probs},
+            "done": {"probability": 0.05},
+            "blocked": {"choice": "none", "probabilities": blocked_probs},
+            "done2": {"probability": 0.05},
+            "progress": {"score": 2.0},
+            "sensitive": {"probability": 0.01},
+        }
+        d = navigator.decide_vision(ask, "data:image/jpeg;base64,AA==", "Submit search", (390.0, 844.0))
+        self.assertEqual((d["action"], d["confidence"]), ("submit", 0.92))
 
 
 if __name__ == "__main__":
