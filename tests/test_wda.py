@@ -190,7 +190,24 @@ class WDATests(unittest.TestCase):
 
         self.assertIsNone(client.tap(12.5, 44)["value"])
 
-        self.assertEqual(client.posts[0], ("/session", {"capabilities": {"alwaysMatch": {}, "firstMatch": [{}]}}))
+        self.assertEqual(
+            client.posts[0],
+            (
+                "/session",
+                {
+                    "capabilities": {
+                        "alwaysMatch": {
+                            "shouldWaitForQuiescence": False,
+                            "eventloopIdleDelaySec": 0,
+                            "disableAutomaticScreenshots": True,
+                        },
+                        "firstMatch": [{}],
+                    }
+                },
+            ),
+        )
+        self.assertEqual(client.posts[1][0], "/session/session-123/appium/settings")
+        self.assertEqual(client.posts[1][1]["settings"]["accessibilityDeadline"], 5.0)
         self.assertEqual(
             client.posts[2],
             (
@@ -204,7 +221,7 @@ class WDATests(unittest.TestCase):
                             "actions": [
                                 {"type": "pointerMove", "duration": 0, "x": 12.5, "y": 44},
                                 {"type": "pointerDown", "button": 0},
-                                {"type": "pause", "duration": 100},
+                                {"type": "pause", "duration": 25},
                                 {"type": "pointerUp", "button": 0},
                             ],
                         }
@@ -222,7 +239,22 @@ class WDATests(unittest.TestCase):
             self.assertIsNone(client.type_text("hé🙂", frequency=15)["value"])
         self.assertEqual([call.args for call in sleep.call_args_list], [(1 / 15,), (1 / 15,)])
 
-        self.assertEqual(client.posts[0], ("/session", {"capabilities": {"alwaysMatch": {}, "firstMatch": [{}]}}))
+        self.assertEqual(
+            client.posts[0],
+            (
+                "/session",
+                {
+                    "capabilities": {
+                        "alwaysMatch": {
+                            "shouldWaitForQuiescence": False,
+                            "eventloopIdleDelaySec": 0,
+                            "disableAutomaticScreenshots": True,
+                        },
+                        "firstMatch": [{}],
+                    }
+                },
+            ),
+        )
         self.assertEqual(
             client.posts[2],
             (
@@ -296,7 +328,22 @@ class WDATests(unittest.TestCase):
 
         client.open_url("instagram://user?username=creator")
 
-        self.assertEqual(client.posts[0], ("/session", {"capabilities": {"alwaysMatch": {}, "firstMatch": [{}]}}))
+        self.assertEqual(
+            client.posts[0],
+            (
+                "/session",
+                {
+                    "capabilities": {
+                        "alwaysMatch": {
+                            "shouldWaitForQuiescence": False,
+                            "eventloopIdleDelaySec": 0,
+                            "disableAutomaticScreenshots": True,
+                        },
+                        "firstMatch": [{}],
+                    }
+                },
+            ),
+        )
         self.assertEqual(client.posts[2], ("/session/session-123/url", {"url": "instagram://user?username=creator"}))
         self.assertEqual(client.requests, [("DELETE", "/session/session-123", None)])
 
@@ -305,7 +352,22 @@ class WDATests(unittest.TestCase):
 
         self.assertIsNone(client.drag(10, 20, 30, 40, duration=0.4)["value"])
 
-        self.assertEqual(client.posts[0], ("/session", {"capabilities": {"alwaysMatch": {}, "firstMatch": [{}]}}))
+        self.assertEqual(
+            client.posts[0],
+            (
+                "/session",
+                {
+                    "capabilities": {
+                        "alwaysMatch": {
+                            "shouldWaitForQuiescence": False,
+                            "eventloopIdleDelaySec": 0,
+                            "disableAutomaticScreenshots": True,
+                        },
+                        "firstMatch": [{}],
+                    }
+                },
+            ),
+        )
         self.assertEqual(
             client.posts[2],
             (

@@ -18,7 +18,7 @@ from .connection import Connection
 from .errors import OpenClawIPhoneError, WDAOutcomeUnknown, WDAStaleElement, WDAUnavailable, WDATransportUnavailable, diagnostic
 from .execution import Budget
 from .evidence import artifact_path, write_private
-from . import goal, shallow
+from . import cache, goal, shallow
 from .image_evidence import redact_png
 from .inputs import (InputReadbackUnavailable, InputUnavailable, date_components, input_kind,
                      iso_date, pick_value, set_checked, set_date, validate_text, write_text)
@@ -106,8 +106,21 @@ class Session:
         self.secrets: set[str] = set()
         self.candidate_ids: set[str] | None = None
         self.shallow_apps = shallow.load()  # apps too slow to read in full (shallow.py)
-        self.app_hint: str | None = None  # the app the next read expects: last observed or launched
+        device_udid = connection.device.udid if connection.device is not None else None
+        self.app_hint: str | None = (
+            cache.get_cached_last_app(device_udid)
+            if device_udid and os.environ.get("OPENCLAW_IPHONE_DISABLE_CACHE") != "1"
+            else None
+        )
         self._pasteboard_needs_swap = False
+
+    def _set_app_hint(self, bundle_id: str | None) -> None:
+        if not bundle_id or bundle_id == self.app_hint:
+            self.app_hint = bundle_id or self.app_hint
+            return
+        self.app_hint = bundle_id
+        if os.environ.get("OPENCLAW_IPHONE_DISABLE_CACHE") != "1" and self.connection.device is not None:
+            cache.set_cached_last_app(self.connection.device.udid, bundle_id)
 
     def _read(self, read: Callable[[WDAClient], T]) -> T:
         """One safe retry per read; no lifetime recovery allowance."""
@@ -160,7 +173,8 @@ class Session:
             self._remember_shallow(observation.app)  # this read already has the full tree; the next ones are capped
         elif depth == shallow.DEPTH and observation.app not in self.shallow_apps:
             observation = capture(depth := shallow.DEFAULT_DEPTH)  # another app is in front now: read it in full
-        self.snapshot, self.app_hint = observation, observation.app
+        self.snapshot = observation
+        self._set_app_hint(observation.app)
         return observation, depth
 
     def _render_accessibility(self, observation: Observation, depth: int | None, *,
@@ -455,7 +469,7 @@ class Session:
                         if swapped and text:
                             self._pasteboard_needs_swap = True
                         if restored_app:
-                            self.app_hint = restored_app
+                            self._set_app_hint(restored_app)
                     redacted = self._redact(text)
                     clipped, truncated = _truncate_json_text(redacted, max_bytes=32_768)
                     completed = True
@@ -610,7 +624,7 @@ class Session:
                         send(lambda: wda.press_button(value, duration=data.get("duration")))
                 elif op == "launch":
                     send(lambda: wda.activate_app(value))
-                    self.app_hint = value  # the next read expects this app (and its depth)
+                    self._set_app_hint(value)  # the next read expects this app (and its depth)
                 elif op == "open_url":
                     send(lambda: wda.open_url(value))
                 completed = True

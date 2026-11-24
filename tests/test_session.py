@@ -1141,6 +1141,69 @@ class SessionTests(unittest.TestCase):
             self.assertEqual(depths, [50, 22, 50])  # explicit at session start, capped, restored
             self.finish(proc, base)
 
+    def test_session_seeds_app_hint_from_last_app_cache_for_first_observe(self):
+        with self.running() as (proc, server, base):
+            # Seed last_apps cache directly via an X observation, then start a second session
+            # sharing the same HOME and verify its very first observe starts shallow (depth=22).
+            server.xml = GOAL_XML.replace("test.app", "com.atebits.Tweetie2")
+            first = self.request(proc, {"op": "observe", "mode": "accessibility"})["observation"]["accessibility"]
+            self.assertEqual(first["app"], "com.atebits.Tweetie2")
+            self.finish(proc, base)
+
+            udid = (base / "identity").read_text()
+            cache_data = json.loads((base / ".openclaw/iphone/runtime-cache.json").read_text())
+            self.assertEqual(cache_data["last_apps"][udid]["bundle_id"], "com.atebits.Tweetie2")
+
+            server.requests.clear()
+            env = {
+                **os.environ,
+                "PYTHONPATH": str(ROOT / "src"),
+                "IPHONE_TEST_DIR": str(base),
+                "IPHONE_TEST_URL": f"http://127.0.0.1:{server.server_port}",
+                "IPHONE_TEST_TIMEOUT": "2",
+            }
+            proc2 = subprocess.Popen(
+                [sys.executable, "-c", BOOTSTRAP, "session", "--device", "physical"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=base, env=env,
+            )
+            try:
+                ready = self.receive(proc2)
+                self.assertEqual(ready["status"], "ready")
+                reply = self.request(proc2, {"op": "observe", "mode": "accessibility"})["observation"]["accessibility"]
+                self.assertEqual(reply["tree_depth_limit"], 22)
+                depths = [p["settings"]["snapshotMaxDepth"] for _, path, p in server.requests
+                          if path.endswith("/appium/settings") and "snapshotMaxDepth" in p["settings"]]
+                self.assertEqual(depths, [50, 22])
+                self.finish(proc2, base)
+            finally:
+                if proc2.poll() is None:
+                    proc2.terminate()
+                    proc2.wait(timeout=5)
+                for stream in (proc2.stdin, proc2.stdout, proc2.stderr):
+                    if stream:
+                        stream.close()
+
+            # Respects OPENCLAW_IPHONE_DISABLE_CACHE=1
+            server.requests.clear()
+            env_disabled = {**env, "OPENCLAW_IPHONE_DISABLE_CACHE": "1"}
+            proc3 = subprocess.Popen(
+                [sys.executable, "-c", BOOTSTRAP, "session", "--device", "physical"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=base, env=env_disabled,
+            )
+            try:
+                ready = self.receive(proc3)
+                self.assertEqual(ready["status"], "ready")
+                reply = self.request(proc3, {"op": "observe", "mode": "accessibility"})["observation"]["accessibility"]
+                self.assertNotIn("tree_depth_limit", reply)
+                self.finish(proc3, base)
+            finally:
+                if proc3.poll() is None:
+                    proc3.terminate()
+                    proc3.wait(timeout=5)
+                for stream in (proc3.stdin, proc3.stdout, proc3.stderr):
+                    if stream:
+                        stream.close()
+
     def test_goal_navigation_is_off_by_default(self):
         with self.running() as (proc, server, base):
             self.assertNotIn("goal", self.ready["capabilities"])

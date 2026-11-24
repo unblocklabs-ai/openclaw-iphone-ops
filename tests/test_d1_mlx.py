@@ -404,6 +404,15 @@ class RuntimeCacheTests(unittest.TestCase):
             cache.clear_cached_wda_endpoint("UDID-1")
             self.assertIsNone(cache.get_cached_wda_endpoint("UDID-1"))
 
+    def test_last_app_cache_roundtrip_and_ttl(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"HOME": tmp}):
+            self.assertIsNone(cache.get_cached_last_app("UDID-1"))
+            cache.set_cached_last_app("UDID-1", "com.atebits.Tweetie2")
+            self.assertEqual(cache.get_cached_last_app("UDID-1"), "com.atebits.Tweetie2")
+            self.assertEqual(cache.runtime_cache_path().stat().st_mode & 0o777, 0o600)
+            with mock.patch("openclaw_iphone.cache.time.time", return_value=10**12):
+                self.assertIsNone(cache.get_cached_last_app("UDID-1"))
+
     def test_devicectl_find_app_uses_cache_and_refreshes_on_miss(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"HOME": tmp}):
             ctl = DeviceCtl()

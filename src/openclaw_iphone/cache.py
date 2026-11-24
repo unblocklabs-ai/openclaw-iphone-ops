@@ -12,6 +12,7 @@ from typing import Any, Iterator
 
 WDA_URL_TTL_SECONDS = 6 * 3600
 APPS_TTL_SECONDS = 10 * 60
+LAST_APP_TTL_SECONDS = 30 * 60
 
 
 def runtime_cache_path() -> Path:
@@ -181,6 +182,43 @@ def set_cached_apps(device_id: str, items: list[dict[str, str]]) -> None:
             apps_by_device = {}
         apps_by_device[device_id] = {"updated_at": time.time(), "items": items}
         data["apps"] = apps_by_device
+        _write_json(path, data)
+
+
+def get_cached_last_app(udid: str | None) -> str | None:
+    if not udid:
+        return None
+    data = _read_json(runtime_cache_path())
+    last_apps = data.get("last_apps")
+    if not isinstance(last_apps, dict):
+        return None
+    entry = last_apps.get(udid)
+    if not isinstance(entry, dict):
+        return None
+    updated = entry.get("updated_at")
+    bundle_id = entry.get("bundle_id")
+    if (
+        not isinstance(updated, (int, float))
+        or isinstance(updated, bool)
+        or time.time() - updated >= LAST_APP_TTL_SECONDS
+        or not isinstance(bundle_id, str)
+        or not bundle_id
+    ):
+        return None
+    return bundle_id
+
+
+def set_cached_last_app(udid: str | None, bundle_id: str | None) -> None:
+    if not udid or not bundle_id:
+        return
+    path = runtime_cache_path()
+    with _locked_cache(path):
+        data = _read_json(path)
+        last_apps = data.get("last_apps")
+        if not isinstance(last_apps, dict):
+            last_apps = {}
+        last_apps[udid] = {"bundle_id": bundle_id, "updated_at": time.time()}
+        data["last_apps"] = last_apps
         _write_json(path, data)
 
 

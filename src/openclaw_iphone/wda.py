@@ -144,7 +144,7 @@ class WDAClient:
                     "actions": [
                         {"type": "pointerMove", "duration": 0, "x": x, "y": y},
                         {"type": "pointerDown", "button": 0},
-                        {"type": "pause", "duration": 100},
+                        {"type": "pause", "duration": 25},
                         {"type": "pointerUp", "button": 0},
                     ],
                 }
@@ -395,6 +395,7 @@ class WDAClient:
             # postconditions; do not also wait for the entire app to be idle.
             self._json_post(f"/session/{session_id}/appium/settings", {"settings": {
                 "waitForIdleTimeout": 0, "animationCoolOffTimeout": 0,
+                "accessibilityDeadline": 5.0,
                 "shouldUseCompactResponses": False,
                 "elementResponseAttributes": "type,label,attribute/value",
                 "snapshotMaxDepth": 50,  # explicit: a previous client may have left it capped
@@ -483,7 +484,16 @@ class WDAClient:
         return parsed
 
     def _create_session(self) -> str:
-        payload = {"capabilities": {"alwaysMatch": {}, "firstMatch": [{}]}}
+        payload = {
+            "capabilities": {
+                "alwaysMatch": {
+                    "shouldWaitForQuiescence": False,
+                    "eventloopIdleDelaySec": 0,
+                    "disableAutomaticScreenshots": True,
+                },
+                "firstMatch": [{}],
+            }
+        }
         response = self._json_post("/session", payload)
         session_id = response.get("sessionId")
         if isinstance(session_id, str) and session_id:

@@ -77,8 +77,10 @@ model unless the operator enabled goal navigation.
   - `needs_approval`: nothing was tapped. Ask the user, then tap
     `pending.target` (valid until your next observation).
 - An observation with `tree_depth_limit` comes from an app too slow to read in
-  full (X): deeper controls are missing from `elements`, so use the screenshot
-  and tap by coordinates.
+  full (X, TikTok): deeper controls are missing from `elements`, so use the
+  screenshot and tap by coordinates. On X, prefer `open_url` with
+  `twitter://search?query=...` or `twitter://user?screen_name=...` to jump
+  directly instead of navigating menus.
 - Enable goal navigation only when the operator asks, since it sends screens to
   the configured provider. For local Apple Silicon MLX `d1-omni-600M` (zero core
   dependencies, isolated venv, zero cloud cost), run
